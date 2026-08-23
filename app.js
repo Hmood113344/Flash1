@@ -39,7 +39,7 @@ const CONFIG = {
 
     SITE_NAME: "فلاش",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
-    PORT: process.env.PORT || 7700,
+    PORT: process.env.PORT || 7770,
 
     // رتب العسكر المعتمدة لتسجيل الدخول بالموقع (رولات ديسكورد)
     MILITARY_ROLE_IDS: [
