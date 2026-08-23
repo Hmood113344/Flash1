@@ -32,14 +32,14 @@ const {
 const CONFIG = {
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID || "",
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || "",
-    DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",
+    DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "https://your-site.onrender.com/auth/discord/callback",
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
 
     SITE_NAME: "فلاش",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
-    PORT: process.env.PORT || 7770,
+    PORT: process.env.PORT || 7700,
 
     // رتب العسكر المعتمدة لتسجيل الدخول بالموقع (رولات ديسكورد)
     MILITARY_ROLE_IDS: [
@@ -1114,7 +1114,7 @@ async function renderNewViolation() {
                     <div>\${v.name}</div>
                 </div>\`).join('')}</div>\` : '<p style="color:var(--muted);margin-bottom:10px;">لا توجد مركبات مضافة</p>'}
             <label>صورة المخالفة (اختياري)</label>
-            <input type="file" id="v-photo" accept="image/*" capture="environment" onchange="previewPhoto()">
+            <input type="file" id="v-photo" accept="image/*" onchange="previewPhoto()">
             <img id="v-photo-preview" style="display:none;max-width:220px;border-radius:8px;margin-bottom:10px;">
             <div class="row" style="gap:8px;margin-top:10px;">
                 <button class="btn" onclick="submitViolation()">إرسال</button>
