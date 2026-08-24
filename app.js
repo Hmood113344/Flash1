@@ -32,7 +32,7 @@ const {
 const CONFIG = {
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID || "",
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || "",
-    DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "https://your-site.onrender.com/auth/discord/callback",
+    DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
