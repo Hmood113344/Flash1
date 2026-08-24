@@ -38,8 +38,8 @@ const CONFIG = {
     MONGO_URI: process.env.MONGO_URI || "",
 
     SITE_NAME: "فلاش",
-    SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
-    PORT: process.env.PORT || 7700,
+    SESSION_SECRET: process.env.SESSION_SECRET || "norv_hmood_secret_789",
+    PORT: process.env.PORT || 7770,
 
     // رتب العسكر المعتمدة لتسجيل الدخول بالموقع (رولات ديسكورد)
     MILITARY_ROLE_IDS: [
