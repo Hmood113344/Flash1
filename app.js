@@ -32,14 +32,14 @@ const {
 const CONFIG = {
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID || "",
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || "",
-    DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",
+    DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "https://your-site.onrender.com/auth/discord/callback",
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
 
     SITE_NAME: "فلاش",
-    SESSION_SECRET: process.env.SESSION_SECRET || "norv_hmood_secret_789",
-    PORT: process.env.PORT || 7770,
+    SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
+    PORT: process.env.PORT || 7700,
 
     // رتب العسكر المعتمدة لتسجيل الدخول بالموقع (رولات ديسكورد)
     MILITARY_ROLE_IDS: [
@@ -50,9 +50,7 @@ const CONFIG = {
 
     // آيديات كبار المسؤولين — نفس أسلوب ملف البنك (مصفوفة ثابتة بالكود)
     SENIOR_ADMIN_IDS: [
-         "1003511814140743825",
-         "1231269832201207808",
-         "1458502584481484952",
+        // "ضع_آيدي_هنا",
     ],
 
     // الرتب العسكرية الرسمية بالترتيب من الأدنى للأعلى
@@ -75,8 +73,8 @@ const CONFIG = {
         "الهروب من نقطة تفتيش",
     ],
 
-    POINTS_ON_APPROVE: 2,
-    POINTS_ON_REJECT: 1,
+    POINTS_ON_APPROVE: 1,
+    POINTS_ON_REJECT: 1, // تُخصم (تُطرح) من نقاط العسكري عند رفض مخالفته
     MAX_VEHICLES_ADD: 60,
     MAX_PHOTO_MB: 3,
 };
@@ -314,7 +312,8 @@ async function approveViolation(v, actorId, actorTag) {
 async function rejectViolation(v, actorId, actorTag, reason) {
     v.status = "rejected"; v.rejectReason = reason; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
     await v.save();
-    await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: CONFIG.POINTS_ON_REJECT } });
+    await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: -CONFIG.POINTS_ON_REJECT } });
+    await Personnel.updateOne({ discord: v.reporterDiscord, points: { $lt: 0 } }, { $set: { points: 0 } });
     await syncViolationMessage(v);
     await logEvent(actorId, actorTag, "رفض مخالفة", `${v.violationType} — ${v.reporterName} — السبب: ${reason}`);
 }
@@ -511,7 +510,7 @@ client.on("interactionCreate", async interaction => {
                     );
                     await logEvent(interaction.user.id, interaction.user.username, text === "ترقية" ? "ترقية عسكري" : "تنزيل عسكري", `<@${targetId}>: ${currentRank} ← ${newRank}`);
                     rankFlowState.delete(interaction.user.id);
-                    return interaction.followUp({ content: `✅ تم ${text === "ترقية" ? "ترقية" : "تنزيل"} <@${targetId}> إلى رتبة **${newRank}**.` });
+                    return interaction.followUp({ content: `✅ تم ${text === "ترقية" ? "ترقية" : "تنزيل"} <@${targetId}> إلى رتبة **${newRank}**.`, ephemeral: true });
                 } catch (e) {
                     rankFlowState.delete(interaction.user.id);
                     return interaction.followUp({ content: "⏱️ انتهى الوقت، تم إلغاء العملية.", ephemeral: true }).catch(() => {});
@@ -544,7 +543,7 @@ client.on("interactionCreate", async interaction => {
                     { new: true, upsert: true }
                 );
                 await logEvent(interaction.user.id, interaction.user.username, "تعيين يونت", `<@${targetId}> → ${p.unit}`);
-                return interaction.reply({ content: `✅ تم تعيين <@${targetId}> إلى يونت **${p.unit}**${update.rank ? ` برتبة **${p.rank}**` : ""}.` });
+                return interaction.reply({ content: `✅ تم تعيين <@${targetId}> إلى يونت **${p.unit}**${update.rank ? ` برتبة **${p.rank}**` : ""}.`, ephemeral: true });
             }
             if (interaction.customId.startsWith("pointsmodal_")) {
                 const targetId = interaction.customId.split("_")[1];
@@ -556,7 +555,7 @@ client.on("interactionCreate", async interaction => {
                     { new: true, upsert: true }
                 );
                 await logEvent(interaction.user.id, interaction.user.username, "تعديل نقاط", `<@${targetId}>: ${amount >= 0 ? "+" : ""}${amount} → المجموع ${p.points}`);
-                return interaction.reply({ content: `✅ تم تعديل نقاط <@${targetId}>. النقاط الحالية: **${p.points}**` });
+                return interaction.reply({ content: `✅ تم تعديل نقاط <@${targetId}>. النقاط الحالية: **${p.points}**`, ephemeral: true });
             }
         }
     } catch (e) {
@@ -671,18 +670,29 @@ async function ensureAnyAdmin(req, res, next) {
 
 app.get("/api/me", ensureAuth, async (req, res) => {
     const settings = await getSettings();
-    if (settings.disableLogin) {
-        return res.json({ blocked: true, reason: "الدخول مغلق حالياً من قبل الإدارة" });
-    }
-    const check = await isMilitary(req.user.id);
-    if (!check.ok) {
-        return res.json({ blocked: true, reason: "هذا الموقع مخصص لمنسوبي الجهات العسكرية فقط" });
+    const senior = isSeniorAdmin(req.user.id);
+
+    // كبار المسؤولين يدخلون دائماً حتى لو كان التسجيل مقفل أو الموقع بالصيانة
+    if (!senior) {
+        if (settings.disableLogin) {
+            return res.json({ blocked: true, reason: "🔒 تسجيل الدخول مغلق حالياً من قبل الإدارة العليا." });
+        }
+        if (settings.isMaintenance) {
+            return res.json({ blocked: true, maintenance: true, reason: "🚨 الموقع مغلق حالياً للصيانة العامة بطلب من الإدارة العليا." });
+        }
+        const check = await isMilitary(req.user.id);
+        if (!check.ok) {
+            return res.json({ blocked: true, reason: "هذا الموقع مخصص لمنسوبي الجهات العسكرية فقط" });
+        }
     }
 
     let p = await Personnel.findOne({ discord: req.user.id });
     if (!p) p = await Personnel.create({ discord: req.user.id, discordTag: req.user.username });
 
-    const senior = isSeniorAdmin(req.user.id);
+    if (!senior && p.isBlocked) {
+        return res.json({ blocked: true, reason: "🚫 تم إيقاف حسابك من الموقع من قبل الإدارة." });
+    }
+
     const isAdmin = senior || settings.adminList.includes(req.user.id);
     const progress = await rankProgress(p, settings);
 
@@ -721,28 +731,49 @@ app.get("/api/violations/meta", ensureAuth, async (req, res) => {
     res.json({ types: CONFIG.VIOLATION_TYPES, vehicles: vehicles.map(v => ({ name: v.name, photo: v.photo })) });
 });
 
-app.post("/api/violations/submit", ensureAuth, async (req, res) => {
-    const settings = await getSettings();
-    if (settings.disableViolations) return res.status(403).json({ error: "تسجيل المخالفات مغلق حالياً" });
-    const p = await Personnel.findOne({ discord: req.user.id });
-    if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
-    if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل مخالفات جديدة" });
-    const { violationType, vehicle, photo } = req.body;
-    if (!violationType || !vehicle) return res.status(400).json({ error: "أكمل نوع المخالفة والمركبة" });
-    if (photo && photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
-        return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    }
-    const vehicleDoc = await Vehicle.findOne({ name: vehicle });
+const VIOLATION_COOLDOWN_MS = 30 * 1000;
+const violationLocks = new Set(); // يمنع إرسال مخالفتين بنفس اللحظة من نفس الحساب
 
-    const v = await Violation.create({
-        reporterDiscord: req.user.id, reporterTag: req.user.username,
-        reporterName: p.registeredName, reporterUnit: p.unit,
-        violationType, vehicle, vehiclePhoto: vehicleDoc?.photo || null,
-        photo: photo || null,
-        plateNumber: generatePlate(), status: "pending",
-    });
-    postViolationToChannel(v).catch(() => {});
-    res.json({ ok: true, violation: v });
+app.post("/api/violations/submit", ensureAuth, async (req, res) => {
+    if (violationLocks.has(req.user.id)) {
+        return res.status(429).json({ error: "في مخالفة قيد الإرسال حالياً على حسابك، انتظر لحظة." });
+    }
+    violationLocks.add(req.user.id);
+    try {
+        const settings = await getSettings();
+        if (settings.disableViolations) return res.status(403).json({ error: "تسجيل المخالفات مغلق حالياً" });
+        const p = await Personnel.findOne({ discord: req.user.id });
+        if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
+        if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل مخالفات جديدة" });
+
+        const last = await Violation.findOne({ reporterDiscord: req.user.id }).sort({ createdAt: -1 });
+        if (last) {
+            const elapsed = Date.now() - last.createdAt.getTime();
+            if (elapsed < VIOLATION_COOLDOWN_MS) {
+                const wait = Math.ceil((VIOLATION_COOLDOWN_MS - elapsed) / 1000);
+                return res.status(429).json({ error: `لازم تنتظر ${wait} ثانية قبل تسجيل مخالفة جديدة`, cooldown: wait });
+            }
+        }
+
+        const { violationType, vehicle, photo } = req.body;
+        if (!violationType || !vehicle) return res.status(400).json({ error: "أكمل نوع المخالفة والمركبة" });
+        if (photo && photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
+            return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
+        }
+        const vehicleDoc = await Vehicle.findOne({ name: vehicle });
+
+        const v = await Violation.create({
+            reporterDiscord: req.user.id, reporterTag: req.user.username,
+            reporterName: p.registeredName, reporterUnit: p.unit,
+            violationType, vehicle, vehiclePhoto: vehicleDoc?.photo || null,
+            photo: photo || null,
+            plateNumber: generatePlate(), status: "pending",
+        });
+        postViolationToChannel(v).catch(() => {});
+        res.json({ ok: true, violation: v });
+    } finally {
+        violationLocks.delete(req.user.id);
+    }
 });
 
 app.get("/api/violations/mine", ensureAuth, async (req, res) => {
@@ -799,6 +830,24 @@ app.post("/api/senior/personnel/:discord/block", ensureSeniorAdmin, async (req, 
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent(req.user.id, req.user.username, blocked ? "إيقاف عسكري" : "إلغاء إيقاف", p.registeredName || p.discord);
     res.json({ ok: true, isBlocked: p.isBlocked });
+});
+
+// تعديل شامل لملف عسكري: الاسم، اليونت، الرتبة، النقاط — من لوحة كبار المسؤولين مباشرة
+app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req, res) => {
+    const { name, unit, rank, points } = req.body;
+    const update = {};
+    if (typeof name === "string" && name.trim()) update.registeredName = name.trim();
+    if (typeof unit === "string" && unit.trim()) update.unit = unit.trim();
+    if (typeof rank === "string" && rank.trim()) {
+        if (!CONFIG.MILITARY_RANKS.includes(rank.trim())) return res.status(400).json({ error: "رتبة غير موجودة" });
+        update.rank = rank.trim();
+    }
+    if (points !== undefined && points !== "" && !isNaN(parseInt(points))) update.points = Math.max(0, parseInt(points));
+
+    const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, update, { new: true });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent(req.user.id, req.user.username, "تعديل ملف عسكري", `${p.discord}: ${JSON.stringify(update)}`);
+    res.json({ ok: true, personnel: p });
 });
 
 app.get("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
@@ -900,31 +949,42 @@ app.get("/", (req, res) => {
 <title>${CONFIG.SITE_NAME}</title>
 <style>
     :root {
-        --bg1: #050b08; --bg2: #0a1710; --panel: rgba(14,28,20,0.9); --border: rgba(212,175,55,0.28);
-        --gold: #d4af37; --gold-soft: #f0d375; --green: #1f8a4c; --green2: #16a34a;
-        --red: #dc2626; --amber: #f59e0b; --text: #eaf3ec; --muted: #90a898;
+        --bg1: #0a1628; --bg2: #0d1f3c; --panel: rgba(255,255,255,0.04); --border: rgba(59,130,246,0.25);
+        --gold: #3b82f6; --gold-soft: #60a5fa; --green: #1d4ed8; --green2: #3b82f6;
+        --red: #ef4444; --amber: #eab308; --text: #e2e8f0; --muted: #64748b;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Tahoma', 'Segoe UI', sans-serif; }
-    body { background: radial-gradient(circle at top, var(--bg2) 0%, var(--bg1) 70%); color: var(--text); min-height: 100vh; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Tajawal', 'Tahoma', 'Segoe UI', sans-serif; }
+    body { background: linear-gradient(135deg, #0a1628 0%, #0d1f3c 40%, #0a2744 70%, #0d3060 100%); color: var(--text); min-height: 100vh; }
     #warn-banner { position: sticky; top: 0; z-index: 1000; width: 100%; background: linear-gradient(90deg,#7f1d1d,#991b1b); color: #fecaca; text-align: center; padding: 10px 14px; font-weight: bold; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,0.4); }
+    nav { background: rgba(5,15,30,0.95); backdrop-filter: blur(15px); border-bottom: 1px solid rgba(59,130,246,0.3); padding: 0 1.2rem; display: flex; align-items: center; justify-content: space-between; height: 62px; position: sticky; top: 37px; z-index: 900; }
+    .logo { font-size: 1.3rem; font-weight: 900; background: linear-gradient(90deg, #3b82f6, #60a5fa, #93c5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; letter-spacing: 2px; }
+    .nav-links { display: flex; gap: 0.3rem; list-style: none; flex-wrap: wrap; }
+    .nav-links button { background: transparent; border: 1px solid transparent; color: #94a3b8; padding: 0.4rem 0.8rem; border-radius: 8px; cursor: pointer; font-family: inherit; font-size: 0.85rem; transition: all 0.2s; }
+    .nav-links button:hover { background: rgba(59,130,246,0.2); border-color: #3b82f6; color: #60a5fa; }
+    .hamburger-btn { display: none; background: rgba(59,130,246,0.15); border: 1px solid #3b82f6; color: #60a5fa; padding: 0.4rem 0.7rem; border-radius: 8px; cursor: pointer; font-size: 1.2rem; }
+    .mobile-menu { display: none; position: fixed; top: 99px; left: 0; width: 230px; background: rgba(5,15,30,0.98); border: 1px solid rgba(59,130,246,0.35); border-radius: 0 0 14px 0; z-index: 950; padding: 8px 0; box-shadow: 4px 8px 30px rgba(0,0,0,0.7); }
+    .mobile-menu.open { display: block; }
+    .mobile-menu button { display: block; width: 100%; background: transparent; border: none; border-bottom: 1px solid rgba(59,130,246,0.08); color: #94a3b8; padding: 12px 20px; text-align: right; font-family: inherit; font-size: 0.9rem; cursor: pointer; }
+    .mobile-menu button:hover { background: rgba(59,130,246,0.18); color: #60a5fa; }
+    @media (max-width: 760px) { .nav-links { display: none !important; } .hamburger-btn { display: inline-block; } }
     .wrap { max-width: 940px; margin: 0 auto; padding: 20px 16px 60px; }
     .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 18px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
     h1, h2, h3 { color: var(--gold-soft); margin-bottom: 12px; }
-    .btn { display: inline-block; background: linear-gradient(135deg, var(--green2), var(--green)); color: #fff; border: none; border-radius: 10px; padding: 12px 22px; font-size: 15px; cursor: pointer; transition: 0.2s; }
-    .btn:hover { filter: brightness(1.15); }
-    .btn.danger { background: linear-gradient(135deg, #ef4444, var(--red)); }
-    .btn.gray { background: #26362c; }
-    .btn.gold { background: linear-gradient(135deg, var(--gold), #b8912a); color: #201705; font-weight: bold; }
-    .btn.sm { padding: 7px 14px; font-size: 13px; }
-    input, select, textarea { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: rgba(5,15,10,0.9); color: #fff; margin-bottom: 10px; font-size: 14px; }
+    .btn { display: inline-block; background: linear-gradient(135deg, var(--green), var(--green2)); color: #fff; border: none; border-radius: 8px; padding: 0.6rem 1.3rem; font-size: 0.9rem; font-weight: 700; cursor: pointer; transition: 0.2s; }
+    .btn:hover { opacity: 0.85; transform: translateY(-1px); }
+    .btn.danger { background: #ef4444; }
+    .btn.gray { background: rgba(255,255,255,0.08); border: 1px solid rgba(59,130,246,0.25); color: #94a3b8; }
+    .btn.gold { background: linear-gradient(135deg, #1d4ed8, #60a5fa); color: #fff; }
+    .btn.sm { padding: 0.4rem 0.9rem; font-size: 0.8rem; }
+    input, select, textarea { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: rgba(255,255,255,0.06); color: #fff; margin-bottom: 10px; font-size: 14px; }
     label { display: block; margin-bottom: 6px; color: var(--gold-soft); font-size: 13px; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; justify-content: space-between; }
     .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: bold; }
-    .badge.pending { background: #78350f; color: #fbbf24; }
-    .badge.approved { background: #064e3b; color: #34d399; }
-    .badge.rejected { background: #4c0519; color: #fb7185; }
-    .stat { text-align: center; padding: 14px; background: rgba(5,15,10,0.6); border-radius: 10px; border: 1px solid var(--border); }
-    .stat .num { font-size: 24px; font-weight: bold; color: var(--gold-soft); }
+    .badge.pending { background: rgba(234,179,8,0.15); color: #fbbf24; border: 1px solid #eab308; }
+    .badge.approved { background: rgba(34,197,94,0.15); color: #4ade80; border: 1px solid #22c55e; }
+    .badge.rejected { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid #ef4444; }
+    .stat { text-align: center; padding: 14px; background: rgba(255,255,255,0.03); border-radius: 10px; border: 1px solid var(--border); }
+    .stat .num { font-size: 24px; font-weight: 900; color: var(--gold-soft); }
     .stat .lbl { font-size: 12px; color: var(--muted); }
     .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
     .center { text-align: center; }
@@ -933,27 +993,37 @@ app.get("/", (req, res) => {
     .avatar { width: 70px; height: 70px; border-radius: 50%; border: 3px solid var(--gold); }
     .thumb { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; border: 1px solid var(--border); cursor: pointer; }
     .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
-    .tab { padding: 8px 16px; border-radius: 8px; background: #16241b; cursor: pointer; font-size: 13px; }
-    .tab.active { background: var(--green2); }
-    .id-card { background: linear-gradient(160deg, #0c1a10, #16301f); border: 2px solid var(--gold); border-radius: 16px; padding: 22px; max-width: 400px; margin: 0 auto; }
+    .tab { background: rgba(255,255,255,0.04); border: 1px solid rgba(59,130,246,0.3); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; color: #94a3b8; }
+    .tab.active { background: var(--green2); color: #fff; border-color: var(--green2); }
+    .id-card { background: linear-gradient(135deg, #1e3a5f, #0f2848); border: 2px solid var(--gold); border-radius: 20px; padding: 22px; max-width: 400px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
     .rank-line { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 15px; color: var(--gold-soft); margin: 10px 0; font-weight: bold; }
     .hidden { display: none !important; }
-    #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #16241b; padding: 10px 20px; border-radius: 10px; border: 1px solid var(--gold); z-index: 999; display: none; }
-    .fab { position: fixed; bottom: 24px; right: 24px; z-index: 998; width: 58px; height: 58px; border-radius: 50%; background: linear-gradient(135deg, var(--gold), #b8912a); border: none; font-size: 24px; cursor: pointer; box-shadow: 0 6px 18px rgba(0,0,0,0.5); }
+    #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #0d1f3c; padding: 10px 20px; border-radius: 10px; border: 1px solid var(--gold); z-index: 999; display: none; }
+    .fab { position: fixed; bottom: 25px; right: 25px; z-index: 998; background: linear-gradient(135deg, #1d4ed8, #3b82f6); color: #fff; border: 2px solid rgba(255,255,255,0.2); padding: 14px 24px; border-radius: 50px; font-weight: bold; font-family: inherit; font-size: 14px; cursor: pointer; box-shadow: 0 4px 20px rgba(0,0,0,0.4); transition: 0.3s; }
+    .fab:hover { transform: scale(1.05); }
     .vgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 8px; margin-bottom: 10px; }
-    .vcard { border: 2px solid var(--border); border-radius: 10px; padding: 6px; text-align: center; cursor: pointer; font-size: 11px; background: rgba(5,15,10,0.6); }
-    .vcard.sel { border-color: var(--gold); background: rgba(212,175,55,0.12); }
+    .vcard { border: 2px solid var(--border); border-radius: 10px; padding: 6px; text-align: center; cursor: pointer; font-size: 11px; background: rgba(255,255,255,0.03); }
+    .vcard.sel { border-color: var(--gold); background: rgba(59,130,246,0.12); }
     .vcard img { width: 100%; height: 54px; object-fit: cover; border-radius: 6px; margin-bottom: 4px; }
-    footer { text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid var(--border); background: rgba(5,15,10,0.8); color: var(--muted); font-size: 0.9rem; }
+    .login-screen { text-align: center; padding: 4rem 2rem; }
+    .login-screen h1 { font-size: 3rem; color: #3b82f6; text-shadow: 0 0 20px rgba(59,130,246,0.5); margin-bottom: 10px; }
+    footer { text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--muted); font-size: 0.9rem; }
 </style>
 </head>
 <body>
 <div id="warn-banner">⚠️ تنبيه: هذا الموقع مخصص للمحاكاة واللعب فقط، ولا يمت للواقع بصلة.</div>
+<nav>
+    <div class="logo">🚨 ${CONFIG.SITE_NAME}</div>
+    <ul class="nav-links" id="nav-links"></ul>
+    <button class="hamburger-btn" onclick="toggleMobileMenu()">☰</button>
+</nav>
+<div class="mobile-menu" id="mobile-menu"></div>
 <div class="wrap" id="app"><div class="card center">جارِ التحميل...</div></div>
 <div id="toast"></div>
 <footer><p>جميع الحقوق محفوظة © 2026 | <span style="color:#d4af37;font-weight:bold;">${CONFIG.SITE_NAME}</span></p></footer>
 
 <script>
+const MILITARY_RANKS = ${JSON.stringify(CONFIG.MILITARY_RANKS)};
 let ME = null;
 let lastKnownRank = null;
 let META = { types: [], vehicles: [] };
@@ -975,9 +1045,31 @@ async function init() {
     try { ME = await api('/api/me'); } catch (e) { renderLogin(); return; }
     if (ME.blocked) { renderBlocked(ME.reason); return; }
     lastKnownRank = ME.rank;
+    buildNav();
     if (!ME.registeredName || !ME.unit) { renderSetup(); return; }
     renderDashboard();
     startPolling();
+}
+function buildNav() {
+    const links = document.getElementById('nav-links');
+    const mobile = document.getElementById('mobile-menu');
+    if (!ME || ME.blocked) { links.innerHTML = ''; mobile.innerHTML = ''; return; }
+    const items = [
+        { label: '🏠 الرئيسية', fn: 'renderDashboard()' },
+        { label: '📝 تسجيل مخالفة', fn: 'renderNewViolation()' },
+        { label: '📋 مخالفاتي', fn: 'renderMinePage()' },
+        { label: '🪪 بطاقتي', fn: 'renderCard()' },
+    ];
+    if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
+    items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
+    links.innerHTML = items.map(i => \`<button onclick="\${i.fn}">\${i.label}</button>\`).join('');
+    mobile.innerHTML = items.map(i => \`<button onclick="\${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
+}
+function toggleMobileMenu() { document.getElementById('mobile-menu').classList.toggle('open'); }
+function closeMobileMenu() { document.getElementById('mobile-menu').classList.remove('open'); }
+function renderMinePage() {
+    document.getElementById('app').innerHTML = \`<div class="card"><h2>📋 مخالفاتي</h2><div id="mine-list">جارِ التحميل...</div></div>\`;
+    loadMine();
 }
 function startPolling() {
     setInterval(async () => {
@@ -1004,19 +1096,23 @@ function startPolling() {
     }, 9000);
 }
 function renderLogin() {
+    document.getElementById('nav-links').innerHTML = '';
+    document.getElementById('mobile-menu').innerHTML = '';
     document.getElementById('app').innerHTML = \`
-        <div class="card center" style="margin-top:60px;">
+        <div class="login-screen">
             <h1>${CONFIG.SITE_NAME}</h1>
-            <p style="color:var(--muted);margin-bottom:24px;">نظام إدارة عسكري لمنسوبي الجهات العسكرية</p>
-            <a href="/auth/discord" style="display:inline-flex;align-items:center;justify-content:center;gap:10px;background:linear-gradient(135deg,#d4af37,#b8912a);color:#201705;font-weight:bold;font-size:17px;padding:16px 34px;border-radius:999px;text-decoration:none;box-shadow:0 6px 18px rgba(212,175,55,0.35);">
+            <p style="color:var(--muted);margin-bottom:28px;">نظام إدارة عسكري لمنسوبي الجهات العسكرية</p>
+            <a href="/auth/discord" style="display:inline-flex;align-items:center;justify-content:center;gap:10px;background:#5865F2;color:#fff;font-weight:bold;font-size:16px;padding:16px 34px;border-radius:10px;text-decoration:none;box-shadow:0 6px 18px rgba(88,101,242,0.4);">
                 <span>🔒</span><span>تسجيل الدخول عبر ديسكورد</span>
             </a>
         </div>\`;
 }
 function renderBlocked(reason) {
+    document.getElementById('nav-links').innerHTML = '';
+    document.getElementById('mobile-menu').innerHTML = '';
     document.getElementById('app').innerHTML = \`
         <div class="card center" style="margin-top:60px;">
-            <h2 style="color:#fb7185;">🚫 غير مصرح</h2>
+            <h2 style="color:#fca5a5;">🚫 غير مصرح</h2>
             <p style="color:var(--muted);margin-top:10px;">\${reason}</p>
             <a class="btn gray" href="/auth/logout" style="margin-top:16px;">تسجيل خروج</a>
         </div>\`;
@@ -1075,7 +1171,7 @@ function renderDashboard() {
             <div id="notes-box" style="margin:10px 0;"></div>
             <div id="mine-list">جارِ التحميل...</div>
         </div>
-        \${ME.isSeniorAdmin ? '<button class="fab" title="لوحة تحكم كبار المسؤولين" onclick="renderAdmin()">🛡️</button>' : ''}
+        \${ME.isSeniorAdmin ? '<button class="fab" onclick="renderAdmin()">🛡️ لوحة كبار المسؤولين</button>' : ''}
     \`;
     loadMine();
     renderNotes();
@@ -1238,22 +1334,49 @@ async function loadPersonnel() {
     box.innerHTML = \`<div class="card"><input id="p-search" placeholder="بحث بالاسم / اليونت / التاق" onkeyup="if(event.key==='Enter') searchPersonnel()"><button class="btn sm" onclick="searchPersonnel()">بحث</button></div><div id="p-list"></div>\`;
     searchPersonnel();
 }
+let personnelCache = [];
 async function searchPersonnel() {
     const q = document.getElementById('p-search') ? document.getElementById('p-search').value : '';
     const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
-    document.getElementById('p-list').innerHTML = list.map(p => \`
-        <div class="card">
+    personnelCache = list;
+    document.getElementById('p-list').innerHTML = list.map((p, i) => \`
+        <div class="card" id="pcard-\${i}">
             <div class="row">
                 <div>
                     <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
                     <div style="font-size:13px;color:#94a3b8;">النقاط: \${p.points} \${p.isBlocked ? '• 🚫 موقوف' : ''}</div>
                 </div>
                 <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="toggleEdit(\${i})">تعديل</button>
                     <button class="btn sm gray" onclick="addNote('\${p.discord}')">ملاحظة</button>
-                    <button class="btn sm \${p.isBlocked ? '' : 'danger'}" onclick="toggleBlock('\${p.discord}', \${!p.isBlocked})">\${p.isBlocked ? 'إلغاء الإيقاف' : 'إيقاف'}</button>
+                    <button class="btn sm \${p.isBlocked ? '' : 'danger'}" onclick="toggleBlock('\${p.discord}', \${!p.isBlocked})">\${p.isBlocked ? 'إلغاء الإيقاف' : 'إيقاف (بند)'}</button>
                 </div>
             </div>
+            <div id="pedit-\${i}" class="hidden" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label>الاسم</label><input id="pe-name-\${i}" value="\${p.registeredName || ''}">
+                <label>اليونت</label><input id="pe-unit-\${i}" value="\${p.unit || ''}">
+                <label>الرتبة العسكرية</label>
+                <select id="pe-rank-\${i}">\${MILITARY_RANKS.map(r => \`<option \${r === p.rank ? 'selected' : ''}>\${r}</option>\`).join('')}</select>
+                <label>النقاط</label><input type="number" id="pe-points-\${i}" value="\${p.points}">
+                <button class="btn sm" onclick="saveEdit('\${p.discord}', \${i})">حفظ التعديلات</button>
+            </div>
         </div>\`).join('') || '<div class="card center" style="color:var(--muted);">لا نتائج</div>';
+}
+function toggleEdit(i) {
+    document.getElementById('pedit-' + i).classList.toggle('hidden');
+}
+async function saveEdit(discordId, i) {
+    const body = {
+        name: document.getElementById('pe-name-' + i).value,
+        unit: document.getElementById('pe-unit-' + i).value,
+        rank: document.getElementById('pe-rank-' + i).value,
+        points: document.getElementById('pe-points-' + i).value,
+    };
+    try {
+        await api('/api/senior/personnel/' + discordId + '/update', { method: 'POST', body: JSON.stringify(body) });
+        toast('✅ تم حفظ التعديلات');
+        searchPersonnel();
+    } catch (e) { toast(e.message); }
 }
 function addNote(discordId) {
     const text = prompt('اكتب الملاحظة:');
