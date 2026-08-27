@@ -206,6 +206,37 @@ async function rankProgress(p, settings) {
     return { currentRank: p.rank, nextRank, threshold, remaining };
 }
 
+// النقاط اللي المفروض يكون العسكري وصلها عشان يستحق هذي الرتبة بشكل طبيعي
+// (نفس عدد نقاط عتبة الرتبة اللي قبلها مباشرة)
+async function pointsForReachingRank(rankName, settings) {
+    const idx = rankIndex(rankName);
+    if (idx <= 0) return 0;
+    const prevRank = CONFIG.MILITARY_RANKS[idx - 1];
+    return await getThreshold(prevRank, settings);
+}
+
+// يفحص إذا العسكري وصل للنقاط المطلوبة لرتبته الحالية ويرقّيه تلقائياً
+// (يدعم أكثر من رتبة دفعة وحدة لو جمع نقاط كثيرة، وينقل الباقي للرتبة الجديدة)
+async function checkAutoPromotion(discordId) {
+    const settings = await getSettings();
+    const p = await Personnel.findOne({ discord: discordId });
+    if (!p) return;
+    let promoted = false;
+    let guard = 0;
+    while (guard++ < CONFIG.MILITARY_RANKS.length) {
+        const idx = rankIndex(p.rank);
+        if (idx >= CONFIG.MILITARY_RANKS.length - 1) break; // وصل لأعلى رتبة
+        const threshold = await getThreshold(p.rank, settings);
+        if (threshold <= 0 || p.points < threshold) break;
+        const oldRank = p.rank;
+        p.rank = CONFIG.MILITARY_RANKS[idx + 1];
+        p.points -= threshold;
+        promoted = true;
+        await logEvent("نظام تلقائي", "🤖 نظام تلقائي", "ترقية تلقائية", `<@${discordId}>: ${oldRank} ← ${p.rank} (وصل للنقاط المطلوبة)`);
+    }
+    if (promoted) await p.save();
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // 3) بوت الديسكورد
 // ══════════════════════════════════════════════════════════════════════════
@@ -307,6 +338,7 @@ async function approveViolation(v, actorId, actorTag) {
     v.status = "approved"; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
     await v.save();
     await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: CONFIG.POINTS_ON_APPROVE } });
+    await checkAutoPromotion(v.reporterDiscord);
     await syncViolationMessage(v);
     await logEvent(actorId, actorTag, "قبول مخالفة", `${v.violationType} — ${v.reporterName}`);
 }
@@ -505,12 +537,19 @@ client.on("interactionCreate", async interaction => {
                         rankFlowState.delete(interaction.user.id);
                         return interaction.followUp({ content: "❌ انتهت العملية بالفشل بسبب تنزيله لرتبة أعلى من أو تساوي رتبته الحالية.", ephemeral: true });
                     }
+                    const settingsForRank = await getSettings();
+                    const rankUpdate = { rank: newRank };
+                    if (text === "ترقية") {
+                        rankUpdate.points = await pointsForReachingRank(newRank, settingsForRank);
+                    } else {
+                        rankUpdate.points = 0; // تنزيل الرتبة يصفّر النقاط عشان ما يترقى تلقائي مرة ثانية بنفس النقاط
+                    }
                     await Personnel.findOneAndUpdate(
                         { discord: targetId },
-                        { $set: { rank: newRank }, $setOnInsert: { discordTag: targetId } },
+                        { $set: rankUpdate, $setOnInsert: { discordTag: targetId } },
                         { upsert: true }
                     );
-                    await logEvent(interaction.user.id, interaction.user.username, text === "ترقية" ? "ترقية عسكري" : "تنزيل عسكري", `<@${targetId}>: ${currentRank} ← ${newRank}`);
+                    await logEvent(interaction.user.id, interaction.user.username, text === "ترقية" ? "ترقية عسكري" : "تنزيل عسكري", `<@${targetId}>: ${currentRank} ← ${newRank} (النقاط: ${rankUpdate.points})`);
                     rankFlowState.delete(interaction.user.id);
                     return interaction.followUp({ content: `✅ تم ${text === "ترقية" ? "ترقية" : "تنزيل"} <@${targetId}> إلى رتبة **${newRank}**.`, ephemeral: true });
                 } catch (e) {
@@ -557,6 +596,7 @@ client.on("interactionCreate", async interaction => {
                     { new: true, upsert: true }
                 );
                 await logEvent(interaction.user.id, interaction.user.username, "تعديل نقاط", `<@${targetId}>: ${amount >= 0 ? "+" : ""}${amount} → المجموع ${p.points}`);
+                await checkAutoPromotion(targetId);
                 return interaction.reply({ content: `✅ تم تعديل نقاط <@${targetId}>. النقاط الحالية: **${p.points}**`, ephemeral: true });
             }
         }
@@ -840,15 +880,30 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
     const update = {};
     if (typeof name === "string" && name.trim()) update.registeredName = name.trim();
     if (typeof unit === "string" && unit.trim()) update.unit = unit.trim();
+
+    const settings = await getSettings();
+    const existing = await Personnel.findOne({ discord: req.params.discord });
+    const oldIdx = rankIndex(existing ? existing.rank : "مستجد");
+
     if (typeof rank === "string" && rank.trim()) {
-        if (!CONFIG.MILITARY_RANKS.includes(rank.trim())) return res.status(400).json({ error: "رتبة غير موجودة" });
-        update.rank = rank.trim();
+        const newRank = rank.trim();
+        if (!CONFIG.MILITARY_RANKS.includes(newRank)) return res.status(400).json({ error: "رتبة غير موجودة" });
+        update.rank = newRank;
+
+        // إذا ما حط الأدمن نقاط يدوياً مع الرتبة، نعطيه تلقائياً النقاط المناسبة لرتبته الجديدة
+        const explicitPoints = points !== undefined && points !== "" && !isNaN(parseInt(points));
+        if (!explicitPoints) {
+            const newIdx = rankIndex(newRank);
+            if (newIdx > oldIdx) update.points = await pointsForReachingRank(newRank, settings);
+            else if (newIdx < oldIdx) update.points = 0; // تنزيل الرتبة يصفّر النقاط عشان ما يترقى تلقائي بنفس النقاط القديمة
+        }
     }
     if (points !== undefined && points !== "" && !isNaN(parseInt(points))) update.points = Math.max(0, parseInt(points));
 
     const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, update, { new: true });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent(req.user.id, req.user.username, "تعديل ملف عسكري", `${p.discord}: ${JSON.stringify(update)}`);
+    await checkAutoPromotion(req.params.discord);
     res.json({ ok: true, personnel: p });
 });
 
