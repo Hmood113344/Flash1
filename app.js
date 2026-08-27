@@ -940,6 +940,32 @@ app.get("/api/senior/log", ensureSeniorAdmin, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// 4.5) APIs مخصصة لموقع البنك (ربط رواتب العساكر) — بدون تسجيل دخول ديسكورد
+//      يستخدمها البنك فقط للحصول على قائمة الرتب ورتبة كل عسكري مسجل
+// ══════════════════════════════════════════════════════════════════════════
+
+// قائمة الرتب العسكرية الرسمية (يستخدمها البنك لبناء جدول تحديد الرواتب)
+app.get("/api/bank/ranks", async (req, res) => {
+    res.json({ success: true, ranks: CONFIG.MILITARY_RANKS });
+});
+
+// رتبة كل عسكري مسجل (يستخدمها البنك وقت توزيع الرواتب لمطابقة كل حساب برتبته)
+app.get("/api/bank/personnel-ranks", async (req, res) => {
+    try {
+        const list = await Personnel.find({ isBlocked: false }, "discord discordTag rank registeredName");
+        const personnel = list.map(p => ({
+            discord: p.discord,
+            discordTag: p.discordTag,
+            rank: p.rank,
+            registeredName: p.registeredName,
+        }));
+        res.json({ success: true, personnel });
+    } catch (e) {
+        res.json({ success: false, msg: e.message });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 // 5) الواجهة (صفحة واحدة SPA)
 // ══════════════════════════════════════════════════════════════════════════
 app.get("/", (req, res) => {
