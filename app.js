@@ -93,7 +93,7 @@ const PersonnelSchema = new mongoose.Schema({
     discordTag: String,
     registeredName: { type: String, default: null },
     unit: { type: String, default: null },
-    rank: { type: String, default: "مستجد" },
+    rank: { type: String, default: "جندي" },
     points: { type: Number, default: 0 },
     notes: [{
         text: String, addedBy: String, addedByTag: String,
@@ -558,7 +558,7 @@ client.on("interactionCreate", async interaction => {
                         return interaction.followUp({ content: "❌ انتهت العملية بالفشل.", ephemeral: true });
                     }
                     const p = await Personnel.findOne({ discord: targetId });
-                    const currentRank = p ? p.rank : "مستجد";
+                    const currentRank = p ? p.rank : "جندي";
                     const currentIdx = rankIndex(currentRank);
                     await interaction.followUp({ content: `العضو الآن رتبته **${currentRank}**.\n✍️ وش تبي تعطيه؟ اكتب اسم الرتبة الجديدة بالضبط (خلال 60 ثانية):`, ephemeral: true });
                     const collected2 = await interaction.channel.awaitMessages({ filter, max: 1, time: 60000, errors: ["time"] });
@@ -843,6 +843,7 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
 
         const { violationType, vehicle, photo } = req.body;
         if (!violationType || !vehicle) return res.status(400).json({ error: "أكمل نوع المخالفة والمركبة" });
+        if (!photo) return res.status(400).json({ error: "لازم ترفق صورة المخالفة" });
         if (photo && photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
             return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
         }
@@ -936,7 +937,7 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
 
     const settings = await getSettings();
     const existing = await Personnel.findOne({ discord: req.params.discord });
-    const oldIdx = rankIndex(existing ? existing.rank : "مستجد");
+    const oldIdx = rankIndex(existing ? existing.rank : "جندي");
 
     if (typeof rank === "string" && rank.trim()) {
         const newRank = rank.trim();
@@ -1347,8 +1348,8 @@ async function renderNewViolation() {
                     \${v.photo ? \`<img src="\${v.photo}">\` : ''}
                     <div>\${v.name}</div>
                 </div>\`).join('')}</div>\` : '<p style="color:var(--muted);margin-bottom:10px;">لا توجد مركبات مضافة</p>'}
-            <label>صورة المخالفة (اختياري)</label>
-            <input type="file" id="v-photo" accept="image/*" onchange="previewPhoto()">
+            <label>صورة المخالفة (إجباري)</label>
+            <input type="file" id="v-photo" accept="image/*" onchange="previewPhoto()" required>
             <img id="v-photo-preview" style="display:none;max-width:220px;border-radius:8px;margin-bottom:10px;">
             <div class="row" style="gap:8px;margin-top:10px;">
                 <button class="btn" onclick="submitViolation()">إرسال</button>
@@ -1377,6 +1378,7 @@ function previewPhoto() {
 async function submitViolation() {
     const violationType = document.getElementById('v-type').value;
     if (!selectedVehicle) return toast('اختر المركبة');
+    if (!photoBase64) return toast('لازم ترفق صورة المخالفة');
     try {
         await api('/api/violations/submit', { method: 'POST', body: JSON.stringify({ violationType, vehicle: selectedVehicle, photo: photoBase64 }) });
         toast('تم الإرسال، بانتظار قبول الإدارة'); renderDashboard();
