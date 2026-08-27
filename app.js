@@ -590,14 +590,17 @@ client.on("interactionCreate", async interaction => {
                 const targetId = interaction.customId.split("_")[1];
                 const amount = parseInt(interaction.fields.getTextInputValue("amount"));
                 if (isNaN(amount)) return interaction.reply({ content: "❌ الرقم غير صحيح.", ephemeral: true });
-                const p = await Personnel.findOneAndUpdate(
+                const before = await Personnel.findOneAndUpdate(
                     { discord: targetId },
                     { $inc: { points: amount }, $setOnInsert: { discordTag: targetId } },
                     { new: true, upsert: true }
                 );
-                await logEvent(interaction.user.id, interaction.user.username, "تعديل نقاط", `<@${targetId}>: ${amount >= 0 ? "+" : ""}${amount} → المجموع ${p.points}`);
+                await logEvent(interaction.user.id, interaction.user.username, "تعديل نقاط", `<@${targetId}>: ${amount >= 0 ? "+" : ""}${amount} → المجموع ${before.points}`);
+                const oldRank = before.rank;
                 await checkAutoPromotion(targetId);
-                return interaction.reply({ content: `✅ تم تعديل نقاط <@${targetId}>. النقاط الحالية: **${p.points}**`, ephemeral: true });
+                const after = await Personnel.findOne({ discord: targetId });
+                const promoMsg = (after && after.rank !== oldRank) ? `\n🎖️ ترقى تلقائياً من **${oldRank}** إلى **${after.rank}**!` : "";
+                return interaction.reply({ content: `✅ تم تعديل نقاط <@${targetId}>. النقاط الحالية: **${after ? after.points : before.points}**${promoMsg}`, ephemeral: true });
             }
         }
     } catch (e) {
