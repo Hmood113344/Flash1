@@ -369,6 +369,17 @@ const commands = [
     new SlashCommandBuilder()
         .setName("لوحة-القيادة")
         .setDescription("فتح لوحة أوامر القيادة العسكرية"),
+
+    new SlashCommandBuilder()
+        .setName("حظر")
+        .setDescription("حظر عسكري من الموقع (كبار المسؤولين فقط)")
+        .addUserOption(o => o.setName("اللاعب").setDescription("العسكري المطلوب حظره").setRequired(true))
+        .addStringOption(o => o.setName("السبب").setDescription("سبب الحظر").setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName("فك-حظر")
+        .setDescription("فك حظر عسكري عن الموقع (كبار المسؤولين فقط)")
+        .addUserOption(o => o.setName("اللاعب").setDescription("العسكري المطلوب فك حظره").setRequired(true)),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -426,6 +437,36 @@ client.on("interactionCreate", async interaction => {
                     return interaction.reply({ content: "🚫 هذا الأمر مخصص للقيادة العسكرية فقط.", ephemeral: true });
                 }
                 return interaction.reply({ embeds: [commandPanelEmbed()], components: [commandPanelRow()] });
+            }
+
+            if (commandName === "حظر") {
+                if (!isSeniorAdmin(interaction.user.id)) {
+                    return interaction.reply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط.", ephemeral: true });
+                }
+                const target = interaction.options.getUser("اللاعب");
+                const reason = interaction.options.getString("السبب");
+                await Personnel.findOneAndUpdate(
+                    { discord: target.id },
+                    {
+                        $set: { isBlocked: true },
+                        $push: { notes: { text: `🚫 حظر من الموقع — السبب: ${reason}`, addedBy: interaction.user.id, addedByTag: interaction.user.username } },
+                        $setOnInsert: { discordTag: target.username },
+                    },
+                    { upsert: true }
+                );
+                await logEvent(interaction.user.id, interaction.user.username, "حظر عسكري (أمر)", `<@${target.id}> — السبب: ${reason}`);
+                return interaction.reply({ content: `🚫 تم حظر <@${target.id}> من الموقع.\n📝 السبب: ${reason}`, ephemeral: true });
+            }
+
+            if (commandName === "فك-حظر") {
+                if (!isSeniorAdmin(interaction.user.id)) {
+                    return interaction.reply({ content: "🚫 هذا الأمر مخصص لكبار المسؤولين فقط.", ephemeral: true });
+                }
+                const target = interaction.options.getUser("اللاعب");
+                const p = await Personnel.findOneAndUpdate({ discord: target.id }, { isBlocked: false }, { new: true });
+                if (!p) return interaction.reply({ content: "❌ هذا اللاعب غير مسجل بالنظام أصلاً.", ephemeral: true });
+                await logEvent(interaction.user.id, interaction.user.username, "فك حظر عسكري (أمر)", `<@${target.id}>`);
+                return interaction.reply({ content: `✅ تم فك حظر <@${target.id}> من الموقع.`, ephemeral: true });
             }
             return;
         }
@@ -875,6 +916,15 @@ app.post("/api/senior/personnel/:discord/block", ensureSeniorAdmin, async (req, 
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent(req.user.id, req.user.username, blocked ? "إيقاف عسكري" : "إلغاء إيقاف", p.registeredName || p.discord);
     res.json({ ok: true, isBlocked: p.isBlocked });
+});
+
+// حذف نهائي لحساب عسكري — يحذف السجل بالكامل من قاعدة البيانات (يختفي من الصفحة نهائياً)
+// العسكري يقدر يقدم/يسجل من جديد بعدها عادي لأنه يصير كأنه ما سجل قبل
+app.delete("/api/senior/personnel/:discord", ensureSeniorAdmin, async (req, res) => {
+    const p = await Personnel.findOneAndDelete({ discord: req.params.discord });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent(req.user.id, req.user.username, "حذف حساب نهائي", `${p.registeredName || p.discordTag || p.discord} (${p.discord})`);
+    res.json({ ok: true });
 });
 
 // تعديل شامل لملف عسكري: الاسم، اليونت، الرتبة، النقاط — من لوحة كبار المسؤولين مباشرة
@@ -1353,7 +1403,7 @@ function renderAdmin() {
     const tabsHtml = ME.isSeniorAdmin ? \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
-            <div class="tab" onclick="adminTab('personnel', this)">العسكريون</div>
+            <div class="tab" onclick="adminTab('personnel', this)">الحسابات</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
@@ -1436,6 +1486,7 @@ async function searchPersonnel() {
                     <button class="btn sm gray" onclick="toggleEdit(\${i})">تعديل</button>
                     <button class="btn sm gray" onclick="addNote('\${p.discord}')">ملاحظة</button>
                     <button class="btn sm \${p.isBlocked ? '' : 'danger'}" onclick="toggleBlock('\${p.discord}', \${!p.isBlocked})">\${p.isBlocked ? 'إلغاء الإيقاف' : 'إيقاف (بند)'}</button>
+                    <button class="btn sm danger" onclick="deletePersonnel('\${p.discord}', '\${(p.registeredName || p.discordTag || '').replace(/'/g, "\\\\'")}')">🗑️ حذف نهائي</button>
                 </div>
             </div>
             <div id="pedit-\${i}" class="hidden" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
@@ -1443,7 +1494,7 @@ async function searchPersonnel() {
                 <label>اليونت</label><input id="pe-unit-\${i}" value="\${p.unit || ''}">
                 <label>الرتبة العسكرية</label>
                 <select id="pe-rank-\${i}">\${MILITARY_RANKS.map(r => \`<option \${r === p.rank ? 'selected' : ''}>\${r}</option>\`).join('')}</select>
-                <label>النقاط</label><input type="number" id="pe-points-\${i}" value="\${p.points}">
+                <label>النقاط</label><input type="number" id="pe-points-\${i}" data-original="\${p.points}" value="\${p.points}">
                 <button class="btn sm" onclick="saveEdit('\${p.discord}', \${i})">حفظ التعديلات</button>
             </div>
         </div>\`).join('') || '<div class="card center" style="color:var(--muted);">لا نتائج</div>';
@@ -1452,15 +1503,26 @@ function toggleEdit(i) {
     document.getElementById('pedit-' + i).classList.toggle('hidden');
 }
 async function saveEdit(discordId, i) {
+    const pointsInput = document.getElementById('pe-points-' + i);
+    const pointsChanged = pointsInput.value !== pointsInput.dataset.original;
     const body = {
         name: document.getElementById('pe-name-' + i).value,
         unit: document.getElementById('pe-unit-' + i).value,
         rank: document.getElementById('pe-rank-' + i).value,
-        points: document.getElementById('pe-points-' + i).value,
+        // نرسل النقاط بس إذا الأدمن عدّلها فعلاً بنفسه، عشان النظام يقدر يحسبها تلقائياً وقت تغيير الرتبة بدون ما تظل "معلّقة" على القيمة القديمة
+        points: pointsChanged ? pointsInput.value : '',
     };
     try {
         await api('/api/senior/personnel/' + discordId + '/update', { method: 'POST', body: JSON.stringify(body) });
         toast('✅ تم حفظ التعديلات');
+        searchPersonnel();
+    } catch (e) { toast(e.message); }
+}
+async function deletePersonnel(discordId, displayName) {
+    if (!confirm('متأكد تبي تحذف حساب "' + (displayName || discordId) + '" نهائياً؟ ما يمكن التراجع عن هذا الإجراء.')) return;
+    try {
+        await api('/api/senior/personnel/' + discordId, { method: 'DELETE' });
+        toast('🗑️ تم حذف الحساب نهائياً');
         searchPersonnel();
     } catch (e) { toast(e.message); }
 }
