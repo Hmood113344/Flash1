@@ -150,10 +150,14 @@ const VehicleSchema = new mongoose.Schema({
 const Vehicle = mongoose.model("Vehicle", VehicleSchema);
 
 const LogSchema = new mongoose.Schema({
-    actorId: String,
-    actorTag: String,
-    action: String,
-    detail: String,
+    discordId: { type: String, default: null },     // آيدي الشخص المتأثر بالحدث (العسكري مثلاً)
+    discordTag: { type: String, default: null },
+    actorId: { type: String, default: null },        // آيدي اللي سوى الإجراء
+    actorTag: { type: String, default: null },
+    action: String,        // نوع الحدث
+    site: { type: String, default: "فلاش" },
+    accountNumber: { type: String, default: null },
+    details: { type: String, default: "" },
     createdAt: { type: Date, default: Date.now }
 });
 const Log = mongoose.model("Log", LogSchema);
@@ -183,8 +187,8 @@ async function getSettings() {
     return s;
 }
 
-async function logEvent(actorId, actorTag, action, detail) {
-    try { await Log.create({ actorId, actorTag, action, detail }); } catch (e) { /* تجاهل */ }
+async function logEvent({ action, discordId = null, discordTag = null, actorId = null, actorTag = null, site = "فلاش", accountNumber = null, details = "" }) {
+    try { await Log.create({ action, discordId, discordTag, actorId, actorTag, site, accountNumber, details }); } catch (e) { /* تجاهل */ }
 }
 
 function generatePlate() {
@@ -250,7 +254,7 @@ async function checkAutoPromotion(discordId) {
         p.rank = CONFIG.MILITARY_RANKS[idx + 1];
         p.points -= threshold;
         promoted = true;
-        await logEvent("نظام تلقائي", "🤖 نظام تلقائي", "ترقية تلقائية", `<@${discordId}>: ${oldRank} ← ${p.rank} (وصل للنقاط المطلوبة)`);
+        await logEvent({ action: "ترقية تلقائية", discordId, discordTag: p.discordTag, actorId: "نظام تلقائي", actorTag: "🤖 نظام تلقائي", details: `${oldRank} ← ${p.rank} (وصل للنقاط المطلوبة)` });
     }
     if (promoted) await p.save();
 }
@@ -391,7 +395,7 @@ async function approveViolation(v, actorId, actorTag) {
     await checkAutoPromotion(v.reporterDiscord);
     await syncViolationMessage(v);
     const label = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
-    await logEvent(actorId, actorTag, v.kind === "report" ? "قبول تقرير" : "قبول مخالفة", `${label} — ${v.reporterName}`);
+    await logEvent({ action: v.kind === "report" ? "قبول تقرير" : "قبول مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${label} — ${v.reporterName}` });
 }
 
 async function rejectViolation(v, actorId, actorTag, reason) {
@@ -402,7 +406,7 @@ async function rejectViolation(v, actorId, actorTag, reason) {
     await Personnel.updateOne({ discord: v.reporterDiscord, points: { $lt: 0 } }, { $set: { points: 0 } });
     await syncViolationMessage(v);
     const rlabel = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
-    await logEvent(actorId, actorTag, v.kind === "report" ? "رفض تقرير" : "رفض مخالفة", `${rlabel} — ${v.reporterName} — السبب: ${reason}`);
+    await logEvent({ action: v.kind === "report" ? "رفض تقرير" : "رفض مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${rlabel} — ${v.reporterName} — السبب: ${reason}` });
 }
 
 const commands = [
@@ -507,7 +511,7 @@ client.on("interactionCreate", async interaction => {
                     },
                     { upsert: true }
                 );
-                await logEvent(interaction.user.id, interaction.user.username, "حظر عسكري (أمر)", `<@${target.id}> — السبب: ${reason}`);
+                await logEvent({ action: "حظر عسكري (أمر)", discordId: target.id, discordTag: target.username, actorId: interaction.user.id, actorTag: interaction.user.username, details: `السبب: ${reason}` });
                 return interaction.reply({ content: `🚫 تم حظر <@${target.id}> من الموقع.\n📝 السبب: ${reason}`, ephemeral: true });
             }
 
@@ -518,7 +522,7 @@ client.on("interactionCreate", async interaction => {
                 const target = interaction.options.getUser("اللاعب");
                 const p = await Personnel.findOneAndUpdate({ discord: target.id }, { isBlocked: false }, { new: true });
                 if (!p) return interaction.reply({ content: "❌ هذا اللاعب غير مسجل بالنظام أصلاً.", ephemeral: true });
-                await logEvent(interaction.user.id, interaction.user.username, "فك حظر عسكري (أمر)", `<@${target.id}>`);
+                await logEvent({ action: "فك حظر عسكري (أمر)", discordId: target.id, discordTag: target.username, actorId: interaction.user.id, actorTag: interaction.user.username });
                 return interaction.reply({ content: `✅ تم فك حظر <@${target.id}> من الموقع.`, ephemeral: true });
             }
             return;
@@ -643,7 +647,7 @@ client.on("interactionCreate", async interaction => {
                         { $set: rankUpdate, $setOnInsert: { discordTag: targetId } },
                         { upsert: true }
                     );
-                    await logEvent(interaction.user.id, interaction.user.username, text === "ترقية" ? "ترقية عسكري" : "تنزيل عسكري", `<@${targetId}>: ${currentRank} ← ${newRank} (النقاط: ${rankUpdate.points})`);
+                    await logEvent({ action: text === "ترقية" ? "ترقية عسكري" : "تنزيل عسكري", discordId: targetId, discordTag: p ? p.discordTag : targetId, actorId: interaction.user.id, actorTag: interaction.user.username, details: `${currentRank} ← ${newRank} (النقاط: ${rankUpdate.points})` });
                     rankFlowState.delete(interaction.user.id);
                     return interaction.followUp({ content: `✅ تم ${text === "ترقية" ? "ترقية" : "تنزيل"} <@${targetId}> إلى رتبة **${newRank}**.`, ephemeral: true });
                 } catch (e) {
@@ -677,7 +681,7 @@ client.on("interactionCreate", async interaction => {
                     { $set: update, $setOnInsert: { discordTag: targetId } },
                     { new: true, upsert: true }
                 );
-                await logEvent(interaction.user.id, interaction.user.username, "تعيين يونت", `<@${targetId}> → ${p.unit}`);
+                await logEvent({ action: "تعيين يونت", discordId: targetId, discordTag: p.discordTag, actorId: interaction.user.id, actorTag: interaction.user.username, details: `→ ${p.unit}` });
                 return interaction.reply({ content: `✅ تم تعيين <@${targetId}> إلى يونت **${p.unit}**${update.rank ? ` برتبة **${p.rank}**` : ""}.`, ephemeral: true });
             }
             if (interaction.customId.startsWith("pointsmodal_")) {
@@ -689,7 +693,7 @@ client.on("interactionCreate", async interaction => {
                     { $inc: { points: amount }, $setOnInsert: { discordTag: targetId } },
                     { new: true, upsert: true }
                 );
-                await logEvent(interaction.user.id, interaction.user.username, "تعديل نقاط", `<@${targetId}>: ${amount >= 0 ? "+" : ""}${amount} → المجموع ${before.points}`);
+                await logEvent({ action: "تعديل نقاط", discordId: targetId, discordTag: before.discordTag, actorId: interaction.user.id, actorTag: interaction.user.username, details: `${amount >= 0 ? "+" : ""}${amount} → المجموع ${before.points}` });
                 const oldRank = before.rank;
                 await checkAutoPromotion(targetId);
                 const after = await Personnel.findOne({ discord: targetId });
@@ -1035,15 +1039,42 @@ app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, r
         { new: true }
     );
     if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent(req.user.id, req.user.username, "إضافة ملاحظة", `على ${p.registeredName || p.discord}: ${text.trim()}`);
+    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `على ${p.registeredName || p.discord}: ${text.trim()}` });
     res.json({ ok: true, notes: p.notes });
+});
+
+// يجيب كل الملاحظات المضافة على كل العساكر بصفحة وحدة (لكبار المسؤولين)
+app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
+    const list = await Personnel.find({ "notes.0": { $exists: true } }, { discord: 1, discordTag: 1, registeredName: 1, notes: 1 });
+    const flat = [];
+    for (const p of list) {
+        for (const n of p.notes) {
+            flat.push({
+                noteId: n._id, discord: p.discord, personnelName: p.registeredName || p.discordTag || p.discord,
+                text: n.text, addedBy: n.addedBy, addedByTag: n.addedByTag, createdAt: n.createdAt,
+            });
+        }
+    }
+    flat.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json({ list: flat });
+});
+
+app.delete("/api/senior/personnel/:discord/note/:noteId", ensureSeniorAdmin, async (req, res) => {
+    const p = await Personnel.findOneAndUpdate(
+        { discord: req.params.discord },
+        { $pull: { notes: { _id: req.params.noteId } } },
+        { new: true }
+    );
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent({ action: "حذف ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `من ${p.registeredName || p.discord}` });
+    res.json({ ok: true });
 });
 
 app.post("/api/senior/personnel/:discord/block", ensureSeniorAdmin, async (req, res) => {
     const { blocked } = req.body;
     const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, { isBlocked: !!blocked }, { new: true });
     if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent(req.user.id, req.user.username, blocked ? "إيقاف عسكري" : "إلغاء إيقاف", p.registeredName || p.discord);
+    await logEvent({ action: blocked ? "إيقاف عسكري" : "إلغاء إيقاف", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: p.registeredName || p.discord });
     res.json({ ok: true, isBlocked: p.isBlocked });
 });
 
@@ -1052,7 +1083,7 @@ app.post("/api/senior/personnel/:discord/block", ensureSeniorAdmin, async (req, 
 app.delete("/api/senior/personnel/:discord", ensureSeniorAdmin, async (req, res) => {
     const p = await Personnel.findOneAndDelete({ discord: req.params.discord });
     if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent(req.user.id, req.user.username, "حذف حساب نهائي", `${p.registeredName || p.discordTag || p.discord} (${p.discord})`);
+    await logEvent({ action: "حذف حساب نهائي", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: p.registeredName || p.discordTag || p.discord });
     res.json({ ok: true });
 });
 
@@ -1084,7 +1115,7 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
 
     const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, update, { new: true });
     if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent(req.user.id, req.user.username, "تعديل ملف عسكري", `${p.discord}: ${JSON.stringify(update)}`);
+    await logEvent({ action: "تعديل ملف عسكري", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(update) });
     await checkAutoPromotion(req.params.discord);
     res.json({ ok: true, personnel: p });
 });
@@ -1101,7 +1132,7 @@ app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
     if (typeof disableLogin === "boolean") s.disableLogin = disableLogin;
     if (typeof disableViolations === "boolean") s.disableViolations = disableViolations;
     await s.save();
-    await logEvent(req.user.id, req.user.username, "تعديل إعدادات الموقع", JSON.stringify(req.body));
+    await logEvent({ action: "تعديل إعدادات الموقع", actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(req.body) });
     res.json({ ok: true });
 });
 
@@ -1116,7 +1147,7 @@ app.post("/api/senior/hire-admin", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     if (!settings.adminList.includes(discordId.trim())) settings.adminList.push(discordId.trim());
     await settings.save();
-    await logEvent(req.user.id, req.user.username, "توظيف إداري", `${name || ""} (${discordId.trim()})`);
+    await logEvent({ action: "توظيف إداري", discordId: discordId.trim(), actorId: req.user.id, actorTag: req.user.username, details: name || "" });
     res.json({ ok: true });
 });
 
@@ -1125,7 +1156,7 @@ app.post("/api/senior/fire-admin", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     settings.adminList = settings.adminList.filter(id => id !== discordId);
     await settings.save();
-    await logEvent(req.user.id, req.user.username, "فصل إداري", discordId);
+    await logEvent({ action: "فصل إداري", discordId, actorId: req.user.id, actorTag: req.user.username });
     res.json({ ok: true });
 });
 
@@ -1142,7 +1173,7 @@ app.post("/api/senior/vehicles", ensureSeniorAdmin, async (req, res) => {
     }
     try {
         const v = await Vehicle.create({ name: name.trim(), photo: photo || null, addedBy: req.user.id });
-        await logEvent(req.user.id, req.user.username, "إضافة مركبة", v.name);
+        await logEvent({ action: "إضافة مركبة", actorId: req.user.id, actorTag: req.user.username, details: v.name });
         res.json({ ok: true, vehicle: v });
     } catch (e) { res.status(400).json({ error: "المركبة موجودة مسبقاً" }); }
 });
@@ -1167,7 +1198,20 @@ app.post("/api/senior/thresholds", ensureSeniorAdmin, async (req, res) => {
         if (CONFIG.MILITARY_RANKS.includes(rank)) settings.rankThresholds.set(rank, Math.max(0, parseInt(val) || 0));
     });
     await settings.save();
-    await logEvent(req.user.id, req.user.username, "تعديل حدود النقاط", "تحديث نقاط الترقية");
+    await logEvent({ action: "تعديل حدود النقاط", actorId: req.user.id, actorTag: req.user.username, details: "تحديث نقاط الترقية" });
+    res.json({ ok: true });
+});
+
+app.get("/api/senior/reviewed", ensureSeniorAdmin, async (req, res) => {
+    const list = await Violation.find({ status: { $in: ["approved", "rejected"] } }).sort({ reviewedAt: -1 }).limit(300);
+    res.json({ list });
+});
+
+app.delete("/api/senior/violations/:id", ensureSeniorAdmin, async (req, res) => {
+    const v = await Violation.findByIdAndDelete(req.params.id);
+    if (!v) return res.status(404).json({ error: "غير موجودة" });
+    const label = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
+    await logEvent({ action: "حذف نهائي", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId: req.user.id, actorTag: req.user.username, details: `${label} — ${v.reporterName}` });
     res.json({ ok: true });
 });
 
@@ -1260,6 +1304,7 @@ app.get("/", (req, res) => {
     .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
     .tab { background: rgba(255,255,255,0.04); border: 1px solid rgba(59,130,246,0.3); padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; color: #94a3b8; }
     .tab.active { background: var(--green2); color: #fff; border-color: var(--green2); }
+    .log-item { background: rgba(255,255,255,0.02); border: 1px solid rgba(59,130,246,0.2); border-radius: 8px; padding: 10px 15px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; font-size: 0.88rem; }
     .id-card { background: linear-gradient(135deg, #1e3a5f, #0f2848); border: 2px solid var(--gold); border-radius: 20px; padding: 22px; max-width: 400px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
     .rank-line { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 15px; color: var(--gold-soft); margin: 10px 0; font-weight: bold; }
     .hidden { display: none !important; }
@@ -1381,6 +1426,7 @@ function startPolling() {
             }
             if (document.getElementById('mine-list')) loadMine(true);
             if (document.getElementById('pending-box')) loadPending();
+            if (currentAdminTab === 'log') loadLog(true);
         } catch (e) {}
     }, 9000);
 }
@@ -1686,11 +1732,13 @@ function renderAdmin() {
     const tabsHtml = ME.isSeniorAdmin ? \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
+            <div class="tab" onclick="adminTab('reviewed', this)">المخالفات المقبولة</div>
             <div class="tab" onclick="adminTab('personnel', this)">الحسابات</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
+            <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
             <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
         </div>\` : '';
@@ -1705,11 +1753,13 @@ function adminTab(name, el) {
     if (el) el.classList.add('active');
     currentAdminTab = name;
     if (name === 'pending') loadPending();
+    if (name === 'reviewed') loadReviewed();
     if (name === 'personnel') loadPersonnel();
     if (name === 'vehicles') loadVehicles();
     if (name === 'hire') loadHire();
     if (name === 'thresholds') loadThresholds();
     if (name === 'log') loadLog();
+    if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
 }
 async function loadPending() {
@@ -1787,6 +1837,39 @@ function rejectV(id) {
     api('/api/admin/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
         .then(() => { toast('تم الرفض'); loadPending(); }).catch(e => toast(e.message));
 }
+async function loadReviewed() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    const { list } = await api('/api/senior/reviewed');
+    if (currentAdminTab !== 'reviewed') return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات أو تقارير تمت مراجعتها بعد</div>'; return; }
+    box.innerHTML = list.map(v => \`
+        <div class="card">
+            <div class="row" style="align-items:flex-start;">
+                <div class="row" style="gap:10px;align-items:flex-start;">
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    <div>
+                        <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
+                        <span class="status-badge" style="margin-right:8px;color:\${v.status === 'approved' ? '#4ade80' : '#fca5a5'};">\${v.status === 'approved' ? '✅ مقبولة' : '❌ مرفوضة'}</span>
+                        <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
+                        <div style="color:var(--muted);font-size:13px;">المركبة: \${v.vehicle} \${v.plateNumber ? '• اللوحة: ' + v.plateNumber : ''}</div>
+                        \${v.status === 'rejected' && v.rejectReason ? \`<div style="color:var(--muted);font-size:13px;">سبب الرفض: \${v.rejectReason}</div>\` : ''}
+                        <div style="color:var(--muted);font-size:12px;margin-top:4px;">راجعها: \${v.reviewedByTag || v.reviewedBy || '-'} \${v.reviewedAt ? '• ' + new Date(v.reviewedAt).toLocaleString('ar') : ''}</div>
+                    </div>
+                </div>
+                <div class="row" style="gap:8px;">
+                    <button class="btn danger sm" onclick="deleteReviewed('\${v._id}')">🗑️ حذف نهائي</button>
+                </div>
+            </div>
+        </div>\`).join('');
+}
+async function deleteReviewed(id) {
+    if (!confirm('متأكد تبي تحذفها نهائياً؟ هذا الإجراء ما يُرجع، وبتختفي عند العضو والإداري.')) return;
+    try { await api('/api/senior/violations/' + id, { method: 'DELETE' }); toast('تم الحذف النهائي'); loadReviewed(); }
+    catch (e) { toast(e.message); }
+}
+
 async function loadPersonnel() {
     const box = document.getElementById('admin-content');
     box.innerHTML = \`<div class="card"><input id="p-search" placeholder="بحث بالاسم / اليونت / التاق" onkeyup="if(event.key==='Enter') searchPersonnel()"><button class="btn sm" onclick="searchPersonnel()">بحث</button></div><div id="p-list"></div>\`;
@@ -1969,15 +2052,100 @@ async function saveThresholds() {
     try { await api('/api/senior/thresholds', { method: 'POST', body: JSON.stringify({ thresholds }) }); toast('تم الحفظ'); }
     catch (e) { toast(e.message); }
 }
-async function loadLog() {
+const LOG_META = {
+    "ترقية تلقائية":        { icon: "🎖️", label: "ترقية تلقائية",        color: "#4ade80", border: "#22c55e" },
+    "قبول تقرير":           { icon: "✅", label: "قبول تقرير",           color: "#4ade80", border: "#22c55e" },
+    "رفض تقرير":            { icon: "❌", label: "رفض تقرير",            color: "#fca5a5", border: "#ef4444" },
+    "قبول مخالفة":          { icon: "✅", label: "قبول مخالفة",          color: "#4ade80", border: "#22c55e" },
+    "رفض مخالفة":           { icon: "❌", label: "رفض مخالفة",           color: "#fca5a5", border: "#ef4444" },
+    "حظر عسكري (أمر)":      { icon: "🚫", label: "حظر عسكري",           color: "#fca5a5", border: "#ef4444" },
+    "فك حظر عسكري (أمر)":   { icon: "🔓", label: "فك حظر عسكري",        color: "#60a5fa", border: "#3b82f6" },
+    "ترقية عسكري":          { icon: "⬆️", label: "ترقية عسكري",         color: "#4ade80", border: "#22c55e" },
+    "تنزيل عسكري":          { icon: "⬇️", label: "تنزيل عسكري",         color: "#fca5a5", border: "#ef4444" },
+    "تعيين يونت":           { icon: "🪖", label: "تعيين يونت",          color: "#60a5fa", border: "#3b82f6" },
+    "تعديل نقاط":           { icon: "✏️", label: "تعديل نقاط",          color: "#fde047", border: "#eab308" },
+    "إضافة ملاحظة":         { icon: "📝", label: "إضافة ملاحظة",        color: "#93c5fd", border: "#3b82f6" },
+    "إيقاف عسكري":          { icon: "🚫", label: "إيقاف عسكري",         color: "#fca5a5", border: "#ef4444" },
+    "إلغاء إيقاف":          { icon: "✅", label: "إلغاء إيقاف",          color: "#4ade80", border: "#22c55e" },
+    "حذف حساب نهائي":       { icon: "🗑️", label: "حذف حساب نهائي",      color: "#fca5a5", border: "#7f1d1d" },
+    "تعديل ملف عسكري":      { icon: "✏️", label: "تعديل ملف عسكري",     color: "#93c5fd", border: "#3b82f6" },
+    "تعديل إعدادات الموقع": { icon: "⚙️", label: "تعديل إعدادات الموقع", color: "#60a5fa", border: "#3b82f6" },
+    "توظيف إداري":          { icon: "⭐", label: "توظيف إداري",          color: "#60a5fa", border: "#3b82f6" },
+    "فصل إداري":            { icon: "🚫", label: "فصل إداري",           color: "#fca5a5", border: "#ef4444" },
+    "إضافة مركبة":          { icon: "🚗", label: "إضافة مركبة",         color: "#93c5fd", border: "#3b82f6" },
+    "تعديل حدود النقاط":    { icon: "🎯", label: "تعديل حدود النقاط",   color: "#60a5fa", border: "#3b82f6" },
+    "حذف نهائي":            { icon: "🗑️", label: "حذف نهائي (مخالفة/تقرير)", color: "#fca5a5", border: "#7f1d1d" },
+    "حذف ملاحظة":           { icon: "🗑️", label: "حذف ملاحظة",          color: "#fca5a5", border: "#7f1d1d" },
+};
+let lastLogId = null;
+let allLogsData = [];
+async function loadLog(silent) {
     const { list } = await api('/api/senior/log');
     if (currentAdminTab !== 'log') return;
     const box = document.getElementById('admin-content');
     if (!box) return;
-    box.innerHTML = \`<div class="card"><table>
-        <tr><th>الوقت</th><th>مين</th><th>الإجراء</th><th>التفاصيل</th></tr>
-        \${list.map(l => \`<tr><td style="font-size:11px;">\${new Date(l.createdAt).toLocaleString('ar')}</td><td>\${l.actorTag || l.actorId}</td><td>\${l.action}</td><td style="font-size:12px;">\${l.detail || ''}</td></tr>\`).join('')}
-    </table></div>\` || '<div class="card center" style="color:var(--muted);">لا يوجد سجل بعد</div>';
+    if (silent && list[0] && list[0]._id === lastLogId) return;
+    if (list[0]) lastLogId = list[0]._id;
+    allLogsData = list;
+    if (!document.getElementById('log-search')) {
+        box.innerHTML = \`<div class="card"><input id="log-search" placeholder="🔍 ابحث بالاسم، اليوزر، الآيدي، أو نوع الحدث..." oninput="filterLog()" style="margin-bottom:12px;"><div id="log-list"></div></div>\`;
+    }
+    const q = (document.getElementById('log-search') || {}).value || '';
+    renderLog(q.trim() ? filterLogsData(q) : list);
+}
+function filterLogsData(q) {
+    q = q.trim().toLowerCase();
+    return allLogsData.filter(log => {
+        const meta = LOG_META[log.action] || { label: log.action };
+        return [log.discordId, log.discordTag, log.actorId, log.actorTag, log.details, log.action, meta.label]
+            .some(v => (v || '').toString().toLowerCase().includes(q));
+    });
+}
+function filterLog() {
+    const q = document.getElementById('log-search').value;
+    renderLog(q.trim() ? filterLogsData(q) : allLogsData);
+}
+function renderLog(list) {
+    const container = document.getElementById('log-list');
+    if (!container) return;
+    if (list.length === 0) { container.innerHTML = '<p style="text-align:center;color:var(--muted);padding:20px;">لا توجد نتائج.</p>'; return; }
+    container.innerHTML = list.map(log => {
+        const meta = LOG_META[log.action] || { icon: 'ℹ️', label: log.action, color: '#94a3b8', border: '#64748b' };
+        return \`
+        <div class="log-item" style="border-color:\${meta.border};flex-wrap:wrap;">
+            <div><span style="color:\${meta.color};font-weight:bold;">\${meta.icon} \${meta.label}</span></div>
+            <div style="text-align:left;color:#94a3b8;font-size:0.85rem;">
+                \${log.discordTag || log.discordId ? \`<div>الشخص: <b style="color:#60a5fa;">\${log.discordTag || ''}</b> \${log.discordId ? '(' + log.discordId + ')' : ''}</div>\` : ''}
+                \${log.actorTag || log.actorId ? \`<div>بواسطة: <b style="color:#e2e8f0;">\${log.actorTag || ''}</b> \${log.actorId ? '(' + log.actorId + ')' : ''}</div>\` : ''}
+                \${log.details ? \`<div style="color:#93c5fd;">\${log.details}</div>\` : ''}
+                <div style="font-size:0.78rem;color:#64748b;">\${new Date(log.createdAt).toLocaleString('ar')}</div>
+            </div>
+        </div>\`;
+    }).join('');
+}
+async function loadNotesPage() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    const { list } = await api('/api/senior/notes');
+    if (currentAdminTab !== 'notes') return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد ملاحظات مسجلة</div>'; return; }
+    box.innerHTML = list.map(n => \`
+        <div class="card">
+            <div class="row" style="align-items:flex-start;">
+                <div>
+                    <b>\${n.personnelName}</b>
+                    <div style="margin-top:4px;">\${n.text}</div>
+                    <div style="color:var(--muted);font-size:12px;margin-top:4px;">أضافها: \${n.addedByTag || n.addedBy || '-'} • \${new Date(n.createdAt).toLocaleString('ar')}</div>
+                </div>
+                <button class="btn danger sm" onclick="deleteNote('\${n.discord}', '\${n.noteId}')">🗑️ حذف</button>
+            </div>
+        </div>\`).join('');
+}
+async function deleteNote(discord, noteId) {
+    if (!confirm('متأكد تبي تحذف هذي الملاحظة؟')) return;
+    try { await api('/api/senior/personnel/' + discord + '/note/' + noteId, { method: 'DELETE' }); toast('تم الحذف'); loadNotesPage(); }
+    catch (e) { toast(e.message); }
 }
 async function loadSettings() {
     const { settings } = await api('/api/senior/settings');
