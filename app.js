@@ -1473,6 +1473,32 @@ let photoBase64 = null;
 let reportMeta = { vehicles: [] };
 let reportSelectedVehicle = null;
 let reportVehiclePhoto = null;
+
+// ضغط الصورة قبل الرفع: يصغّر الأبعاد ويحولها JPEG بجودة أقل عشان يقلل حجم كل مخالفة بالداتابيس
+// (هذا هو سبب امتلاء الذاكرة وتعليق الموقع — الصور كانت تترفع بحجمها الأصلي كامل)
+function compressImage(file, maxDim = 1000, quality = 0.7) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => {
+            const img = new Image();
+            img.onload = () => {
+                let { width, height } = img;
+                if (width > maxDim || height > maxDim) {
+                    if (width > height) { height = Math.round(height * maxDim / width); width = maxDim; }
+                    else { width = Math.round(width * maxDim / height); height = maxDim; }
+                }
+                const canvas = document.createElement('canvas');
+                canvas.width = width; canvas.height = height;
+                canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+                resolve(canvas.toDataURL('image/jpeg', quality));
+            };
+            img.onerror = reject;
+            img.src = e.target.result;
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
+}
 let currentAdminTab = null;
 
 async function api(url, opts) {
@@ -1647,7 +1673,13 @@ function renderNotes() {
         ME.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-bottom:6px;font-size:13px;">\${n.text}</div>\`).join('');
 }
 async function loadMine(silent) {
-    const { list } = await api('/api/violations/mine');
+    let list;
+    try { ({ list } = await api('/api/violations/mine')); }
+    catch (e) {
+        const b = document.getElementById('mine-list');
+        if (b) b.innerHTML = '<div class="center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadMine()">إعادة المحاولة</button></div>';
+        return;
+    }
     const cEl = document.getElementById('mine-count');
     if (cEl) cEl.textContent = list.length;
     const box = document.getElementById('mine-list');
@@ -1655,7 +1687,7 @@ async function loadMine(silent) {
     if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);">لا توجد مخالفات مسجلة بعد</p>'; return; }
     box.innerHTML = \`<table><tr><th></th><th>النوع</th><th>المركبة</th><th>اللوحة</th><th>الحالة</th></tr>\` +
         list.map(v => \`<tr>
-            <td>\${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : '—'}</td>
+            <td>\${v.photo ? \`<img class="thumb" src="\${v.photo}">\` : '—'}</td>
             <td>\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</td><td>\${v.vehicle}</td><td>\${v.plateNumber}</td>
             <td><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>\${v.status === 'rejected' && v.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">\${v.rejectReason}</div>\` : ''}</td>
         </tr>\`).join('') + '</table>';
@@ -1693,13 +1725,11 @@ function previewPhoto() {
     const f = document.getElementById('v-photo').files[0];
     if (!f) return;
     if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
-    const reader = new FileReader();
-    reader.onload = e => {
-        photoBase64 = e.target.result;
+    compressImage(f).then(dataUrl => {
+        photoBase64 = dataUrl;
         const img = document.getElementById('v-photo-preview');
         img.src = photoBase64; img.style.display = 'block';
-    };
-    reader.readAsDataURL(f);
+    }).catch(() => toast('تعذر معالجة الصورة'));
 }
 let violationSubmitting = false;
 async function submitViolation() {
@@ -1812,13 +1842,11 @@ function previewReportPhoto() {
     const f = document.getElementById('rp-photo').files[0];
     if (!f) return;
     if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
-    const reader = new FileReader();
-    reader.onload = e => {
-        reportVehiclePhoto = e.target.result;
+    compressImage(f).then(dataUrl => {
+        reportVehiclePhoto = dataUrl;
         const img = document.getElementById('rp-photo-preview');
         img.src = reportVehiclePhoto; img.style.display = 'block';
-    };
-    reader.readAsDataURL(f);
+    }).catch(() => toast('تعذر معالجة الصورة'));
 }
 let reportSubmitting = false;
 async function submitReport(category) {
@@ -1902,14 +1930,16 @@ async function loadLeaderPending() {
     const box = document.getElementById('leader-content');
     if (!box) return;
     box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    const { list } = await api('/api/leader/pending');
+    let list;
+    try { ({ list } = await api('/api/leader/pending')); }
+    catch (e) { box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadLeaderPending()">إعادة المحاولة</button></div>'; return; }
     if (currentLeaderTab !== 'pending') return;
     if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات معلّقة بقطاعك</div>'; return; }
     box.innerHTML = list.map(v => v.kind === 'report' ? \`
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">🧪 تقرير مكافحة المخدرات — \${v.reportCategory}</div>
@@ -1926,7 +1956,7 @@ async function loadLeaderPending() {
         <div class="card">
             <div class="row">
                 <div class="row" style="gap:10px;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.violationType}</div>
@@ -1959,7 +1989,9 @@ async function loadLeaderPersonnel() {
     const box = document.getElementById('leader-content');
     if (!box) return;
     box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    const { list } = await api('/api/leader/personnel');
+    let list;
+    try { ({ list } = await api('/api/leader/personnel')); }
+    catch (e) { box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadLeaderPersonnel()">إعادة المحاولة</button></div>'; return; }
     if (currentLeaderTab !== 'personnel') return;
     if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بقطاعك</div>'; return; }
     box.innerHTML = list.map(p => \`
@@ -2018,14 +2050,16 @@ async function loadReviewed() {
     const box = document.getElementById('admin-content');
     if (!box) return;
     box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    const { list } = await api('/api/senior/violations');
+    let list;
+    try { ({ list } = await api('/api/senior/violations')); }
+    catch (e) { box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadReviewed()">إعادة المحاولة</button></div>'; return; }
     if (currentAdminTab !== 'reviewed') return;
     if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات مراجَعة بعد</div>'; return; }
     box.innerHTML = list.map(v => \`
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير — ' + v.reportCategory) : v.violationType}</div>
@@ -2047,7 +2081,9 @@ async function loadLeaders() {
     const box = document.getElementById('admin-content');
     if (!box) return;
     box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    const { list } = await api('/api/senior/leaders');
+    let list;
+    try { ({ list } = await api('/api/senior/leaders')); }
+    catch (e) { box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadLeaders()">إعادة المحاولة</button></div>'; return; }
     if (currentAdminTab !== 'leaders') return;
     if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد قادة قطاعات معيّنين حالياً. عيّنهم عبر أمر تعيين-يونت بالبوت وحط كلمة "قائد" ضمن اليونت (مع اسم القطاع).</div>'; return; }
     box.innerHTML = list.map(p => \`
@@ -2068,7 +2104,9 @@ async function loadNotesAdmin() {
     const box = document.getElementById('admin-content');
     if (!box) return;
     box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    const { list } = await api('/api/senior/notes');
+    let list;
+    try { ({ list } = await api('/api/senior/notes')); }
+    catch (e) { box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadNotesAdmin()">إعادة المحاولة</button></div>'; return; }
     if (currentAdminTab !== 'notes') return;
     if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد ملاحظات</div>'; return; }
     box.innerHTML = list.map(n => \`
@@ -2090,7 +2128,9 @@ async function loadPending() {
     const box = document.getElementById('admin-content');
     if (!box) return;
     if (!box.dataset.loaded) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    const { list } = await api('/api/admin/pending');
+    let list;
+    try { ({ list } = await api('/api/admin/pending')); }
+    catch (e) { box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadPending()">إعادة المحاولة</button></div>'; return; }
     if (currentAdminTab !== 'pending') return; // المستخدم غيّر التبويب أثناء التحميل
     box.id = 'admin-content'; box.dataset.loaded = '1';
     box.innerHTML = '<div id="pending-box"></div>';
@@ -2100,7 +2140,7 @@ async function loadPending() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">🧪 تقرير مكافحة المخدرات — \${v.reportCategory}</div>
@@ -2123,7 +2163,7 @@ async function loadPending() {
         <div class="card">
             <div class="row">
                 <div class="row" style="gap:10px;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.violationType}</div>
@@ -2256,13 +2296,11 @@ function previewVehiclePhoto() {
     const f = document.getElementById('veh-photo').files[0];
     if (!f) return;
     if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
-    const reader = new FileReader();
-    reader.onload = e => {
-        newVehiclePhoto = e.target.result;
+    compressImage(f).then(dataUrl => {
+        newVehiclePhoto = dataUrl;
         const img = document.getElementById('veh-photo-preview');
         img.src = newVehiclePhoto; img.style.display = 'block';
-    };
-    reader.readAsDataURL(f);
+    }).catch(() => toast('تعذر معالجة الصورة'));
 }
 async function addVehicle() {
     const name = document.getElementById('veh-name').value.trim();
