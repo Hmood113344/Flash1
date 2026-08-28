@@ -149,6 +149,9 @@ const ViolationSchema = new mongoose.Schema({
     drugQuantity: { type: String, default: null },
     concealMethod: { type: String, default: null },
 });
+ViolationSchema.index({ reporterDiscord: 1, createdAt: -1 });
+ViolationSchema.index({ status: 1, createdAt: 1 });
+ViolationSchema.index({ status: 1, reviewedAt: -1 });
 const Violation = mongoose.model("Violation", ViolationSchema);
 
 const VehicleSchema = new mongoose.Schema({
