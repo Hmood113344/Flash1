@@ -135,6 +135,11 @@ const ViolationSchema = new mongoose.Schema({
     suspectVehicle: { type: String, default: null },
     seizedItems: { type: String, default: null },
     securityActions: { type: [String], default: [] },
+
+    // حقول خاصة بتقرير "مخدرات" فقط
+    drugType: { type: String, default: null },
+    drugQuantity: { type: String, default: null },
+    concealMethod: { type: String, default: null },
 });
 const Violation = mongoose.model("Violation", ViolationSchema);
 
@@ -292,21 +297,30 @@ async function isMilitary(discordId) {
 
 function buildViolationEmbed(v) {
     if (v.kind === "report") {
+        const fields = [
+            { name: "اسم العسكري", value: v.reporterName || "-", inline: true },
+            { name: "اليونت", value: v.reporterUnit || "-", inline: true },
+            { name: "نوع التقرير", value: v.reportCategory || "-", inline: true },
+            { name: "اسم المتهم", value: v.suspectName || "-", inline: true },
+            { name: "موقع الضبط", value: v.arrestLocation || "-", inline: true },
+            { name: "المركبة", value: v.vehicle || "-", inline: true },
+            { name: "سبب الاستيقاف", value: v.stopReason || "-", inline: false },
+            { name: "مركبة المشتبه به", value: v.suspectVehicle || "-", inline: false },
+        ];
+        if (v.reportCategory === "مخدرات") {
+            fields.push(
+                { name: "نوع المخدر المضبوط", value: v.drugType || "-", inline: true },
+                { name: "الكمية المضبوطة", value: v.drugQuantity || "-", inline: true },
+                { name: "طريقة إخفاء المخدر", value: v.concealMethod || "-", inline: false },
+            );
+        } else {
+            fields.push({ name: "المضبوطات", value: v.seizedItems || "-", inline: false });
+        }
+        fields.push({ name: "الإجراءات الأمنية المتخذة", value: (v.securityActions && v.securityActions.length) ? v.securityActions.map(a => `- ${a}`).join("\n") : "-", inline: false });
         return new EmbedBuilder()
             .setTitle(`🧪 تقرير مكافحة مخدرات جديد (${v.reportCategory || "-"}) — بانتظار المراجعة`)
             .setColor(0xf59e0b)
-            .addFields(
-                { name: "اسم العسكري", value: v.reporterName || "-", inline: true },
-                { name: "اليونت", value: v.reporterUnit || "-", inline: true },
-                { name: "نوع التقرير", value: v.reportCategory || "-", inline: true },
-                { name: "اسم المتهم", value: v.suspectName || "-", inline: true },
-                { name: "موقع الضبط", value: v.arrestLocation || "-", inline: true },
-                { name: "المركبة", value: v.vehicle || "-", inline: true },
-                { name: "سبب الاستيقاف", value: v.stopReason || "-", inline: false },
-                { name: "مركبة المشتبه به", value: v.suspectVehicle || "-", inline: false },
-                { name: "المضبوطات", value: v.seizedItems || "-", inline: false },
-                { name: "الإجراءات الأمنية المتخذة", value: (v.securityActions && v.securityActions.length) ? v.securityActions.map(a => `- ${a}`).join("\n") : "-", inline: false },
-            )
+            .addFields(fields)
             .setFooter({ text: `ID: ${v._id}` })
             .setTimestamp(v.createdAt);
     }
@@ -943,6 +957,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
         const {
             category, suspectName, arrestLocation, vehicle,
             stopReason, suspectVehicle, seizedItems, securityActions, photo,
+            drugType, drugQuantity, concealMethod,
         } = req.body;
 
         if (!category || !["جنائي", "مخدرات"].includes(category)) {
@@ -951,10 +966,16 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
         if (!suspectName || !arrestLocation) return res.status(400).json({ error: "أكمل اسم المتهم وموقع الضبط" });
         if (!vehicle) return res.status(400).json({ error: "اختر المركبة" });
         if (!stopReason || !suspectVehicle) return res.status(400).json({ error: "أكمل تفاصيل العملية الميدانية" });
-        if (!seizedItems) return res.status(400).json({ error: "اكتب المضبوطات" });
         if (!photo) return res.status(400).json({ error: "لازم ترفق صورة المركبة" });
         if (photo && photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
             return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
+        }
+        if (category === "مخدرات") {
+            if (!drugType || !drugQuantity || !concealMethod) {
+                return res.status(400).json({ error: "أكمل نوع المخدر وكميته وطريقة إخفائه" });
+            }
+        } else {
+            if (!seizedItems) return res.status(400).json({ error: "اكتب المضبوطات" });
         }
         const cleanActions = Array.isArray(securityActions) ? securityActions.map(a => String(a).trim()).filter(Boolean) : [];
         const vehicleDoc = await Vehicle.findOne({ name: vehicle });
@@ -964,7 +985,11 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
             reporterName: p.registeredName, reporterUnit: p.unit,
             kind: "report", reportCategory: category,
             suspectName, arrestLocation, vehicle, vehiclePhoto: vehicleDoc?.photo || null,
-            stopReason, suspectVehicle, seizedItems, securityActions: cleanActions,
+            stopReason, suspectVehicle, securityActions: cleanActions,
+            seizedItems: category === "جنائي" ? seizedItems : null,
+            drugType: category === "مخدرات" ? drugType : null,
+            drugQuantity: category === "مخدرات" ? drugQuantity : null,
+            concealMethod: category === "مخدرات" ? concealMethod : null,
             photo: photo || null, plateNumber: generatePlate(), status: "pending",
         });
         postViolationToChannel(v).catch(() => {});
@@ -1251,6 +1276,10 @@ app.get("/", (req, res) => {
     .login-screen { text-align: center; padding: 4rem 2rem; }
     .login-screen h1 { font-size: 3rem; color: #3b82f6; text-shadow: 0 0 20px rgba(59,130,246,0.5); margin-bottom: 10px; }
     footer { text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--muted); font-size: 0.9rem; }
+    #img-modal { display: none; position: fixed; inset: 0; z-index: 2000; background: rgba(0,0,0,0.88); align-items: center; justify-content: center; padding: 20px; cursor: zoom-out; }
+    #img-modal.open { display: flex; }
+    #img-modal img { max-width: 92vw; max-height: 90vh; border-radius: 10px; border: 2px solid var(--gold); box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
+    #img-modal .close-hint { position: absolute; top: 18px; left: 50%; transform: translateX(-50%); color: #cbd5e1; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -1263,6 +1292,7 @@ app.get("/", (req, res) => {
 <div class="mobile-menu" id="mobile-menu"></div>
 <div class="wrap" id="app"><div class="card center">جارِ التحميل...</div></div>
 <div id="toast"></div>
+<div id="img-modal" onclick="closeImageModal()"><span class="close-hint">اضغط لإغلاق</span><img id="img-modal-img" src=""></div>
 <footer><p>جميع الحقوق محفوظة © 2026 | <span style="color:#d4af37;font-weight:bold;">${CONFIG.SITE_NAME}</span></p></footer>
 
 <script>
@@ -1275,6 +1305,7 @@ let photoBase64 = null;
 let reportMeta = { vehicles: [] };
 let reportSelectedVehicle = null;
 let reportVehiclePhoto = null;
+let currentAdminTab = null;
 
 async function api(url, opts) {
     const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -1286,6 +1317,15 @@ function toast(msg) {
     const t = document.getElementById('toast');
     t.textContent = msg; t.style.display = 'block';
     setTimeout(() => t.style.display = 'none', 2800);
+}
+function openImageModal(src) {
+    if (!src) return;
+    document.getElementById('img-modal-img').src = src;
+    document.getElementById('img-modal').classList.add('open');
+}
+function closeImageModal() {
+    document.getElementById('img-modal').classList.remove('open');
+    document.getElementById('img-modal-img').src = '';
 }
 async function init() {
     try { ME = await api('/api/me'); } catch (e) { renderLogin(); return; }
@@ -1302,12 +1342,16 @@ function buildNav() {
     if (!ME || ME.blocked) { links.innerHTML = ''; mobile.innerHTML = ''; return; }
     const items = [
         { label: '🏠 الرئيسية', fn: 'renderDashboard()' },
-        ME.isAntiDrugs
-            ? { label: '📝 تسجيل تقرير', fn: 'renderNewReport()' }
-            : { label: '📝 تسجيل مخالفة', fn: 'renderNewViolation()' },
+    ];
+    if (ME.isAntiDrugs && !ME.isSeniorAdmin) {
+        items.push({ label: '📝 تسجيل تقرير', fn: 'renderNewReport()' });
+    } else {
+        items.push({ label: '📝 تسجيل مخالفة', fn: 'renderNewViolation()' });
+    }
+    items.push(
         { label: '📋 مخالفاتي', fn: 'renderMinePage()' },
         { label: '🪪 بطاقتي', fn: 'renderCard()' },
-    ];
+    );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
     links.innerHTML = items.map(i => \`<button onclick="\${i.fn}">\${i.label}</button>\`).join('');
@@ -1413,7 +1457,7 @@ function renderDashboard() {
                 <h3>مخالفاتي المسجلة</h3>
                 <div class="row" style="gap:8px;">
                     <button class="btn sm" onclick="renderCard()">بطاقتي</button>
-                    \${!ME.violationsDisabled ? (ME.isAntiDrugs
+                    \${!ME.violationsDisabled ? (ME.isAntiDrugs && !ME.isSeniorAdmin
                         ? '<button class="btn sm" onclick="renderNewReport()">+ تسجيل تقرير جديد</button>'
                         : '<button class="btn sm" onclick="renderNewViolation()">+ تسجيل مخالفة جديدة</button>') : ''}
                 </div>
@@ -1442,7 +1486,7 @@ async function loadMine(silent) {
     if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);">لا توجد مخالفات مسجلة بعد</p>'; return; }
     box.innerHTML = \`<table><tr><th></th><th>النوع</th><th>المركبة</th><th>اللوحة</th><th>الحالة</th></tr>\` +
         list.map(v => \`<tr>
-            <td>\${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="window.open('\${v.photo}','_blank')">\` : '—'}</td>
+            <td>\${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : '—'}</td>
             <td>\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</td><td>\${v.vehicle}</td><td>\${v.plateNumber}</td>
             <td><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>\${v.status === 'rejected' && v.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">\${v.rejectReason}</div>\` : ''}</td>
         </tr>\`).join('') + '</table>';
@@ -1514,9 +1558,10 @@ function renderNewReport() {
 async function renderReportForm(category) {
     const meta = await api('/api/violations/meta');
     reportMeta = meta; reportSelectedVehicle = null; reportVehiclePhoto = null;
+    const isDrugs = category === 'مخدرات';
     document.getElementById('app').innerHTML = \`
         <div class="card">
-            <h2>تسجيل تقرير \${category === 'مخدرات' ? 'مكافحة مخدرات' : 'جنائي'}</h2>
+            <h2>تسجيل تقرير \${isDrugs ? 'مكافحة مخدرات' : 'جنائي'}</h2>
             <label>اسم المتهم</label>
             <input id="rp-suspect-name" placeholder="اسم المتهم">
             <label>موقع الضبط</label>
@@ -1532,11 +1577,23 @@ async function renderReportForm(category) {
             <input id="rp-stop-reason" placeholder="سبب الاستيقاف">
             <label>مركبة المشتبه به</label>
             <input id="rp-suspect-vehicle" placeholder="مركبة المشتبه به">
+            \${isDrugs ? \`
+            <label>نوع المخدر المضبوط</label>
+            <input id="rp-drug-type" placeholder="مثال: حشيش، شبو، حبوب مخدرة">
+            <label>الكمية المضبوطة</label>
+            <input id="rp-drug-qty" placeholder="مثال: 3 كيلو / 50 حبة">
+            <label>طريقة إخفاء المخدر</label>
+            <input id="rp-conceal" placeholder="مثال: مخبأ داخل صندوق السيارة">
+            \` : \`
             <label>المضبوطات</label>
             <textarea id="rp-seized" placeholder="المضبوطات" rows="3"></textarea>
+            \`}
             <label>الإجراءات الأمنية المتخذة</label>
             <div id="rp-actions-box">
-                <input class="rp-action" placeholder="- إجراء أمني">
+                <div class="row rp-action-row" style="gap:6px;flex-wrap:nowrap;">
+                    <input class="rp-action" placeholder="- إجراء أمني" style="flex:1;">
+                    <button type="button" class="btn danger sm" style="flex:0 0 auto;" onclick="removeSecurityAction(this)">حذف</button>
+                </div>
             </div>
             <button class="btn gray sm" style="margin:8px 0;" onclick="addSecurityAction()">+ إضافة إجراء</button>
             <label>صورة المركبة (إجباري)</label>
@@ -1556,11 +1613,20 @@ function pickReportVehicle(i) {
 }
 function addSecurityAction() {
     const box = document.getElementById('rp-actions-box');
-    const inp = document.createElement('input');
-    inp.className = 'rp-action';
-    inp.placeholder = '- إجراء أمني';
-    inp.style.marginTop = '6px';
-    box.appendChild(inp);
+    const row = document.createElement('div');
+    row.className = 'row rp-action-row';
+    row.style.cssText = 'gap:6px;flex-wrap:nowrap;margin-top:6px;';
+    row.innerHTML = '<input class="rp-action" placeholder="- إجراء أمني" style="flex:1;"><button type="button" class="btn danger sm" style="flex:0 0 auto;" onclick="removeSecurityAction(this)">حذف</button>';
+    box.appendChild(row);
+}
+function removeSecurityAction(btn) {
+    const box = document.getElementById('rp-actions-box');
+    if (box.querySelectorAll('.rp-action-row').length <= 1) {
+        // لازم يبقى إجراء واحد على الأقل بالفورم
+        btn.closest('.rp-action-row').querySelector('.rp-action').value = '';
+        return;
+    }
+    btn.closest('.rp-action-row').remove();
 }
 function previewReportPhoto() {
     const f = document.getElementById('rp-photo').files[0];
@@ -1575,21 +1641,32 @@ function previewReportPhoto() {
     reader.readAsDataURL(f);
 }
 async function submitReport(category) {
+    const isDrugs = category === 'مخدرات';
     const suspectName = document.getElementById('rp-suspect-name').value.trim();
     const arrestLocation = document.getElementById('rp-location').value.trim();
     const stopReason = document.getElementById('rp-stop-reason').value.trim();
     const suspectVehicle = document.getElementById('rp-suspect-vehicle').value.trim();
-    const seizedItems = document.getElementById('rp-seized').value.trim();
     const securityActions = Array.from(document.querySelectorAll('.rp-action')).map(el => el.value.trim()).filter(Boolean);
     if (!suspectName || !arrestLocation) return toast('أكمل اسم المتهم وموقع الضبط');
     if (!reportSelectedVehicle) return toast('اختر المركبة');
     if (!stopReason || !suspectVehicle) return toast('أكمل تفاصيل العملية الميدانية');
-    if (!seizedItems) return toast('اكتب المضبوطات');
     if (!reportVehiclePhoto) return toast('لازم ترفق صورة المركبة');
+
+    let seizedItems = null, drugType = null, drugQuantity = null, concealMethod = null;
+    if (isDrugs) {
+        drugType = document.getElementById('rp-drug-type').value.trim();
+        drugQuantity = document.getElementById('rp-drug-qty').value.trim();
+        concealMethod = document.getElementById('rp-conceal').value.trim();
+        if (!drugType || !drugQuantity || !concealMethod) return toast('أكمل نوع المخدر وكميته وطريقة إخفائه');
+    } else {
+        seizedItems = document.getElementById('rp-seized').value.trim();
+        if (!seizedItems) return toast('اكتب المضبوطات');
+    }
     try {
         await api('/api/reports/submit', { method: 'POST', body: JSON.stringify({
             category, suspectName, arrestLocation, vehicle: reportSelectedVehicle,
-            stopReason, suspectVehicle, seizedItems, securityActions, photo: reportVehiclePhoto
+            stopReason, suspectVehicle, seizedItems, securityActions, photo: reportVehiclePhoto,
+            drugType, drugQuantity, concealMethod,
         }) });
         toast('تم إرسال التقرير، بانتظار المراجعة'); renderDashboard();
     } catch (e) { toast(e.message); }
@@ -1621,6 +1698,7 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
+            <div class="tab" onclick="renderNewReport()">🧪 تسجيل تقرير جديد مكافحة</div>
         </div>\` : '';
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>\${ME.isSeniorAdmin ? 'لوحة تحكم كبار المسؤولين' : 'لوحة الإدارة'}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
@@ -1631,6 +1709,7 @@ function renderAdmin() {
 function adminTab(name, el) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     if (el) el.classList.add('active');
+    currentAdminTab = name;
     if (name === 'pending') loadPending();
     if (name === 'personnel') loadPersonnel();
     if (name === 'vehicles') loadVehicles();
@@ -1644,6 +1723,7 @@ async function loadPending() {
     if (!box) return;
     if (!box.dataset.loaded) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
     const { list } = await api('/api/admin/pending');
+    if (currentAdminTab !== 'pending') return; // المستخدم غيّر التبويب أثناء التحميل
     box.id = 'admin-content'; box.dataset.loaded = '1';
     box.innerHTML = '<div id="pending-box"></div>';
     const pbox = document.getElementById('pending-box');
@@ -1652,14 +1732,17 @@ async function loadPending() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="window.open('\${v.photo}','_blank')">\` : ''}
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">🧪 تقرير مكافحة المخدرات — \${v.reportCategory}</div>
                         <div style="color:var(--muted);font-size:13px;">المتهم: \${v.suspectName} • موقع الضبط: \${v.arrestLocation}</div>
                         <div style="color:var(--muted);font-size:13px;">المركبة: \${v.vehicle} • سبب الاستيقاف: \${v.stopReason}</div>
                         <div style="color:var(--muted);font-size:13px;">مركبة المشتبه به: \${v.suspectVehicle}</div>
-                        <div style="color:var(--muted);font-size:13px;">المضبوطات: \${v.seizedItems}</div>
+                        \${v.reportCategory === 'مخدرات' ? \`
+                        <div style="color:var(--muted);font-size:13px;">نوع المخدر: \${v.drugType || '-'} • الكمية: \${v.drugQuantity || '-'}</div>
+                        <div style="color:var(--muted);font-size:13px;">طريقة الإخفاء: \${v.concealMethod || '-'}</div>
+                        \` : \`<div style="color:var(--muted);font-size:13px;">المضبوطات: \${v.seizedItems}</div>\`}
                         \${v.securityActions && v.securityActions.length ? \`<div style="color:var(--muted);font-size:13px;">الإجراءات: \${v.securityActions.join('، ')}</div>\` : ''}
                     </div>
                 </div>
@@ -1672,7 +1755,7 @@ async function loadPending() {
         <div class="card">
             <div class="row">
                 <div class="row" style="gap:10px;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="window.open('\${v.photo}','_blank')">\` : ''}
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.violationType}</div>
@@ -1686,14 +1769,28 @@ async function loadPending() {
             </div>
         </div>\`).join('');
 }
+const actionLocks = {};
+function isActionLocked(id) {
+    const until = actionLocks[id];
+    if (until && Date.now() < until) return true;
+    return false;
+}
+function lockAction(id) {
+    actionLocks[id] = Date.now() + 5000;
+    setTimeout(() => { delete actionLocks[id]; }, 5000);
+}
 async function approveV(id) {
+    if (isActionLocked(id)) return toast('انتظر 5 ثواني قبل الضغط مرة أخرى');
+    lockAction(id);
     try { await api('/api/admin/violations/' + id + '/approve', { method: 'POST' }); toast('تم القبول'); loadPending(); }
     catch (e) { toast(e.message); }
 }
 function rejectV(id) {
+    if (isActionLocked(id)) return toast('انتظر 5 ثواني قبل الضغط مرة أخرى');
     const reason = prompt('اكتب سبب الرفض:');
     if (reason === null) return;
     if (!reason.trim()) return toast('لازم تكتب سبب');
+    lockAction(id);
     api('/api/admin/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
         .then(() => { toast('تم الرفض'); loadPending(); }).catch(e => toast(e.message));
 }
@@ -1706,8 +1803,11 @@ let personnelCache = [];
 async function searchPersonnel() {
     const q = document.getElementById('p-search') ? document.getElementById('p-search').value : '';
     const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+    if (currentAdminTab !== 'personnel') return; // المستخدم غيّر التبويب أثناء التحميل
     personnelCache = list;
-    document.getElementById('p-list').innerHTML = list.map((p, i) => \`
+    const pListEl = document.getElementById('p-list');
+    if (!pListEl) return;
+    pListEl.innerHTML = list.map((p, i) => \`
         <div class="card" id="pcard-\${i}">
             <div class="row">
                 <div>
@@ -1806,7 +1906,10 @@ async function addVehicle() {
 }
 async function loadVehicleList() {
     const { list } = await api('/api/senior/vehicles');
-    document.getElementById('veh-list').innerHTML = list.map(v => \`
+    if (currentAdminTab !== 'vehicles') return;
+    const box = document.getElementById('veh-list');
+    if (!box) return;
+    box.innerHTML = list.map(v => \`
         <div class="vcard">
             \${v.photo ? \`<img src="\${v.photo}">\` : ''}
             <div>\${v.name}</div>
@@ -1840,7 +1943,10 @@ async function hireAdmin() {
 }
 async function loadAdminsList() {
     const { list } = await api('/api/senior/admins');
-    document.getElementById('admins-list').innerHTML = list.map(id => \`
+    if (currentAdminTab !== 'hire') return;
+    const box = document.getElementById('admins-list');
+    if (!box) return;
+    box.innerHTML = list.map(id => \`
         <div class="card row"><span>\${id}</span><button class="btn danger sm" onclick="fireAdmin('\${id}')">فصل</button></div>\`).join('') || '<div class="card center" style="color:var(--muted);">لا يوجد إداريون معيّنون</div>';
 }
 function fireAdmin(id) {
@@ -1848,7 +1954,9 @@ function fireAdmin(id) {
 }
 async function loadThresholds() {
     const { ranks, thresholds } = await api('/api/senior/thresholds');
+    if (currentAdminTab !== 'thresholds') return;
     const box = document.getElementById('admin-content');
+    if (!box) return;
     box.innerHTML = \`<div class="card">
         <h3>نقاط الترقية بين الرتب</h3>
         <p style="color:var(--muted);font-size:12px;margin-bottom:10px;">حدد كم نقطة يحتاجها العسكري بكل رتبة عشان يترقى للي بعدها.</p>
@@ -1870,14 +1978,20 @@ async function saveThresholds() {
 }
 async function loadLog() {
     const { list } = await api('/api/senior/log');
-    document.getElementById('admin-content').innerHTML = \`<div class="card"><table>
+    if (currentAdminTab !== 'log') return;
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = \`<div class="card"><table>
         <tr><th>الوقت</th><th>مين</th><th>الإجراء</th><th>التفاصيل</th></tr>
         \${list.map(l => \`<tr><td style="font-size:11px;">\${new Date(l.createdAt).toLocaleString('ar')}</td><td>\${l.actorTag || l.actorId}</td><td>\${l.action}</td><td style="font-size:12px;">\${l.detail || ''}</td></tr>\`).join('')}
     </table></div>\` || '<div class="card center" style="color:var(--muted);">لا يوجد سجل بعد</div>';
 }
 async function loadSettings() {
     const { settings } = await api('/api/senior/settings');
-    document.getElementById('admin-content').innerHTML = \`
+    if (currentAdminTab !== 'settings') return;
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = \`
         <div class="card">
             <div class="row"><span>وضع الصيانة</span><input type="checkbox" id="s-maint" \${settings.isMaintenance ? 'checked' : ''}></div>
             <div class="row" style="margin-top:10px;"><span>إغلاق تسجيل الدخول</span><input type="checkbox" id="s-login" \${settings.disableLogin ? 'checked' : ''}></div>
