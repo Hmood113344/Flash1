@@ -44,9 +44,7 @@ const CONFIG = {
     // رتب العسكر المعتمدة لتسجيل الدخول بالموقع (رولات ديسكورد)
     MILITARY_ROLE_IDS: [
         "1500064443537686588",
-        "1533192878510178304",        
-        "1500064767082233926",
-        
+        "1533192878510178304",
     ],
 
     // آيديات كبار المسؤولين — نفس أسلوب ملف البنك (مصفوفة ثابتة بالكود)
@@ -133,7 +131,6 @@ const ViolationSchema = new mongoose.Schema({
     suspectName: { type: String, default: null },
     arrestLocation: { type: String, default: null },
     stopReason: { type: String, default: null },
-    suspectVehicle: { type: String, default: null },
     seizedItems: { type: String, default: null },
     securityActions: { type: [String], default: [] },
 
@@ -306,7 +303,6 @@ function buildViolationEmbed(v) {
             { name: "موقع الضبط", value: v.arrestLocation || "-", inline: true },
             { name: "المركبة", value: v.vehicle || "-", inline: true },
             { name: "سبب الاستيقاف", value: v.stopReason || "-", inline: false },
-            { name: "مركبة المشتبه به", value: v.suspectVehicle || "-", inline: false },
         ];
         if (v.reportCategory === "مخدرات") {
             fields.push(
@@ -957,7 +953,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
 
         const {
             category, suspectName, arrestLocation, vehicle,
-            stopReason, suspectVehicle, seizedItems, securityActions, photo,
+            stopReason, seizedItems, securityActions, photo,
             drugType, drugQuantity, concealMethod,
         } = req.body;
 
@@ -966,7 +962,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
         }
         if (!suspectName || !arrestLocation) return res.status(400).json({ error: "أكمل اسم المتهم وموقع الضبط" });
         if (!vehicle) return res.status(400).json({ error: "اختر المركبة" });
-        if (!stopReason || !suspectVehicle) return res.status(400).json({ error: "أكمل تفاصيل العملية الميدانية" });
+        if (!stopReason) return res.status(400).json({ error: "أكمل تفاصيل العملية الميدانية" });
         if (!photo) return res.status(400).json({ error: "لازم ترفق صورة المركبة" });
         if (photo && photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
             return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
@@ -986,7 +982,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
             reporterName: p.registeredName, reporterUnit: p.unit,
             kind: "report", reportCategory: category,
             suspectName, arrestLocation, vehicle, vehiclePhoto: vehicleDoc?.photo || null,
-            stopReason, suspectVehicle, securityActions: cleanActions,
+            stopReason, securityActions: cleanActions,
             seizedItems: category === "جنائي" ? seizedItems : null,
             drugType: category === "مخدرات" ? drugType : null,
             drugQuantity: category === "مخدرات" ? drugQuantity : null,
@@ -1576,8 +1572,6 @@ async function renderReportForm(category) {
             <h3 style="margin-top:16px;">تفاصيل العملية الميدانية</h3>
             <label>سبب الاستيقاف</label>
             <input id="rp-stop-reason" placeholder="سبب الاستيقاف">
-            <label>مركبة المشتبه به</label>
-            <input id="rp-suspect-vehicle" placeholder="مركبة المشتبه به">
             \${isDrugs ? \`
             <label>نوع المخدر المضبوط</label>
             <input id="rp-drug-type" placeholder="مثال: حشيش، شبو، حبوب مخدرة">
@@ -1646,11 +1640,10 @@ async function submitReport(category) {
     const suspectName = document.getElementById('rp-suspect-name').value.trim();
     const arrestLocation = document.getElementById('rp-location').value.trim();
     const stopReason = document.getElementById('rp-stop-reason').value.trim();
-    const suspectVehicle = document.getElementById('rp-suspect-vehicle').value.trim();
     const securityActions = Array.from(document.querySelectorAll('.rp-action')).map(el => el.value.trim()).filter(Boolean);
     if (!suspectName || !arrestLocation) return toast('أكمل اسم المتهم وموقع الضبط');
     if (!reportSelectedVehicle) return toast('اختر المركبة');
-    if (!stopReason || !suspectVehicle) return toast('أكمل تفاصيل العملية الميدانية');
+    if (!stopReason) return toast('أكمل تفاصيل العملية الميدانية');
     if (!reportVehiclePhoto) return toast('لازم ترفق صورة المركبة');
 
     let seizedItems = null, drugType = null, drugQuantity = null, concealMethod = null;
@@ -1666,7 +1659,7 @@ async function submitReport(category) {
     try {
         await api('/api/reports/submit', { method: 'POST', body: JSON.stringify({
             category, suspectName, arrestLocation, vehicle: reportSelectedVehicle,
-            stopReason, suspectVehicle, seizedItems, securityActions, photo: reportVehiclePhoto,
+            stopReason, seizedItems, securityActions, photo: reportVehiclePhoto,
             drugType, drugQuantity, concealMethod,
         }) });
         toast('تم إرسال التقرير، بانتظار المراجعة'); renderDashboard();
@@ -1739,7 +1732,6 @@ async function loadPending() {
                         <div style="color:var(--gold-soft);margin-top:4px;">🧪 تقرير مكافحة المخدرات — \${v.reportCategory}</div>
                         <div style="color:var(--muted);font-size:13px;">المتهم: \${v.suspectName} • موقع الضبط: \${v.arrestLocation}</div>
                         <div style="color:var(--muted);font-size:13px;">المركبة: \${v.vehicle} • سبب الاستيقاف: \${v.stopReason}</div>
-                        <div style="color:var(--muted);font-size:13px;">مركبة المشتبه به: \${v.suspectVehicle}</div>
                         \${v.reportCategory === 'مخدرات' ? \`
                         <div style="color:var(--muted);font-size:13px;">نوع المخدر: \${v.drugType || '-'} • الكمية: \${v.drugQuantity || '-'}</div>
                         <div style="color:var(--muted);font-size:13px;">طريقة الإخفاء: \${v.concealMethod || '-'}</div>
