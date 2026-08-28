@@ -983,8 +983,10 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
 });
 
 app.get("/api/violations/mine", ensureAuth, async (req, res) => {
-    const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 }).limit(200);
-    res.json({ list });
+    try {
+        const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 }).limit(200).maxTimeMS(10000);
+        res.json({ list });
+    } catch (e) { res.status(500).json({ error: "تعذر جلب المخالفات، حاول مرة ثانية" }); }
 });
 
 // ── تقارير مديرية مكافحة المخدرات ────────────────────────────────────────
@@ -1049,8 +1051,10 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
 
 // ── مسارات الإداري المعيَّن (قبول/رفض فقط) ──────────────────────────────
 app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
-    const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 }).limit(200);
-    res.json({ list });
+    try {
+        const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 }).limit(200).maxTimeMS(10000);
+        res.json({ list });
+    } catch (e) { res.status(500).json({ error: "تعذر جلب المخالفات، حاول مرة ثانية" }); }
 });
 
 app.post("/api/admin/violations/:id/approve", ensureAnyAdmin, async (req, res) => {
@@ -1071,10 +1075,12 @@ app.post("/api/admin/violations/:id/reject", ensureAnyAdmin, async (req, res) =>
 
 // ── مسارات كبار المسؤولين فقط ────────────────────────────────────────────
 app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
-    const q = (req.query.q || "").trim();
-    const filter = q ? { $or: [{ registeredName: new RegExp(q, "i") }, { unit: new RegExp(q, "i") }, { discordTag: new RegExp(q, "i") }] } : {};
-    const list = await Personnel.find(filter).sort({ createdAt: -1 }).limit(100);
-    res.json({ list });
+    try {
+        const q = (req.query.q || "").trim();
+        const filter = q ? { $or: [{ registeredName: new RegExp(q, "i") }, { unit: new RegExp(q, "i") }, { discordTag: new RegExp(q, "i") }] } : {};
+        const list = await Personnel.find(filter).sort({ createdAt: -1 }).limit(100).maxTimeMS(10000);
+        res.json({ list });
+    } catch (e) { res.status(500).json({ error: "تعذر جلب القائمة، حاول مرة ثانية" }); }
 });
 
 app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, res) => {
@@ -1143,15 +1149,17 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
 // ── قيادة القطاعات — كبار المسؤولين ─────────────────────────────────────
 // يعرض كل عسكري يونته يحتوي كلمة "قائد" (معيّنة عبر أمر تعيين-يونت بالبوت)
 app.get("/api/senior/leaders", ensureSeniorAdmin, async (req, res) => {
-    const list = await Personnel.find({ unit: /قائد/i }).sort({ createdAt: -1 });
-    const result = list.map(p => {
-        const sector = detectSector(p.unit);
-        return {
-            discord: p.discord, discordTag: p.discordTag, registeredName: p.registeredName,
-            unit: p.unit, rank: p.rank, sector, sectorName: sector ? sectorLabel(sector) : "غير محدد (اليونت ما فيه اسم قطاع واضح)",
-        };
-    });
-    res.json({ list: result });
+    try {
+        const list = await Personnel.find({ unit: /قائد/i }).sort({ createdAt: -1 }).maxTimeMS(10000);
+        const result = list.map(p => {
+            const sector = detectSector(p.unit);
+            return {
+                discord: p.discord, discordTag: p.discordTag, registeredName: p.registeredName,
+                unit: p.unit, rank: p.rank, sector, sectorName: sector ? sectorLabel(sector) : "غير محدد (اليونت ما فيه اسم قطاع واضح)",
+            };
+        });
+        res.json({ list: result });
+    } catch (e) { res.status(500).json({ error: "تعذر جلب القائمة، حاول مرة ثانية" }); }
 });
 
 // يشيل صفة "قائد" عن يونت العسكري (يبقى بنفس القطاع كعضو عادي)
@@ -1167,8 +1175,10 @@ app.post("/api/senior/leaders/:discord/remove", ensureSeniorAdmin, async (req, r
 
 // ── المخالفات/التقارير المراجَعة (مقبولة أو مرفوضة) — كبار المسؤولين ────
 app.get("/api/senior/violations", ensureSeniorAdmin, async (req, res) => {
-    const list = await Violation.find({ status: { $in: ["approved", "rejected"] } }).sort({ reviewedAt: -1 }).limit(300);
-    res.json({ list });
+    try {
+        const list = await Violation.find({ status: { $in: ["approved", "rejected"] } }).sort({ reviewedAt: -1 }).limit(300).maxTimeMS(10000);
+        res.json({ list });
+    } catch (e) { res.status(500).json({ error: "تعذر جلب المخالفات، حاول مرة ثانية" }); }
 });
 
 // حذف مخالفة/تقرير بعد المراجعة — يرجّع تأثيرها على نقاط العسكري تلقائياً
@@ -1192,18 +1202,20 @@ app.delete("/api/senior/violations/:id", ensureSeniorAdmin, async (req, res) => 
 
 // ── الملاحظات — عرض وحذف من كبار المسؤولين ──────────────────────────────
 app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
-    const list = await Personnel.find({ "notes.0": { $exists: true } }, "discord discordTag registeredName notes");
-    const flat = [];
-    list.forEach(p => {
-        (p.notes || []).forEach(n => {
-            flat.push({
-                noteId: n._id, discord: p.discord, name: p.registeredName || p.discordTag,
-                text: n.text, addedBy: n.addedBy, addedByTag: n.addedByTag, createdAt: n.createdAt,
+    try {
+        const list = await Personnel.find({ "notes.0": { $exists: true } }, "discord discordTag registeredName notes").maxTimeMS(10000);
+        const flat = [];
+        list.forEach(p => {
+            (p.notes || []).forEach(n => {
+                flat.push({
+                    noteId: n._id, discord: p.discord, name: p.registeredName || p.discordTag,
+                    text: n.text, addedBy: n.addedBy, addedByTag: n.addedByTag, createdAt: n.createdAt,
+                });
             });
         });
-    });
-    flat.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    res.json({ list: flat });
+        flat.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        res.json({ list: flat });
+    } catch (e) { res.status(500).json({ error: "تعذر جلب الملاحظات، حاول مرة ثانية" }); }
 });
 
 app.delete("/api/senior/notes/:discord/:noteId", ensureSeniorAdmin, async (req, res) => {
@@ -1219,9 +1231,11 @@ app.delete("/api/senior/notes/:discord/:noteId", ensureSeniorAdmin, async (req, 
 
 // ── لوحة القادة — قادة القطاعات الثلاثة (كل قائد يشوف قطاعه فقط) ────────
 app.get("/api/leader/pending", ensureSectorLeader, async (req, res) => {
-    const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 }).limit(200);
-    const filtered = list.filter(v => detectSector(v.reporterUnit) === req.leaderSector);
-    res.json({ list: filtered, sectorName: req.leaderSectorName });
+    try {
+        const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 }).limit(200).maxTimeMS(10000);
+        const filtered = list.filter(v => detectSector(v.reporterUnit) === req.leaderSector);
+        res.json({ list: filtered, sectorName: req.leaderSectorName });
+    } catch (e) { res.status(500).json({ error: "تعذر جلب المخالفات، حاول مرة ثانية" }); }
 });
 
 app.post("/api/leader/violations/:id/approve", ensureSectorLeader, async (req, res) => {
@@ -1243,10 +1257,12 @@ app.post("/api/leader/violations/:id/reject", ensureSectorLeader, async (req, re
 });
 
 app.get("/api/leader/personnel", ensureSectorLeader, async (req, res) => {
-    const list = await Personnel.find().sort({ createdAt: -1 });
-    const filtered = list.filter(p => detectSector(p.unit) === req.leaderSector)
-        .map(p => ({ discord: p.discord, discordTag: p.discordTag, registeredName: p.registeredName, unit: p.unit, rank: p.rank, points: p.points, isBlocked: p.isBlocked }));
-    res.json({ list: filtered, sectorName: req.leaderSectorName });
+    try {
+        const list = await Personnel.find().sort({ createdAt: -1 }).maxTimeMS(10000);
+        const filtered = list.filter(p => detectSector(p.unit) === req.leaderSector)
+            .map(p => ({ discord: p.discord, discordTag: p.discordTag, registeredName: p.registeredName, unit: p.unit, rank: p.rank, points: p.points, isBlocked: p.isBlocked }));
+        res.json({ list: filtered, sectorName: req.leaderSectorName });
+    } catch (e) { res.status(500).json({ error: "تعذر جلب القائمة، حاول مرة ثانية" }); }
 });
 
 app.post("/api/leader/personnel/:discord/note", ensureSectorLeader, async (req, res) => {
@@ -1502,7 +1518,17 @@ function compressImage(file, maxDim = 1000, quality = 0.7) {
 let currentAdminTab = null;
 
 async function api(url, opts) {
-    const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // إذا الطلب أخذ أكثر من 15 ثانية نوقفه بدل ما يعلّق للأبد
+    let r;
+    try {
+        r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, signal: controller.signal, ...opts });
+    } catch (e) {
+        if (e.name === 'AbortError') throw new Error('السيرفر ما رد خلال 15 ثانية، جرب مرة ثانية');
+        throw new Error('تعذر الاتصال بالسيرفر');
+    } finally {
+        clearTimeout(timeoutId);
+    }
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.error || 'خطأ');
     return data;
@@ -2210,7 +2236,10 @@ async function loadPersonnel() {
 let personnelCache = [];
 async function searchPersonnel() {
     const q = document.getElementById('p-search') ? document.getElementById('p-search').value : '';
-    const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+    const box0 = document.getElementById('p-list');
+    let list;
+    try { ({ list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q))); }
+    catch (e) { if (box0) box0.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="searchPersonnel()">إعادة المحاولة</button></div>'; return; }
     if (currentAdminTab !== 'personnel') return; // المستخدم غيّر التبويب أثناء التحميل
     personnelCache = list;
     const pListEl = document.getElementById('p-list');
@@ -2311,9 +2340,11 @@ async function addVehicle() {
     } catch (e) { toast(e.message); }
 }
 async function loadVehicleList() {
-    const { list } = await api('/api/senior/vehicles');
-    if (currentAdminTab !== 'vehicles') return;
     const box = document.getElementById('veh-list');
+    let list;
+    try { ({ list } = await api('/api/senior/vehicles')); }
+    catch (e) { if (box) box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadVehicleList()">إعادة المحاولة</button></div>'; return; }
+    if (currentAdminTab !== 'vehicles') return;
     if (!box) return;
     box.innerHTML = list.map(v => \`
         <div class="vcard">
@@ -2348,9 +2379,11 @@ async function hireAdmin() {
     catch (e) { toast(e.message); }
 }
 async function loadAdminsList() {
-    const { list } = await api('/api/senior/admins');
-    if (currentAdminTab !== 'hire') return;
     const box = document.getElementById('admins-list');
+    let list;
+    try { ({ list } = await api('/api/senior/admins')); }
+    catch (e) { if (box) box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadAdminsList()">إعادة المحاولة</button></div>'; return; }
+    if (currentAdminTab !== 'hire') return;
     if (!box) return;
     box.innerHTML = list.map(id => \`
         <div class="card row"><span>\${id}</span><button class="btn danger sm" onclick="fireAdmin('\${id}')">فصل</button></div>\`).join('') || '<div class="card center" style="color:var(--muted);">لا يوجد إداريون معيّنون</div>';
@@ -2359,9 +2392,11 @@ function fireAdmin(id) {
     api('/api/senior/fire-admin', { method: 'POST', body: JSON.stringify({ discordId: id }) }).then(() => { toast('تم الفصل'); loadHire(); });
 }
 async function loadThresholds() {
-    const { ranks, thresholds } = await api('/api/senior/thresholds');
-    if (currentAdminTab !== 'thresholds') return;
     const box = document.getElementById('admin-content');
+    let ranks, thresholds;
+    try { ({ ranks, thresholds } = await api('/api/senior/thresholds')); }
+    catch (e) { if (box) box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadThresholds()">إعادة المحاولة</button></div>'; return; }
+    if (currentAdminTab !== 'thresholds') return;
     if (!box) return;
     box.innerHTML = \`<div class="card">
         <h3>نقاط الترقية بين الرتب</h3>
@@ -2383,9 +2418,11 @@ async function saveThresholds() {
     catch (e) { toast(e.message); }
 }
 async function loadLog() {
-    const { list } = await api('/api/senior/log');
-    if (currentAdminTab !== 'log') return;
     const box = document.getElementById('admin-content');
+    let list;
+    try { ({ list } = await api('/api/senior/log')); }
+    catch (e) { if (box) box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadLog()">إعادة المحاولة</button></div>'; return; }
+    if (currentAdminTab !== 'log') return;
     if (!box) return;
     box.innerHTML = \`<div class="card"><table>
         <tr><th>الوقت</th><th>مين</th><th>الإجراء</th><th>التفاصيل</th></tr>
@@ -2393,9 +2430,11 @@ async function loadLog() {
     </table></div>\` || '<div class="card center" style="color:var(--muted);">لا يوجد سجل بعد</div>';
 }
 async function loadSettings() {
-    const { settings } = await api('/api/senior/settings');
-    if (currentAdminTab !== 'settings') return;
     const box = document.getElementById('admin-content');
+    let settings;
+    try { ({ settings } = await api('/api/senior/settings')); }
+    catch (e) { if (box) box.innerHTML = '<div class="card center" style="color:#f87171;">تعذر التحميل: ' + e.message + '<br><button class="btn sm" style="margin-top:10px;" onclick="loadSettings()">إعادة المحاولة</button></div>'; return; }
+    if (currentAdminTab !== 'settings') return;
     if (!box) return;
     box.innerHTML = \`
         <div class="card">
@@ -2414,6 +2453,13 @@ init();
 </script>
 </body>
 </html>`);
+});
+
+// معالج أخطاء عام: أي خطأ يصير بأي route (مثل تجاوز مهلة استعلام Mongo) يرجّع رد بدل ما يعلّق الطلب للأبد
+app.use((err, req, res, next) => {
+    console.error("❌ خطأ غير متوقع:", err && err.message);
+    if (res.headersSent) return next(err);
+    res.status(500).json({ error: "صار خطأ بالسيرفر، حاول مرة ثانية" });
 });
 
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
