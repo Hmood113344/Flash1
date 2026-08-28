@@ -1202,19 +1202,6 @@ app.post("/api/senior/thresholds", ensureSeniorAdmin, async (req, res) => {
     res.json({ ok: true });
 });
 
-app.get("/api/senior/reviewed", ensureSeniorAdmin, async (req, res) => {
-    const list = await Violation.find({ status: { $in: ["approved", "rejected"] } }).sort({ reviewedAt: -1 }).limit(300);
-    res.json({ list });
-});
-
-app.delete("/api/senior/violations/:id", ensureSeniorAdmin, async (req, res) => {
-    const v = await Violation.findByIdAndDelete(req.params.id);
-    if (!v) return res.status(404).json({ error: "غير موجودة" });
-    const label = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
-    await logEvent({ action: "حذف نهائي", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId: req.user.id, actorTag: req.user.username, details: `${label} — ${v.reporterName}` });
-    res.json({ ok: true });
-});
-
 app.get("/api/senior/log", ensureSeniorAdmin, async (req, res) => {
     const list = await Log.find().sort({ createdAt: -1 }).limit(200);
     res.json({ list });
@@ -1732,7 +1719,6 @@ function renderAdmin() {
     const tabsHtml = ME.isSeniorAdmin ? \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
-            <div class="tab" onclick="adminTab('reviewed', this)">المخالفات المقبولة</div>
             <div class="tab" onclick="adminTab('personnel', this)">الحسابات</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
@@ -1753,7 +1739,6 @@ function adminTab(name, el) {
     if (el) el.classList.add('active');
     currentAdminTab = name;
     if (name === 'pending') loadPending();
-    if (name === 'reviewed') loadReviewed();
     if (name === 'personnel') loadPersonnel();
     if (name === 'vehicles') loadVehicles();
     if (name === 'hire') loadHire();
@@ -1837,39 +1822,6 @@ function rejectV(id) {
     api('/api/admin/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
         .then(() => { toast('تم الرفض'); loadPending(); }).catch(e => toast(e.message));
 }
-async function loadReviewed() {
-    const box = document.getElementById('admin-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    const { list } = await api('/api/senior/reviewed');
-    if (currentAdminTab !== 'reviewed') return;
-    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات أو تقارير تمت مراجعتها بعد</div>'; return; }
-    box.innerHTML = list.map(v => \`
-        <div class="card">
-            <div class="row" style="align-items:flex-start;">
-                <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
-                    <div>
-                        <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
-                        <span class="status-badge" style="margin-right:8px;color:\${v.status === 'approved' ? '#4ade80' : '#fca5a5'};">\${v.status === 'approved' ? '✅ مقبولة' : '❌ مرفوضة'}</span>
-                        <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
-                        <div style="color:var(--muted);font-size:13px;">المركبة: \${v.vehicle} \${v.plateNumber ? '• اللوحة: ' + v.plateNumber : ''}</div>
-                        \${v.status === 'rejected' && v.rejectReason ? \`<div style="color:var(--muted);font-size:13px;">سبب الرفض: \${v.rejectReason}</div>\` : ''}
-                        <div style="color:var(--muted);font-size:12px;margin-top:4px;">راجعها: \${v.reviewedByTag || v.reviewedBy || '-'} \${v.reviewedAt ? '• ' + new Date(v.reviewedAt).toLocaleString('ar') : ''}</div>
-                    </div>
-                </div>
-                <div class="row" style="gap:8px;">
-                    <button class="btn danger sm" onclick="deleteReviewed('\${v._id}')">🗑️ حذف نهائي</button>
-                </div>
-            </div>
-        </div>\`).join('');
-}
-async function deleteReviewed(id) {
-    if (!confirm('متأكد تبي تحذفها نهائياً؟ هذا الإجراء ما يُرجع، وبتختفي عند العضو والإداري.')) return;
-    try { await api('/api/senior/violations/' + id, { method: 'DELETE' }); toast('تم الحذف النهائي'); loadReviewed(); }
-    catch (e) { toast(e.message); }
-}
-
 async function loadPersonnel() {
     const box = document.getElementById('admin-content');
     box.innerHTML = \`<div class="card"><input id="p-search" placeholder="بحث بالاسم / اليونت / التاق" onkeyup="if(event.key==='Enter') searchPersonnel()"><button class="btn sm" onclick="searchPersonnel()">بحث</button></div><div id="p-list"></div>\`;
@@ -2074,7 +2026,6 @@ const LOG_META = {
     "فصل إداري":            { icon: "🚫", label: "فصل إداري",           color: "#fca5a5", border: "#ef4444" },
     "إضافة مركبة":          { icon: "🚗", label: "إضافة مركبة",         color: "#93c5fd", border: "#3b82f6" },
     "تعديل حدود النقاط":    { icon: "🎯", label: "تعديل حدود النقاط",   color: "#60a5fa", border: "#3b82f6" },
-    "حذف نهائي":            { icon: "🗑️", label: "حذف نهائي (مخالفة/تقرير)", color: "#fca5a5", border: "#7f1d1d" },
     "حذف ملاحظة":           { icon: "🗑️", label: "حذف ملاحظة",          color: "#fca5a5", border: "#7f1d1d" },
 };
 let lastLogId = null;
