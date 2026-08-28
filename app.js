@@ -982,7 +982,7 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
 });
 
 app.get("/api/violations/mine", ensureAuth, async (req, res) => {
-    const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 });
+    const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 }).limit(200);
     res.json({ list });
 });
 
@@ -1048,7 +1048,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
 
 // ── مسارات الإداري المعيَّن (قبول/رفض فقط) ──────────────────────────────
 app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
-    const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 });
+    const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 }).limit(200);
     res.json({ list });
 });
 
@@ -1218,7 +1218,7 @@ app.delete("/api/senior/notes/:discord/:noteId", ensureSeniorAdmin, async (req, 
 
 // ── لوحة القادة — قادة القطاعات الثلاثة (كل قائد يشوف قطاعه فقط) ────────
 app.get("/api/leader/pending", ensureSectorLeader, async (req, res) => {
-    const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 });
+    const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 }).limit(200);
     const filtered = list.filter(v => detectSector(v.reporterUnit) === req.leaderSector);
     res.json({ list: filtered, sectorName: req.leaderSectorName });
 });
