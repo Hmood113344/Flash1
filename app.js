@@ -772,6 +772,26 @@ if (CONFIG.BOT_TOKEN) {
 // 4) موقع الويب (Express)
 // ══════════════════════════════════════════════════════════════════════════
 const app = express();
+
+// 🛠️ يمسك أي خطأ غير متوقع داخل أي راوت (Mongo, إلخ) ويرجّع JSON دايماً
+// بدل ما يخلي الطلب "يعلّق" بدون رد، وهذا اللي كان يسبب بقاء "جاري التحميل..."
+// معلّقة للأبد بأي صفحة (مخالفاتي، لوحة الإدارة، مخالفات معلّقة...)
+["get", "post", "put", "delete", "patch"].forEach(method => {
+    const original = app[method].bind(app);
+    app[method] = (path, ...handlers) => {
+        const wrapped = handlers.map(h => {
+            if (typeof h !== "function") return h;
+            return (req, res, next) => {
+                Promise.resolve(h(req, res, next)).catch(err => {
+                    console.error(`❌ خطأ في ${method.toUpperCase()} ${path}:`, err);
+                    if (!res.headersSent) res.status(500).json({ error: "صار خطأ بالسيرفر، حاول مرة ثانية", ok: false });
+                });
+            };
+        });
+        return original(path, ...wrapped);
+    };
+});
+
 app.use(express.json({ limit: "8mb" }));
 app.use(session({ secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialized: false }));
 app.use(passport.initialize());
@@ -904,6 +924,13 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
         const p = await Personnel.findOne({ discord: req.user.id });
         if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
         if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل مخالفات جديدة" });
+
+        // يمنع تسجيل مخالفة جديدة إذا عنده مخالفة معلّقة بانتظار المراجعة أصلاً
+        // (هذا يمنع مشكلة تسجيل مخالفتين دبل لو ضغط المستخدم إرسال أكثر من مرة)
+        const existingPending = await Violation.findOne({ reporterDiscord: req.user.id, status: "pending" });
+        if (existingPending) {
+            return res.status(429).json({ error: "عندك مخالفة معلّقة بانتظار المراجعة، لازم تنتظر رد الإدارة عليها قبل تسجيل مخالفة جديدة." });
+        }
 
         const last = await Violation.findOne({ reporterDiscord: req.user.id }).sort({ createdAt: -1 });
         if (last) {
@@ -1509,18 +1536,22 @@ function renderNotes() {
         ME.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-bottom:6px;font-size:13px;">\${n.text}</div>\`).join('');
 }
 async function loadMine(silent) {
-    const { list } = await api('/api/violations/mine');
-    const cEl = document.getElementById('mine-count');
-    if (cEl) cEl.textContent = list.length;
     const box = document.getElementById('mine-list');
-    if (!box) return;
-    if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);">لا توجد مخالفات مسجلة بعد</p>'; return; }
-    box.innerHTML = \`<table><tr><th></th><th>النوع</th><th>المركبة</th><th>اللوحة</th><th>الحالة</th></tr>\` +
-        list.map(v => \`<tr>
-            <td>\${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : '—'}</td>
-            <td>\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</td><td>\${v.vehicle}</td><td>\${v.plateNumber}</td>
-            <td><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>\${v.status === 'rejected' && v.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">\${v.rejectReason}</div>\` : ''}</td>
-        </tr>\`).join('') + '</table>';
+    try {
+        const { list } = await api('/api/violations/mine');
+        const cEl = document.getElementById('mine-count');
+        if (cEl) cEl.textContent = list.length;
+        if (!box) return;
+        if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);">لا توجد مخالفات مسجلة بعد</p>'; return; }
+        box.innerHTML = \`<table><tr><th></th><th>النوع</th><th>المركبة</th><th>اللوحة</th><th>الحالة</th></tr>\` +
+            list.map(v => \`<tr>
+                <td>\${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : '—'}</td>
+                <td>\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</td><td>\${v.vehicle}</td><td>\${v.plateNumber}</td>
+                <td><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>\${v.status === 'rejected' && v.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">\${v.rejectReason}</div>\` : ''}</td>
+            </tr>\`).join('') + '</table>';
+    } catch (e) {
+        if (box) box.innerHTML = \`<p style="color:#f87171;">تعذر تحميل مخالفاتي، حاول تحدّث الصفحة. (\${e.message})</p>\`;
+    }
 }
 async function renderNewViolation() {
     const meta = await api('/api/violations/meta');
@@ -1540,7 +1571,7 @@ async function renderNewViolation() {
             <input type="file" id="v-photo" accept="image/*" onchange="previewPhoto()" required>
             <img id="v-photo-preview" style="display:none;max-width:220px;border-radius:8px;margin-bottom:10px;">
             <div class="row" style="gap:8px;margin-top:10px;">
-                <button class="btn" onclick="submitViolation()">إرسال</button>
+                <button class="btn" id="v-submit-btn" onclick="submitViolation()">إرسال</button>
                 <button class="btn gray" onclick="renderDashboard()">رجوع</button>
             </div>
         </div>\`;
@@ -1563,14 +1594,24 @@ function previewPhoto() {
     };
     reader.readAsDataURL(f);
 }
+let violationSubmitting = false;
 async function submitViolation() {
+    if (violationSubmitting) return; // يمنع الدبل-كليك من إرسال الطلب مرتين
     const violationType = document.getElementById('v-type').value;
     if (!selectedVehicle) return toast('اختر المركبة');
     if (!photoBase64) return toast('لازم ترفق صورة المخالفة');
+    const btn = document.getElementById('v-submit-btn');
+    violationSubmitting = true;
+    if (btn) { btn.disabled = true; btn.textContent = 'جارِ الإرسال...'; }
     try {
         await api('/api/violations/submit', { method: 'POST', body: JSON.stringify({ violationType, vehicle: selectedVehicle, photo: photoBase64 }) });
         toast('تم الإرسال، بانتظار قبول الإدارة'); renderDashboard();
-    } catch (e) { toast(e.message); }
+    } catch (e) {
+        toast(e.message);
+        if (btn) { btn.disabled = false; btn.textContent = 'إرسال'; }
+    } finally {
+        violationSubmitting = false;
+    }
 }
 function renderNewReport() {
     document.getElementById('app').innerHTML = \`
@@ -1752,7 +1793,14 @@ async function loadPending() {
     const box = document.getElementById('admin-content');
     if (!box) return;
     if (!box.dataset.loaded) box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    const { list } = await api('/api/admin/pending');
+    let list;
+    try {
+        ({ list } = await api('/api/admin/pending'));
+    } catch (e) {
+        if (currentAdminTab !== 'pending') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر تحميل المخالفات المعلّقة، حاول تحدّث الصفحة. (\${e.message})</div>\`;
+        return;
+    }
     if (currentAdminTab !== 'pending') return; // المستخدم غيّر التبويب أثناء التحميل
     box.id = 'admin-content'; box.dataset.loaded = '1';
     box.innerHTML = '<div id="pending-box"></div>';
@@ -2079,7 +2127,14 @@ async function loadNotesPage() {
     const box = document.getElementById('admin-content');
     if (!box) return;
     box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    const { list } = await api('/api/senior/notes');
+    let list;
+    try {
+        ({ list } = await api('/api/senior/notes'));
+    } catch (e) {
+        if (currentAdminTab !== 'notes') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر تحميل الملاحظات، حاول تحدّث الصفحة. (\${e.message})</div>\`;
+        return;
+    }
     if (currentAdminTab !== 'notes') return;
     if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد ملاحظات مسجلة</div>'; return; }
     box.innerHTML = list.map(n => \`
