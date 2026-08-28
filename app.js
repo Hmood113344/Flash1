@@ -55,6 +55,14 @@ const CONFIG = {
          "1458502584481484952",
     ],
 
+    // القطاعات الثلاثة — تُستخدم لتحديد قطاع كل عسكري (حسب كلمة موجودة باليونت)
+    // ولتحديد قادة القطاعات (يونت العسكري لازم يحتوي كلمة "قائد" + كلمة القطاع)
+    SECTORS: [
+        { key: "دوريات", label: "المديرية العامة لدوريات الأمن", roleId: "1500064443537686588" },
+        { key: "مكافحة", label: "مديرية مكافحة المخدرات", roleId: "1500064767082233926" },
+        { key: "طرق", label: "مديرية أمن الطرق", roleId: "1533192878510178304" },
+    ],
+
     // الرتب العسكرية الرسمية بالترتيب من الأدنى للأعلى
     MILITARY_RANKS: [
     "جندي", "جندي اول", "عريف", "وكيل رقيب", "رقيب", "رقيب اول", "رئيس رقباء",
@@ -209,6 +217,29 @@ async function isAnyAdmin(userId) {
     if (isSeniorAdmin(userId)) return true;
     const settings = await getSettings();
     return settings.adminList.includes(userId);
+}
+
+// ── القطاعات وقادة القطاعات ──────────────────────────────────────────────
+// يحدد قطاع العسكري من نص اليونت (يبحث عن كلمة القطاع بالنص)
+function detectSector(unitText) {
+    if (!unitText) return null;
+    const found = CONFIG.SECTORS.find(s => unitText.includes(s.key));
+    return found ? found.key : null;
+}
+function sectorLabel(key) {
+    const s = CONFIG.SECTORS.find(x => x.key === key);
+    return s ? s.label : null;
+}
+// يعتبر العسكري "قائد قطاع" إذا يونته يحتوي كلمة "قائد" مع اسم قطاع واضح (معيّنة من البوت بأمر تعيين-يونت)
+function isLeaderUnit(unitText) {
+    return !!(unitText && /قائد/.test(unitText));
+}
+async function getLeaderInfo(discordId, personnelDoc) {
+    const p = personnelDoc || await Personnel.findOne({ discord: discordId });
+    if (!p || !p.unit) return { isLeader: false, sector: null, sectorName: null };
+    const sector = detectSector(p.unit);
+    const isLeader = isLeaderUnit(p.unit) && !!sector;
+    return { isLeader, sector: isLeader ? sector : null, sectorName: isLeader ? sectorLabel(sector) : null };
 }
 
 async function getThreshold(rank, settings) {
@@ -818,6 +849,15 @@ async function ensureAnyAdmin(req, res, next) {
     next();
 }
 
+async function ensureSectorLeader(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const info = await getLeaderInfo(req.user.id);
+    if (!info.isLeader) return res.status(403).json({ error: "هذا القسم لقادة القطاعات فقط" });
+    req.leaderSector = info.sector;
+    req.leaderSectorName = info.sectorName;
+    next();
+}
+
 app.get("/api/me", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const senior = isSeniorAdmin(req.user.id);
@@ -851,6 +891,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
 
     const isAdmin = senior || settings.adminList.includes(req.user.id);
     const progress = await rankProgress(p, settings);
+    const leaderInfo = await getLeaderInfo(req.user.id, p);
 
     res.json({
         blocked: false,
@@ -866,6 +907,9 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         isAdmin,
         isSeniorAdmin: senior,
         isAntiDrugs,
+        isSectorLeader: leaderInfo.isLeader,
+        leaderSector: leaderInfo.sector,
+        leaderSectorName: leaderInfo.sectorName,
         maintenance: settings.isMaintenance,
         violationsDisabled: settings.disableViolations,
         nextRank: progress.nextRank,
@@ -1090,6 +1134,126 @@ app.post("/api/senior/personnel/:discord/update", ensureSeniorAdmin, async (req,
     await logEvent(req.user.id, req.user.username, "تعديل ملف عسكري", `${p.discord}: ${JSON.stringify(update)}`);
     await checkAutoPromotion(req.params.discord);
     res.json({ ok: true, personnel: p });
+});
+
+// ── قيادة القطاعات — كبار المسؤولين ─────────────────────────────────────
+// يعرض كل عسكري يونته يحتوي كلمة "قائد" (معيّنة عبر أمر تعيين-يونت بالبوت)
+app.get("/api/senior/leaders", ensureSeniorAdmin, async (req, res) => {
+    const list = await Personnel.find({ unit: /قائد/i }).sort({ createdAt: -1 });
+    const result = list.map(p => {
+        const sector = detectSector(p.unit);
+        return {
+            discord: p.discord, discordTag: p.discordTag, registeredName: p.registeredName,
+            unit: p.unit, rank: p.rank, sector, sectorName: sector ? sectorLabel(sector) : "غير محدد (اليونت ما فيه اسم قطاع واضح)",
+        };
+    });
+    res.json({ list: result });
+});
+
+// يشيل صفة "قائد" عن يونت العسكري (يبقى بنفس القطاع كعضو عادي)
+app.post("/api/senior/leaders/:discord/remove", ensureSeniorAdmin, async (req, res) => {
+    const p = await Personnel.findOne({ discord: req.params.discord });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const newUnit = (p.unit || "").replace(/قائد/g, "").replace(/\s+/g, " ").trim() || null;
+    p.unit = newUnit;
+    await p.save();
+    await logEvent(req.user.id, req.user.username, "إزالة من قيادة القطاع", `${p.registeredName || p.discord}`);
+    res.json({ ok: true, unit: p.unit });
+});
+
+// ── المخالفات/التقارير المراجَعة (مقبولة أو مرفوضة) — كبار المسؤولين ────
+app.get("/api/senior/violations", ensureSeniorAdmin, async (req, res) => {
+    const list = await Violation.find({ status: { $in: ["approved", "rejected"] } }).sort({ reviewedAt: -1 }).limit(300);
+    res.json({ list });
+});
+
+// حذف مخالفة/تقرير بعد المراجعة — يرجّع تأثيرها على نقاط العسكري تلقائياً
+app.delete("/api/senior/violations/:id", ensureSeniorAdmin, async (req, res) => {
+    const v = await Violation.findById(req.params.id);
+    if (!v) return res.status(404).json({ error: "غير موجودة" });
+    if (v.status === "approved") {
+        const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_APPROVE : CONFIG.POINTS_ON_APPROVE;
+        await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: -pts } });
+        await Personnel.updateOne({ discord: v.reporterDiscord, points: { $lt: 0 } }, { $set: { points: 0 } });
+    } else if (v.status === "rejected") {
+        const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_REJECT : CONFIG.POINTS_ON_REJECT;
+        await Personnel.findOneAndUpdate({ discord: v.reporterDiscord }, { $inc: { points: pts } });
+    }
+    const label = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
+    const statusLabel = v.status === "approved" ? "كانت مقبولة" : "كانت مرفوضة";
+    await Violation.findByIdAndDelete(req.params.id);
+    await logEvent(req.user.id, req.user.username, "حذف مخالفة/تقرير مراجَع", `${label} — ${v.reporterName} (${statusLabel})`);
+    res.json({ ok: true });
+});
+
+// ── الملاحظات — عرض وحذف من كبار المسؤولين ──────────────────────────────
+app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
+    const list = await Personnel.find({ "notes.0": { $exists: true } }, "discord discordTag registeredName notes");
+    const flat = [];
+    list.forEach(p => {
+        (p.notes || []).forEach(n => {
+            flat.push({
+                noteId: n._id, discord: p.discord, name: p.registeredName || p.discordTag,
+                text: n.text, addedBy: n.addedBy, addedByTag: n.addedByTag, createdAt: n.createdAt,
+            });
+        });
+    });
+    flat.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json({ list: flat });
+});
+
+app.delete("/api/senior/notes/:discord/:noteId", ensureSeniorAdmin, async (req, res) => {
+    const p = await Personnel.findOneAndUpdate(
+        { discord: req.params.discord },
+        { $pull: { notes: { _id: req.params.noteId } } },
+        { new: true }
+    );
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent(req.user.id, req.user.username, "حذف ملاحظة", `عن ${p.registeredName || p.discord}`);
+    res.json({ ok: true });
+});
+
+// ── لوحة القادة — قادة القطاعات الثلاثة (كل قائد يشوف قطاعه فقط) ────────
+app.get("/api/leader/pending", ensureSectorLeader, async (req, res) => {
+    const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 });
+    const filtered = list.filter(v => detectSector(v.reporterUnit) === req.leaderSector);
+    res.json({ list: filtered, sectorName: req.leaderSectorName });
+});
+
+app.post("/api/leader/violations/:id/approve", ensureSectorLeader, async (req, res) => {
+    const v = await Violation.findById(req.params.id);
+    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
+    if (detectSector(v.reporterUnit) !== req.leaderSector) return res.status(403).json({ error: "هذي المخالفة مو من قطاعك" });
+    await approveViolation(v, req.user.id, req.user.username);
+    res.json({ ok: true });
+});
+
+app.post("/api/leader/violations/:id/reject", ensureSectorLeader, async (req, res) => {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
+    const v = await Violation.findById(req.params.id);
+    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
+    if (detectSector(v.reporterUnit) !== req.leaderSector) return res.status(403).json({ error: "هذي المخالفة مو من قطاعك" });
+    await rejectViolation(v, req.user.id, req.user.username, reason.trim());
+    res.json({ ok: true });
+});
+
+app.get("/api/leader/personnel", ensureSectorLeader, async (req, res) => {
+    const list = await Personnel.find().sort({ createdAt: -1 });
+    const filtered = list.filter(p => detectSector(p.unit) === req.leaderSector)
+        .map(p => ({ discord: p.discord, discordTag: p.discordTag, registeredName: p.registeredName, unit: p.unit, rank: p.rank, points: p.points, isBlocked: p.isBlocked }));
+    res.json({ list: filtered, sectorName: req.leaderSectorName });
+});
+
+app.post("/api/leader/personnel/:discord/note", ensureSectorLeader, async (req, res) => {
+    const target = await Personnel.findOne({ discord: req.params.discord });
+    if (!target || detectSector(target.unit) !== req.leaderSector) return res.status(403).json({ error: "هذا العسكري مو من قطاعك" });
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
+    target.notes.push({ text: text.trim(), addedBy: req.user.id, addedByTag: req.user.username });
+    await target.save();
+    await logEvent(req.user.id, req.user.username, "إضافة ملاحظة (قائد قطاع)", `على ${target.registeredName || target.discord}: ${text.trim()}`);
+    res.json({ ok: true });
 });
 
 app.get("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
@@ -1466,6 +1630,7 @@ function renderDashboard() {
             <div id="mine-list">جارِ التحميل...</div>
         </div>
         \${ME.isSeniorAdmin ? '<button class="fab" onclick="renderAdmin()">🛡️ لوحة كبار المسؤولين</button>' : ''}
+        \${(!ME.isSeniorAdmin && ME.isSectorLeader) ? '<button class="fab" onclick="renderLeaderPanel()">🎖️ لوحة القادة</button>' : ''}
     \`;
     loadMine();
     renderNotes();
@@ -1509,7 +1674,7 @@ async function renderNewViolation() {
             <input type="file" id="v-photo" accept="image/*" onchange="previewPhoto()" required>
             <img id="v-photo-preview" style="display:none;max-width:220px;border-radius:8px;margin-bottom:10px;">
             <div class="row" style="gap:8px;margin-top:10px;">
-                <button class="btn" onclick="submitViolation()">إرسال</button>
+                <button class="btn" id="v-submit-btn" onclick="submitViolation()">إرسال</button>
                 <button class="btn gray" onclick="renderDashboard()">رجوع</button>
             </div>
         </div>\`;
@@ -1532,14 +1697,25 @@ function previewPhoto() {
     };
     reader.readAsDataURL(f);
 }
+let violationSubmitting = false;
 async function submitViolation() {
+    if (violationSubmitting) return; // يمنع الإرسال المكرر لو ضغط المستخدم أكثر من مرة
     const violationType = document.getElementById('v-type').value;
     if (!selectedVehicle) return toast('اختر المركبة');
     if (!photoBase64) return toast('لازم ترفق صورة المخالفة');
+    const btn = document.getElementById('v-submit-btn');
+    violationSubmitting = true;
+    if (btn) { btn.disabled = true; btn.textContent = 'جارِ الإرسال...'; }
     try {
         await api('/api/violations/submit', { method: 'POST', body: JSON.stringify({ violationType, vehicle: selectedVehicle, photo: photoBase64 }) });
-        toast('تم الإرسال، بانتظار قبول الإدارة'); renderDashboard();
-    } catch (e) { toast(e.message); }
+        toast('تم الإرسال، بانتظار قبول الإدارة');
+        violationSubmitting = false;
+        renderDashboard();
+    } catch (e) {
+        toast(e.message);
+        violationSubmitting = false;
+        if (btn) { btn.disabled = false; btn.textContent = 'إرسال'; }
+    }
 }
 function renderNewReport() {
     document.getElementById('app').innerHTML = \`
@@ -1600,7 +1776,7 @@ async function renderReportForm(category) {
             <input type="file" id="rp-photo" accept="image/*" onchange="previewReportPhoto()" required>
             <img id="rp-photo-preview" style="display:none;max-width:220px;border-radius:8px;margin-bottom:10px;">
             <div class="row" style="gap:8px;margin-top:10px;">
-                <button class="btn" onclick="submitReport('\${category}')">إرسال التقرير</button>
+                <button class="btn" id="rp-submit-btn" onclick="submitReport('\${category}')">إرسال التقرير</button>
                 <button class="btn gray" onclick="renderNewReport()">رجوع</button>
             </div>
         </div>\`;
@@ -1640,7 +1816,9 @@ function previewReportPhoto() {
     };
     reader.readAsDataURL(f);
 }
+let reportSubmitting = false;
 async function submitReport(category) {
+    if (reportSubmitting) return; // يمنع الإرسال المكرر لو ضغط المستخدم أكثر من مرة
     const isDrugs = category === 'مخدرات';
     const suspectName = document.getElementById('rp-suspect-name').value.trim();
     const arrestLocation = document.getElementById('rp-location').value.trim();
@@ -1662,14 +1840,23 @@ async function submitReport(category) {
         seizedItems = document.getElementById('rp-seized').value.trim();
         if (!seizedItems) return toast('اكتب المضبوطات');
     }
+    const rbtn = document.getElementById('rp-submit-btn');
+    reportSubmitting = true;
+    if (rbtn) { rbtn.disabled = true; rbtn.textContent = 'جارِ الإرسال...'; }
     try {
         await api('/api/reports/submit', { method: 'POST', body: JSON.stringify({
             category, suspectName, arrestLocation, vehicle: reportSelectedVehicle,
             stopReason, suspectVehicle, seizedItems, securityActions, photo: reportVehiclePhoto,
             drugType, drugQuantity, concealMethod,
         }) });
-        toast('تم إرسال التقرير، بانتظار المراجعة'); renderDashboard();
-    } catch (e) { toast(e.message); }
+        toast('تم إرسال التقرير، بانتظار المراجعة');
+        reportSubmitting = false;
+        renderDashboard();
+    } catch (e) {
+        toast(e.message);
+        reportSubmitting = false;
+        if (rbtn) { rbtn.disabled = false; rbtn.textContent = 'إرسال التقرير'; }
+    }
 }
 function renderCard() {
     document.getElementById('app').innerHTML = \`
@@ -1688,11 +1875,113 @@ function renderCard() {
             <div class="center" style="margin-top:16px;"><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>
         </div>\`;
 }
+// ── لوحة القادة (قادة القطاعات الثلاثة) ─────────────────────────────────
+function renderLeaderPanel() {
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>🎖️ لوحة القادة \${ME.leaderSectorName ? ('— ' + ME.leaderSectorName) : ''}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="tabs">
+            <div class="tab active" onclick="leaderTab('pending', this)">المخالفات المعلّقة</div>
+            <div class="tab" onclick="leaderTab('personnel', this)">الحسابات</div>
+        </div>
+        <div id="leader-content"></div>\`;
+    leaderTab('pending');
+}
+let currentLeaderTab = null;
+function leaderTab(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    currentLeaderTab = name;
+    if (name === 'pending') loadLeaderPending();
+    if (name === 'personnel') loadLeaderPersonnel();
+}
+async function loadLeaderPending() {
+    const box = document.getElementById('leader-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    const { list } = await api('/api/leader/pending');
+    if (currentLeaderTab !== 'pending') return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات معلّقة بقطاعك</div>'; return; }
+    box.innerHTML = list.map(v => v.kind === 'report' ? \`
+        <div class="card">
+            <div class="row" style="align-items:flex-start;">
+                <div class="row" style="gap:10px;align-items:flex-start;">
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    <div>
+                        <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
+                        <div style="color:var(--gold-soft);margin-top:4px;">🧪 تقرير مكافحة المخدرات — \${v.reportCategory}</div>
+                        <div style="color:var(--muted);font-size:13px;">المتهم: \${v.suspectName} • موقع الضبط: \${v.arrestLocation}</div>
+                        <div style="color:var(--muted);font-size:13px;">المركبة: \${v.vehicle} • سبب الاستيقاف: \${v.stopReason}</div>
+                    </div>
+                </div>
+                <div class="row" style="gap:8px;">
+                    <button class="btn sm" onclick="approveLV('\${v._id}')">قبول</button>
+                    <button class="btn danger sm" onclick="rejectLV('\${v._id}')">رفض</button>
+                </div>
+            </div>
+        </div>\` : \`
+        <div class="card">
+            <div class="row">
+                <div class="row" style="gap:10px;">
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    <div>
+                        <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
+                        <div style="color:var(--gold-soft);margin-top:4px;">\${v.violationType}</div>
+                        <div style="color:var(--muted);font-size:13px;">المركبة: \${v.vehicle} • اللوحة: \${v.plateNumber}</div>
+                    </div>
+                </div>
+                <div class="row" style="gap:8px;">
+                    <button class="btn sm" onclick="approveLV('\${v._id}')">قبول</button>
+                    <button class="btn danger sm" onclick="rejectLV('\${v._id}')">رفض</button>
+                </div>
+            </div>
+        </div>\`).join('');
+}
+async function approveLV(id) {
+    if (isActionLocked(id)) return toast('انتظر 5 ثواني قبل الضغط مرة أخرى');
+    lockAction(id);
+    try { await api('/api/leader/violations/' + id + '/approve', { method: 'POST' }); toast('تم القبول'); loadLeaderPending(); }
+    catch (e) { toast(e.message); }
+}
+function rejectLV(id) {
+    if (isActionLocked(id)) return toast('انتظر 5 ثواني قبل الضغط مرة أخرى');
+    const reason = prompt('اكتب سبب الرفض:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب سبب');
+    lockAction(id);
+    api('/api/leader/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+        .then(() => { toast('تم الرفض'); loadLeaderPending(); }).catch(e => toast(e.message));
+}
+async function loadLeaderPersonnel() {
+    const box = document.getElementById('leader-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    const { list } = await api('/api/leader/personnel');
+    if (currentLeaderTab !== 'personnel') return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بقطاعك</div>'; return; }
+    box.innerHTML = list.map(p => \`
+        <div class="card row">
+            <div>
+                <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                <div style="font-size:13px;color:#94a3b8;">النقاط: \${p.points} \${p.isBlocked ? '• 🚫 موقوف' : ''}</div>
+            </div>
+            <button class="btn sm gray" onclick="addLeaderNote('\${p.discord}')">ملاحظة</button>
+        </div>\`).join('');
+}
+function addLeaderNote(discordId) {
+    const text = prompt('اكتب الملاحظة:');
+    if (!text || !text.trim()) return;
+    api('/api/leader/personnel/' + discordId + '/note', { method: 'POST', body: JSON.stringify({ text }) })
+        .then(() => toast('تمت الإضافة')).catch(e => toast(e.message));
+}
+
 function renderAdmin() {
     const tabsHtml = ME.isSeniorAdmin ? \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
+            <div class="tab" onclick="adminTab('reviewed', this)">المخالفات المقبولة</div>
+            <div class="tab" onclick="adminTab('leaders', this)">قيادة القطاعات</div>
             <div class="tab" onclick="adminTab('personnel', this)">الحسابات</div>
+            <div class="tab" onclick="adminTab('notes', this)">الملاحظات</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
@@ -1711,12 +2000,87 @@ function adminTab(name, el) {
     if (el) el.classList.add('active');
     currentAdminTab = name;
     if (name === 'pending') loadPending();
+    if (name === 'reviewed') loadReviewed();
+    if (name === 'leaders') loadLeaders();
     if (name === 'personnel') loadPersonnel();
+    if (name === 'notes') loadNotesAdmin();
     if (name === 'vehicles') loadVehicles();
     if (name === 'hire') loadHire();
     if (name === 'thresholds') loadThresholds();
     if (name === 'log') loadLog();
     if (name === 'settings') loadSettings();
+}
+async function loadReviewed() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    const { list } = await api('/api/senior/violations');
+    if (currentAdminTab !== 'reviewed') return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات مراجَعة بعد</div>'; return; }
+    box.innerHTML = list.map(v => \`
+        <div class="card">
+            <div class="row" style="align-items:flex-start;">
+                <div class="row" style="gap:10px;align-items:flex-start;">
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    <div>
+                        <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
+                        <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير — ' + v.reportCategory) : v.violationType}</div>
+                        <span class="badge \${v.status}">\${v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>
+                        <div style="font-size:12px;color:var(--muted);margin-top:4px;">راجعها: \${v.reviewedByTag || v.reviewedBy || '-'}</div>
+                        \${v.status === 'rejected' && v.rejectReason ? \`<div style="font-size:12px;color:var(--muted);">السبب: \${v.rejectReason}</div>\` : ''}
+                    </div>
+                </div>
+                <button class="btn danger sm" onclick="deleteReviewed('\${v._id}')">🗑️ حذف</button>
+            </div>
+        </div>\`).join('');
+}
+function deleteReviewed(id) {
+    if (!confirm('متأكد تبي تحذف هذا السجل؟ راح يتعدل رصيد نقاط العسكري تلقائياً حسب حالته.')) return;
+    api('/api/senior/violations/' + id, { method: 'DELETE' })
+        .then(() => { toast('🗑️ تم الحذف'); loadReviewed(); }).catch(e => toast(e.message));
+}
+async function loadLeaders() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    const { list } = await api('/api/senior/leaders');
+    if (currentAdminTab !== 'leaders') return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد قادة قطاعات معيّنين حالياً. عيّنهم عبر أمر تعيين-يونت بالبوت وحط كلمة "قائد" ضمن اليونت (مع اسم القطاع).</div>'; return; }
+    box.innerHTML = list.map(p => \`
+        <div class="card row">
+            <div>
+                <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                <div style="font-size:13px;color:var(--gold-soft);">القطاع: \${p.sectorName}</div>
+            </div>
+            <button class="btn danger sm" onclick="removeLeader('\${p.discord}', '\${(p.registeredName || p.discordTag || '').replace(/'/g, "\\\\'")}')">إزالة من القطاع</button>
+        </div>\`).join('');
+}
+function removeLeader(discordId, name) {
+    if (!confirm('متأكد تبي تشيل "' + name + '" من قيادة القطاع؟')) return;
+    api('/api/senior/leaders/' + discordId + '/remove', { method: 'POST' })
+        .then(() => { toast('تم الإزالة'); loadLeaders(); }).catch(e => toast(e.message));
+}
+async function loadNotesAdmin() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    const { list } = await api('/api/senior/notes');
+    if (currentAdminTab !== 'notes') return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد ملاحظات</div>'; return; }
+    box.innerHTML = list.map(n => \`
+        <div class="card row">
+            <div>
+                <b>\${n.name}</b>
+                <div style="font-size:13px;margin-top:4px;">\${n.text}</div>
+                <div style="font-size:11px;color:var(--muted);margin-top:4px;">بواسطة: \${n.addedByTag || n.addedBy} • \${new Date(n.createdAt).toLocaleString('ar')}</div>
+            </div>
+            <button class="btn danger sm" onclick="deleteNote('\${n.discord}', '\${n.noteId}')">🗑️ حذف</button>
+        </div>\`).join('');
+}
+function deleteNote(discordId, noteId) {
+    if (!confirm('متأكد تبي تحذف هذي الملاحظة؟')) return;
+    api('/api/senior/notes/' + discordId + '/' + noteId, { method: 'DELETE' })
+        .then(() => { toast('🗑️ تم الحذف'); loadNotesAdmin(); }).catch(e => toast(e.message));
 }
 async function loadPending() {
     const box = document.getElementById('admin-content');
