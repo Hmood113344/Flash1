@@ -115,6 +115,15 @@ const PersonnelSchema = new mongoose.Schema({
         text: String, addedBy: String, addedByTag: String,
         createdAt: { type: Date, default: Date.now }
     }],
+    // تحذيرات/إشعارات صادرة له — تظهر بوجهه كشاشة كاملة لين يتعاهد عليها
+    warnings: [{
+        kind: { type: String, enum: ["warning", "notice"], default: "warning" }, // تحذير | إشعار
+        reason: String,
+        issuedBy: String, issuedByTag: String,
+        acknowledged: { type: Boolean, default: false },
+        acknowledgedAt: Date,
+        createdAt: { type: Date, default: Date.now }
+    }],
     isBlocked: { type: Boolean, default: false },
     createdAt: { type: Date, default: Date.now }
 });
@@ -971,6 +980,60 @@ app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, r
     res.json({ ok: true, notes: p.notes });
 });
 
+// ── تحذير / إشعار ─────────────────────────────────────────────────────
+async function issueWarning({ targetDiscord, kind, reason, actorId, actorTag }) {
+    if (!["warning", "notice"].includes(kind)) throw new Error("نوع غير معروف");
+    if (!reason || !reason.trim()) throw new Error("لازم تكتب السبب");
+    const p = await Personnel.findOneAndUpdate(
+        { discord: targetDiscord },
+        { $push: { warnings: { kind, reason: reason.trim(), issuedBy: actorId, issuedByTag: actorTag } } },
+        { new: true }
+    );
+    if (!p) throw new Error("غير موجود");
+    await logEvent({
+        action: kind === "warning" ? "إصدار تحذير" : "إصدار إشعار",
+        discordId: p.discord, discordTag: p.discordTag, actorId, actorTag,
+        details: `على ${p.registeredName || p.discord}: ${reason.trim()}`,
+    });
+    return p;
+}
+app.post("/api/senior/personnel/:discord/warn", ensureSeniorAdmin, async (req, res) => {
+    try {
+        const p = await issueWarning({ targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason, actorId: req.user.id, actorTag: req.user.username });
+        res.json({ ok: true, warnings: p.warnings });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// أقرب تحذير/إشعار لهذا المستخدم لسّه ما اتعاهد عليه — تستخدمها الواجهة للبولينج تعرضه بوجهه
+app.get("/api/warnings/pending", async (req, res) => {
+    if (!req.isAuthenticated()) return res.json({ warning: null });
+    const p = await Personnel.findOne({ discord: req.user.id }, { warnings: 1 });
+    if (!p || !p.warnings || !p.warnings.length) return res.json({ warning: null });
+    const pending = p.warnings.filter(w => !w.acknowledged).sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (!pending) return res.json({ warning: null });
+    res.json({ warning: { id: pending._id, kind: pending.kind, reason: pending.reason, createdAt: pending.createdAt } });
+});
+
+// اتعاهد وأقر بعدم تكرار ذلك
+app.post("/api/warnings/:id/ack", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const p = await Personnel.findOne({ discord: req.user.id });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const w = p.warnings.id(req.params.id);
+    if (!w) return res.status(404).json({ error: "غير موجود" });
+    if (!w.acknowledged) {
+        w.acknowledged = true;
+        w.acknowledgedAt = new Date();
+        await p.save();
+        await logEvent({
+            action: "تعاهد على " + (w.kind === "warning" ? "تحذير" : "إشعار"),
+            discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username,
+            details: w.reason,
+        });
+    }
+    res.json({ ok: true });
+});
+
 // يجيب كل الملاحظات المضافة على كل العساكر بصفحة وحدة (لكبار المسؤولين)
 app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
     const list = await Personnel.find({ "notes.0": { $exists: true } }, { discord: 1, discordTag: 1, registeredName: 1, notes: 1 });
@@ -1300,6 +1363,15 @@ app.post("/api/sector/personnel/:discord/unit", ensureSectorLeader, async (req, 
     res.json({ ok: true, personnel: p });
 });
 
+// إصدار تحذير/إشعار لعضو القطاع
+app.post("/api/sector/personnel/:discord/warn", ensureSectorLeader, async (req, res) => {
+    if (!(await ensureInMySector(req, res, req.params.discord))) return;
+    try {
+        const p = await issueWarning({ targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})` });
+        res.json({ ok: true, warnings: p.warnings });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 // إضافة ملاحظة على عضو القطاع
 app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
@@ -1417,7 +1489,45 @@ app.get("/", (req, res) => {
     #img-modal.open { display: flex; }
     #img-modal img { max-width: 92vw; max-height: 90vh; border-radius: 10px; border: 2px solid var(--gold); box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
     #img-modal .close-hint { position: absolute; top: 18px; left: 50%; transform: translateX(-50%); color: #cbd5e1; font-size: 13px; }
+
+    /* ── تحذير / إشعار (شاشة كاملة) ────────────────────────────────── */
+    #warn-overlay { display: none; position: fixed; inset: 0; z-index: 3000; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 20px; text-align: center; }
+    #warn-overlay.open { display: flex; }
+    #warn-overlay.k-warning { background: radial-gradient(circle at center, #7a1a1a, #3d0d0d); }
+    #warn-overlay.k-notice { background: radial-gradient(circle at center, #7a4a12, #3d2506); }
+    .warn-box { border: 2px dashed rgba(255,255,255,0.55); border-radius: 10px; padding: 26px 40px; max-width: 480px; }
+    .warn-title { font-size: 30px; font-weight: bold; color: #fff; display: flex; align-items: center; justify-content: center; gap: 10px; }
+    .warn-title .tri { color: #f87171; }
+    #warn-overlay.k-notice .warn-title .tri { color: #fbbf24; }
+    .warn-line { border: none; border-top: 1px solid rgba(255,255,255,0.5); margin: 12px 0; }
+    .warn-reason { color: #fff; font-size: 19px; margin-top: 8px; line-height: 1.6; }
+    .warn-ack-btn { margin-top: 26px; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.5); color: #fff; padding: 12px 22px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; }
+    .warn-ack-btn:hover { background: rgba(255,255,255,0.2); }
+
+    /* ── فورم إرسال تحذير/إشعار (بديل عن prompt/confirm) ─────────────── */
+    #wf-overlay { display: none; position: fixed; inset: 0; z-index: 2500; background: rgba(0,0,0,0.75); align-items: center; justify-content: center; padding: 20px; }
+    #wf-overlay.open { display: flex; }
+    .wf-box { background: #0d1f3c; border: 1px solid var(--gold); border-radius: 14px; padding: 22px; max-width: 380px; width: 100%; text-align: center; }
+    .wf-box h3 { margin-bottom: 14px; color: var(--gold-soft); }
+    .wf-choice-row { display: flex; gap: 10px; margin-top: 6px; }
+    .wf-choice-row button { flex: 1; padding: 14px 8px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; border: 1px solid var(--border); background: rgba(255,255,255,0.04); color: #fff; }
+    .wf-choice-row button.wf-warning:hover { border-color: #f87171; background: rgba(248,113,113,0.12); }
+    .wf-choice-row button.wf-notice:hover { border-color: #fbbf24; background: rgba(251,191,36,0.12); }
+    .wf-box textarea { width: 100%; min-height: 90px; margin-top: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 8px; color: #fff; padding: 10px; font-family: inherit; font-size: 14px; resize: vertical; }
+    .wf-actions { display: flex; gap: 8px; margin-top: 14px; }
+    .wf-actions button { flex: 1; }
 </style>
+<div id="wf-overlay">
+    <div class="wf-box" id="wf-box"></div>
+</div>
+<div id="warn-overlay">
+    <div class="warn-box">
+        <div class="warn-title"><span class="tri">⚠️</span><span id="warn-title-text">تحذير</span><span class="tri">⚠️</span></div>
+        <hr class="warn-line">
+        <div class="warn-reason" id="warn-reason-text"></div>
+    </div>
+    <button class="warn-ack-btn" id="warn-ack-btn" onclick="ackCurrentWarning()">🤝 اتعاهد وأقر بعدم تكرار ذلك</button>
+</div>
 </head>
 <body>
 <div id="warn-banner">⚠️ تنبيه: هذا الموقع مخصص للمحاكاة واللعب فقط، ولا يمت للواقع بصلة.</div>
@@ -1464,6 +1574,73 @@ function closeImageModal() {
     document.getElementById('img-modal').classList.remove('open');
     document.getElementById('img-modal-img').src = '';
 }
+
+// ── فورم إرسال تحذير/إشعار (فورم مخصص للموقع، مو نوافذ نظام الجهاز الافتراضية) ──
+function openWarnForm(discord, apiBase) {
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>وش تبي ترسل لهذا الشخص؟</h3>
+        <div class="wf-choice-row">
+            <button class="wf-warning" onclick="warnFormReason('\${discord}','\${apiBase}','warning')">⚠️ تحذير</button>
+            <button class="wf-notice" onclick="warnFormReason('\${discord}','\${apiBase}','notice')">🔔 إشعار</button>
+        </div>
+        <div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button></div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+function warnFormReason(discord, apiBase, kind) {
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>\${kind === 'warning' ? '⚠️ ضع سبب التحذير' : '🔔 ضع سبب الإشعار'}</h3>
+        <textarea id="wf-reason" placeholder="اكتب السبب هنا..."></textarea>
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitWarnForm('\${discord}','\${apiBase}','\${kind}')">إرسال</button>
+        </div>\`;
+}
+function closeWarnForm() {
+    document.getElementById('wf-overlay').classList.remove('open');
+    document.getElementById('wf-box').innerHTML = '';
+}
+async function submitWarnForm(discord, apiBase, kind) {
+    const reason = document.getElementById('wf-reason').value;
+    if (!reason || !reason.trim()) return toast('لازم تكتب السبب');
+    try {
+        await api(apiBase + discord + '/warn', { method: 'POST', body: JSON.stringify({ kind, reason }) });
+        toast(kind === 'warning' ? '✅ تم إرسال التحذير' : '✅ تم إرسال الإشعار');
+        closeWarnForm();
+    } catch (e) { toast(e.message); }
+}
+
+// ── عرض التحذير/الإشعار بوجه المستقبِل (شاشة كاملة، تُفتح تلقائياً بالبولينج) ──
+let currentWarningId = null;
+async function checkPendingWarning() {
+    if (document.getElementById('warn-overlay').classList.contains('open')) return; // فيه وحدة معروضة أصلاً
+    try {
+        const { warning } = await api('/api/warnings/pending');
+        if (warning) showWarningOverlay(warning);
+    } catch (e) {}
+}
+function showWarningOverlay(w) {
+    currentWarningId = w.id;
+    const overlay = document.getElementById('warn-overlay');
+    overlay.classList.remove('k-warning', 'k-notice');
+    overlay.classList.add(w.kind === 'warning' ? 'k-warning' : 'k-notice');
+    document.getElementById('warn-title-text').textContent = w.kind === 'warning' ? 'تحذير' : 'إشعار';
+    document.getElementById('warn-reason-text').textContent = w.reason;
+    overlay.classList.add('open');
+}
+async function ackCurrentWarning() {
+    if (!currentWarningId) return;
+    const btn = document.getElementById('warn-ack-btn');
+    btn.disabled = true;
+    try {
+        await api('/api/warnings/' + currentWarningId + '/ack', { method: 'POST' });
+        document.getElementById('warn-overlay').classList.remove('open');
+        currentWarningId = null;
+        checkPendingWarning(); // لو فيه تحذير ثاني بالطابور
+    } catch (e) { toast(e.message); }
+    btn.disabled = false;
+}
 async function init() {
     try { ME = await api('/api/me'); } catch (e) { renderLogin(); return; }
     if (ME.blocked) { renderBlocked(ME.reason); return; }
@@ -1471,6 +1648,7 @@ async function init() {
     buildNav();
     if (!ME.registeredName || !ME.unit) { renderSetup(); return; }
     renderDashboard();
+    checkPendingWarning();
     startPolling();
 }
 function buildNav() {
@@ -1523,6 +1701,7 @@ function startPolling() {
             if (document.getElementById('mine-list')) loadMine(true);
             if (document.getElementById('pending-box')) loadPending();
             if (currentAdminTab === 'log') loadLog(true);
+            checkPendingWarning();
         } catch (e) {}
     }, 9000);
 }
@@ -2143,6 +2322,7 @@ async function loadSectorMembers() {
                     <button class="btn sm gray" onclick="sectorPromote('\${p.discord}','down')">⬇️ تنزيل</button>
                     <button class="btn sm gray" onclick="sectorAssignUnit('\${p.discord}')">🪖 يونت</button>
                     <button class="btn sm gray" onclick="sectorAddNote('\${p.discord}')">📝 ملاحظة</button>
+                    <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/sector/personnel/')">⚠️ تحذير</button>
                 </div>
             </div>
         </div>\`).join('');
@@ -2281,6 +2461,7 @@ async function searchPersonnel() {
                 <div class="row" style="gap:6px;">
                     <button class="btn sm gray" onclick="toggleEdit(\${i})">تعديل</button>
                     <button class="btn sm gray" onclick="addNote('\${p.discord}')">ملاحظة</button>
+                    <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/senior/personnel/')">⚠️ تحذير</button>
                     <button class="btn sm \${p.isBlocked ? '' : 'danger'}" onclick="toggleBlock('\${p.discord}', \${!p.isBlocked})">\${p.isBlocked ? 'إلغاء الإيقاف' : 'إيقاف (بند)'}</button>
                     <button class="btn sm danger" onclick="deletePersonnel('\${p.discord}', '\${(p.registeredName || p.discordTag || '').replace(/'/g, "\\\\'")}')">🗑️ حذف نهائي</button>
                 </div>
@@ -2466,6 +2647,10 @@ const LOG_META = {
     "حذف مخالفة نهائي":     { icon: "🗑️", label: "حذف مخالفة نهائي",    color: "#fca5a5", border: "#7f1d1d" },
     "تعيين قيادة قطاع":     { icon: "🎖️", label: "تعيين قيادة قطاع",    color: "#60a5fa", border: "#3b82f6" },
     "إزالة قيادة قطاع":     { icon: "🚫", label: "إزالة قيادة قطاع",    color: "#fca5a5", border: "#ef4444" },
+    "إصدار تحذير":          { icon: "⚠️", label: "إصدار تحذير",         color: "#f87171", border: "#7f1d1d" },
+    "إصدار إشعار":          { icon: "🔔", label: "إصدار إشعار",         color: "#fbbf24", border: "#78350f" },
+    "تعاهد على تحذير":      { icon: "🤝", label: "تعاهد على تحذير",     color: "#4ade80", border: "#166534" },
+    "تعاهد على إشعار":      { icon: "🤝", label: "تعاهد على إشعار",     color: "#4ade80", border: "#166534" },
 };
 let lastLogId = null;
 let allLogsData = [];
