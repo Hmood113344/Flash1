@@ -267,18 +267,32 @@ function sectorRoleId(sectorKey) {
 }
 
 // يجيب آيديات كل أعضاء القطاع (حسب الرول بديسكورد) عن طريق البوت
+// كاش بسيط لقائمة أعضاء السيرفر كاملة (30 ثانية) — عشان ما نعيد جلبها من ديسكورد كل ضغطة تبويب،
+// لأن الجلب الكامل ثقيل ويفشل أحياناً (تايم أوت / ريت-ليمت) لو تكرر بسرعة
+let guildMembersFetch = { time: 0, promise: null };
+async function ensureGuildMembersFetched(guild) {
+    const now = Date.now();
+    if (guildMembersFetch.promise && (now - guildMembersFetch.time) < 30000) {
+        return guildMembersFetch.promise;
+    }
+    guildMembersFetch.time = now;
+    guildMembersFetch.promise = guild.members.fetch().catch(e => { guildMembersFetch.promise = null; throw e; });
+    return guildMembersFetch.promise;
+}
+// يرجع مصفوفة آيديات لو نجح، أو null لو صار خطأ فعلي بالجلب (عشان ما نلخبط "فشل" مع "لا يوجد أعضاء")
 async function getSectorMemberIds(sectorKey) {
     const roleId = sectorRoleId(sectorKey);
-    if (!roleId || !botReady) return [];
+    if (!roleId) return [];
+    if (!botReady) return null;
     try {
         const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
         const role = await guild.roles.fetch(roleId);
         if (!role) return [];
-        await guild.members.fetch();
+        await ensureGuildMembersFetched(guild);
         return role.members.map(m => m.id);
     } catch (e) {
         console.error("❌ فشل جلب أعضاء القطاع:", e.message);
-        return [];
+        return null;
     }
 }
 
@@ -1205,12 +1219,14 @@ app.post("/api/senior/sectors/:sector/remove", ensureSeniorAdmin, async (req, re
 // ── مسارات لوحة قيادة القطاع (لقادة/نواب القطاعات، وكبار المسؤولين عبر ?sector=) ──
 app.get("/api/sector/members", ensureSectorLeader, async (req, res) => {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
+    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
     const list = ids.length ? await Personnel.find({ discord: { $in: ids } }).sort({ createdAt: -1 }) : [];
     res.json({ list, sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel });
 });
 
 app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
+    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
     const list = ids.length ? await Violation.find({ reporterDiscord: { $in: ids } }).sort({ createdAt: -1 }).limit(300) : [];
     res.json({ list, canReview: canReviewSector(req.sectorInfo) });
 });
@@ -1236,6 +1252,7 @@ app.post("/api/sector/violations/:id/reject", ensureSectorLeader, async (req, re
 // يتأكد أن الشخص المطلوب فعلاً من ضمن أعضاء قطاع هذا القائد قبل أي تعديل عليه
 async function ensureInMySector(req, res, discordId) {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
+    if (ids === null) { res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" }); return false; }
     if (!ids.includes(discordId)) { res.status(403).json({ error: "هذا الشخص ليس من أعضاء قطاعك" }); return false; }
     return true;
 }
