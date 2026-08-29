@@ -1553,6 +1553,8 @@ let reportMeta = { vehicles: [] };
 let reportSelectedVehicle = null;
 let reportVehiclePhoto = null;
 let currentAdminTab = null;
+let pollTimer = null;
+let blockedPollTimer = null;
 
 async function api(url, opts) {
     const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -1680,30 +1682,52 @@ function renderMinePage() {
     loadMine();
 }
 function startPolling() {
-    setInterval(async () => {
-        if (!ME || ME.blocked) return;
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollTick, 5000);
+}
+async function pollTick() {
+    if (!ME || ME.blocked) return;
+    try {
+        const fresh = await api('/api/me');
+        if (fresh.blocked) {
+            // صار حظر/إيقاف/صيانة/إغلاق تسجيل وهو شغّال بالموقع — نوقفه فوراً ونعرض السبب
+            clearInterval(pollTimer);
+            ME = fresh;
+            renderBlocked(fresh.reason);
+            startBlockedRecheck();
+            return;
+        }
+        if (lastKnownRank && fresh.rank !== lastKnownRank) {
+            toast('🎉 مبروك! تمت ترقيتك إلى ' + fresh.rank);
+        }
+        lastKnownRank = fresh.rank;
+        ME = fresh;
+        buildNav();
+        const rp = document.getElementById('home-points');
+        if (rp) {
+            document.getElementById('home-points').textContent = ME.points;
+            document.getElementById('home-rank').textContent = ME.rank;
+            const nx = document.getElementById('home-next');
+            if (nx) nx.textContent = ME.nextRank ? (ME.rank + ' ——> ' + ME.nextRank) : 'أعلى رتبة';
+            const rem = document.getElementById('home-remaining');
+            if (rem) rem.textContent = ME.nextRank ? ('متبقي ' + ME.pointsRemaining + ' نقطة للترقية') : 'وصلت لأعلى رتبة';
+        }
+        renderNotes();
+        if (document.getElementById('mine-list')) loadMine(true);
+        if (document.getElementById('pending-box')) loadPending();
+        if (currentAdminTab === 'log') loadLog(true);
+        checkPendingWarning();
+    } catch (e) {}
+}
+// لو صار عليه حظر/صيانة وهو شغّال، نفضل نتابعه بهدوء، وأول ما يرجع الوضع طبيعي نحدّث الصفحة تلقائياً
+function startBlockedRecheck() {
+    if (blockedPollTimer) clearInterval(blockedPollTimer);
+    blockedPollTimer = setInterval(async () => {
         try {
             const fresh = await api('/api/me');
-            if (lastKnownRank && fresh.rank !== lastKnownRank) {
-                toast('🎉 مبروك! تمت ترقيتك إلى ' + fresh.rank);
-            }
-            lastKnownRank = fresh.rank;
-            ME = fresh;
-            const rp = document.getElementById('home-points');
-            if (rp) {
-                document.getElementById('home-points').textContent = ME.points;
-                document.getElementById('home-rank').textContent = ME.rank;
-                const nx = document.getElementById('home-next');
-                if (nx) nx.textContent = ME.nextRank ? (ME.rank + ' ——> ' + ME.nextRank) : 'أعلى رتبة';
-                const rem = document.getElementById('home-remaining');
-                if (rem) rem.textContent = ME.nextRank ? ('متبقي ' + ME.pointsRemaining + ' نقطة للترقية') : 'وصلت لأعلى رتبة';
-            }
-            if (document.getElementById('mine-list')) loadMine(true);
-            if (document.getElementById('pending-box')) loadPending();
-            if (currentAdminTab === 'log') loadLog(true);
-            checkPendingWarning();
+            if (!fresh.blocked) { clearInterval(blockedPollTimer); location.reload(); }
         } catch (e) {}
-    }, 9000);
+    }, 6000);
 }
 function renderLogin() {
     document.getElementById('nav-links').innerHTML = '';
