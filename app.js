@@ -95,6 +95,22 @@ const CONFIG = {
         roadSecurity: "أمن الطرق",
         antiDrugs: "مكافحة المخدرات",
     },
+
+    // عقوبات التحذير الثالث — المسؤول يختار وحدة منها وقت إرسال التحذير الثالث لأي عسكري
+    WARNING_PENALTIES: [
+        { id: "deduct5",          label: "خصم 5 نقاط",                        type: "points",  value: 5 },
+        { id: "deduct10",         label: "خصم 10 نقاط",                       type: "points",  value: 10 },
+        { id: "resetPoints",      label: "تصفير النقاط بالكامل",              type: "resetPoints" },
+        { id: "demote1",          label: "تنزيل رتبة واحدة",                  type: "demote",  ranks: 1 },
+        { id: "demote2",          label: "تنزيل رتبتين",                      type: "demote",  ranks: 2 },
+        { id: "demoteToFirst",    label: "تنزيل للرتبة الأولى (جندي)",        type: "demoteToFirst" },
+        { id: "suspend3",         label: "إيقاف 3 أيام",                      type: "suspend", days: 3 },
+        { id: "suspend5",         label: "إيقاف 5 أيام",                      type: "suspend", days: 5 },
+        { id: "suspend7",         label: "إيقاف 7 أيام",                      type: "suspend", days: 7 },
+        { id: "demote1_suspend3", label: "تنزيل رتبة واحدة + إيقاف 3 أيام",   type: "combo",   ranks: 1, days: 3 },
+        { id: "deduct10_suspend5",label: "خصم 10 نقاط + إيقاف 5 أيام",        type: "combo",   value: 10, days: 5 },
+        { id: "dismiss",          label: "فصل نهائي من الخدمة العسكرية",      type: "dismiss" },
+    ],
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -122,9 +138,16 @@ const PersonnelSchema = new mongoose.Schema({
         issuedBy: String, issuedByTag: String,
         acknowledged: { type: Boolean, default: false },
         acknowledgedAt: Date,
+        // ── تصعيد التحذيرات (تُملأ فقط لو kind === "warning") ──
+        warningNumber: { type: Number, default: null },   // رقم التحذير بالترتيب (أول/ثاني/ثالث...)
+        pointsDeducted: { type: Number, default: 0 },      // نقاط الخصم عند التحذير الثاني
+        penaltyType: { type: String, default: null },      // معرّف العقوبة عند التحذير الثالث فأكثر
+        penaltyLabel: { type: String, default: null },     // اسم العقوبة المطبقة (للعرض)
         createdAt: { type: Date, default: Date.now }
     }],
     isBlocked: { type: Boolean, default: false },
+    blockUntil: { type: Date, default: null },   // نهاية مدة الإيقاف المؤقت (عقوبة تحذير)، فك تلقائي بعدها
+    isDismissed: { type: Boolean, default: false }, // فصل نهائي (بعد تجاوز حد التحذيرات المسموح)
     createdAt: { type: Date, default: Date.now }
 });
 const Personnel = mongoose.model("Personnel", PersonnelSchema);
@@ -205,12 +228,21 @@ const SettingsSchema = new mongoose.Schema({
         },
     },
     violationsChannelId: String,
+    // عقوبات التحذير الثالث — قابلة للإضافة/التعديل/الحذف من لوحة كبار المسؤولين (صفحة عقوبات التحذيرات)
+    warningPenalties: { type: Array, default: [] },
 }, { minimize: false });
 const Settings = mongoose.model("Settings", SettingsSchema);
 
 async function getSettings() {
     let s = await Settings.findOne();
-    if (!s) s = await Settings.create({});
+    if (!s) {
+        s = await Settings.create({ warningPenalties: CONFIG.WARNING_PENALTIES });
+    } else if (!s.warningPenalties || s.warningPenalties.length === 0) {
+        // أول تشغيل بعد التحديث — نبذر القائمة الافتراضية مرة وحدة، وبعدها تصير قابلة للتعديل بالكامل
+        s.warningPenalties = CONFIG.WARNING_PENALTIES;
+        s.markModified("warningPenalties");
+        await s.save();
+    }
     return s;
 }
 
@@ -773,8 +805,15 @@ app.get("/api/me", ensureAuth, async (req, res) => {
 
     let p = await Personnel.findOne({ discord: req.user.id });
     if (!p) p = await Personnel.create({ discord: req.user.id, discordTag: req.user.username });
+    p = await autoUnblockIfExpired(p); // فك الإيقاف تلقائيًا لو انتهت مدة عقوبة تحذير مؤقتة
 
     if (!senior && p.isBlocked) {
+        if (p.isDismissed) {
+            return res.json({ blocked: true, reason: "🚫 تم فصلك نهائيًا من الخدمة العسكرية بسبب تجاوز عدد التحذيرات المسموح." });
+        }
+        if (p.blockUntil) {
+            return res.json({ blocked: true, reason: `🚫 موقوف مؤقتًا حتى ${p.blockUntil.toLocaleString('ar')} — نتيجة عقوبة تحذير.` });
+        }
         return res.json({ blocked: true, reason: "🚫 تم إيقاف حسابك من الموقع من قبل الإدارة." });
     }
 
@@ -980,27 +1019,193 @@ app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, r
     res.json({ ok: true, notes: p.notes });
 });
 
-// ── تحذير / إشعار ─────────────────────────────────────────────────────
-async function issueWarning({ targetDiscord, kind, reason, actorId, actorTag }) {
-    if (!["warning", "notice"].includes(kind)) throw new Error("نوع غير معروف");
-    if (!reason || !reason.trim()) throw new Error("لازم تكتب السبب");
-    const p = await Personnel.findOneAndUpdate(
-        { discord: targetDiscord },
-        { $push: { warnings: { kind, reason: reason.trim(), issuedBy: actorId, issuedByTag: actorTag } } },
-        { new: true }
-    );
-    if (!p) throw new Error("غير موجود");
-    await logEvent({
-        action: kind === "warning" ? "إصدار تحذير" : "إصدار إشعار",
-        discordId: p.discord, discordTag: p.discordTag, actorId, actorTag,
-        details: `على ${p.registeredName || p.discord}: ${reason.trim()}`,
-    });
+// ── تحذير / إشعار — مع نظام تصعيد للتحذيرات (أول / ثاني / ثالث فما فوق) ──
+// تطبّق أثر العقوبة فعليًا على وثيقة العسكري (نقاط / رتبة / إيقاف مؤقت / فصل نهائي)
+function applyPenaltyEffect(p, penalty) {
+    switch (penalty.type) {
+        case "points":
+            p.points = Math.max(0, p.points - penalty.value);
+            break;
+        case "resetPoints":
+            p.points = 0;
+            break;
+        case "demote": {
+            const idx = Math.max(0, rankIndex(p.rank) - penalty.ranks);
+            p.rank = CONFIG.MILITARY_RANKS[idx];
+            p.points = 0;
+            break;
+        }
+        case "demoteToFirst":
+            p.rank = CONFIG.MILITARY_RANKS[0];
+            p.points = 0;
+            break;
+        case "suspend":
+            p.isBlocked = true;
+            p.blockUntil = new Date(Date.now() + penalty.days * 24 * 60 * 60 * 1000);
+            break;
+        case "combo":
+            if (penalty.ranks) {
+                const idx = Math.max(0, rankIndex(p.rank) - penalty.ranks);
+                p.rank = CONFIG.MILITARY_RANKS[idx];
+                p.points = 0;
+            }
+            if (penalty.value) p.points = Math.max(0, p.points - penalty.value);
+            if (penalty.days) {
+                p.isBlocked = true;
+                p.blockUntil = new Date(Date.now() + penalty.days * 24 * 60 * 60 * 1000);
+            }
+            break;
+        case "dismiss":
+            p.isBlocked = true;
+            p.isDismissed = true;
+            p.blockUntil = null;
+            break;
+    }
+}
+
+// لو مضت مدة الإيقاف المؤقت (عقوبة تحذير)، يفك الإيقاف تلقائيًا (ما ينطبق على الفصل النهائي)
+async function autoUnblockIfExpired(p) {
+    if (p && p.isBlocked && !p.isDismissed && p.blockUntil && p.blockUntil <= new Date()) {
+        const until = p.blockUntil;
+        p.isBlocked = false;
+        p.blockUntil = null;
+        await p.save();
+        await logEvent({
+            action: "إلغاء إيقاف", discordId: p.discord, discordTag: p.discordTag,
+            actorId: "نظام تلقائي", actorTag: "🤖 نظام تلقائي",
+            details: `انتهت مدة الإيقاف المؤقت (كانت حتى ${until.toLocaleString('ar')})`,
+        });
+    }
     return p;
 }
+
+async function issueWarning({ targetDiscord, kind, reason, actorId, actorTag, pointsToDeduct, penaltyType }) {
+    if (!["warning", "notice"].includes(kind)) throw new Error("نوع غير معروف");
+    if (!reason || !reason.trim()) throw new Error("لازم تكتب السبب");
+
+    const p = await Personnel.findOne({ discord: targetDiscord });
+    if (!p) throw new Error("غير موجود");
+
+    const entry = { kind, reason: reason.trim(), issuedBy: actorId, issuedByTag: actorTag };
+    let dismissed = false;
+    let logDetails = `على ${p.registeredName || p.discord}: ${reason.trim()}`;
+
+    if (kind === "warning") {
+        const priorCount = p.warnings.filter(w => w.kind === "warning").length;
+        const warningNumber = priorCount + 1;
+        entry.warningNumber = warningNumber;
+
+        if (warningNumber === 2) {
+            const pts = parseInt(pointsToDeduct);
+            if (!pts || pts < 1) throw new Error("لازم تحدد عدد نقاط صحيح للتحذير الثاني");
+            p.points = Math.max(0, p.points - pts);
+            entry.pointsDeducted = pts;
+            logDetails += ` (خصم ${pts} نقطة)`;
+        } else if (warningNumber === 3) {
+            const settings = await getSettings();
+            const penalty = (settings.warningPenalties || []).find(pn => pn.id === penaltyType);
+            if (!penalty) throw new Error("لازم تختار عقوبة صحيحة للتحذير الثالث");
+            applyPenaltyEffect(p, penalty);
+            entry.penaltyType = penalty.id;
+            entry.penaltyLabel = penalty.label;
+            logDetails += ` (العقوبة: ${penalty.label})`;
+        } else if (warningNumber >= 4) {
+            // تجاوز الحد المسموح بعد عقوبة التحذير الثالث — فصل تلقائي فوري (ثابت، ما يتأثر بتعديل قائمة العقوبات)
+            applyPenaltyEffect(p, { type: "dismiss" });
+            entry.penaltyType = "dismiss";
+            entry.penaltyLabel = "فصل تلقائي (تجاوز عدد التحذيرات)";
+            dismissed = true;
+            logDetails += ` — فصل تلقائي بسبب تجاوز عدد التحذيرات المسموح`;
+        }
+    }
+
+    p.warnings.push(entry);
+    await p.save();
+
+    await logEvent({
+        action: dismissed ? "فصل تلقائي (تجاوز التحذيرات)" : (kind === "warning" ? "إصدار تحذير" : "إصدار إشعار"),
+        discordId: p.discord, discordTag: p.discordTag, actorId, actorTag,
+        details: logDetails,
+    });
+
+    return { p, dismissed };
+}
+
+// يرجع عدد التحذيرات (نوع warning فقط) لهذا الشخص — تستخدمها الواجهة قبل فتح فورم التحذير
+// عشان تعرف تعرض الفورم المناسب (أول / ثاني / ثالث / فصل تلقائي)
+app.get("/api/senior/personnel/:discord/warning-info", ensureSeniorAdmin, async (req, res) => {
+    const p = await Personnel.findOne({ discord: req.params.discord }, { warnings: 1 });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const count = (p.warnings || []).filter(w => w.kind === "warning").length;
+    res.json({ count });
+});
+
+// عقوبات التحذيرات (تُستخدم عند إصدار التحذير الثالث) — يستخدمها أي شخص عنده صلاحية إرسال تحذير
+app.get("/api/warn-penalties", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    res.json({ list: settings.warningPenalties || [] });
+});
+
+// ── إدارة عقوبات التحذيرات (صفحة كبار المسؤولين — إضافة/تعديل/حذف) ──────
+app.get("/api/senior/penalties", ensureSeniorAdmin, async (req, res) => {
+    const settings = await getSettings();
+    res.json({ list: settings.warningPenalties || [] });
+});
+
+const PENALTY_TYPES = ["points", "resetPoints", "demote", "demoteToFirst", "suspend", "combo", "dismiss"];
+
+app.post("/api/senior/penalties", ensureSeniorAdmin, async (req, res) => {
+    const { label, type, value, ranks, days } = req.body;
+    if (!label || !label.trim()) return res.status(400).json({ error: "لازم تكتب اسم العقوبة" });
+    if (!PENALTY_TYPES.includes(type)) return res.status(400).json({ error: "نوع عقوبة غير معروف" });
+    const settings = await getSettings();
+    const penalty = { id: "pen_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), label: label.trim(), type };
+    if (value !== undefined && value !== "" && !isNaN(parseInt(value))) penalty.value = parseInt(value);
+    if (ranks !== undefined && ranks !== "" && !isNaN(parseInt(ranks))) penalty.ranks = parseInt(ranks);
+    if (days !== undefined && days !== "" && !isNaN(parseInt(days))) penalty.days = parseInt(days);
+    settings.warningPenalties = settings.warningPenalties || [];
+    settings.warningPenalties.push(penalty);
+    settings.markModified("warningPenalties");
+    await settings.save();
+    await logEvent({ action: "إضافة عقوبة تحذير", actorId: req.user.id, actorTag: req.user.username, details: penalty.label });
+    res.json({ ok: true, list: settings.warningPenalties });
+});
+
+app.put("/api/senior/penalties/:id", ensureSeniorAdmin, async (req, res) => {
+    const { label, type, value, ranks, days } = req.body;
+    const settings = await getSettings();
+    const idx = (settings.warningPenalties || []).findIndex(p => p.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: "غير موجودة" });
+    if (label && label.trim()) settings.warningPenalties[idx].label = label.trim();
+    if (PENALTY_TYPES.includes(type)) settings.warningPenalties[idx].type = type;
+    settings.warningPenalties[idx].value = (value !== undefined && value !== "" && !isNaN(parseInt(value))) ? parseInt(value) : undefined;
+    settings.warningPenalties[idx].ranks = (ranks !== undefined && ranks !== "" && !isNaN(parseInt(ranks))) ? parseInt(ranks) : undefined;
+    settings.warningPenalties[idx].days = (days !== undefined && days !== "" && !isNaN(parseInt(days))) ? parseInt(days) : undefined;
+    settings.markModified("warningPenalties");
+    await settings.save();
+    await logEvent({ action: "تعديل عقوبة تحذير", actorId: req.user.id, actorTag: req.user.username, details: settings.warningPenalties[idx].label });
+    res.json({ ok: true, list: settings.warningPenalties });
+});
+
+app.delete("/api/senior/penalties/:id", ensureSeniorAdmin, async (req, res) => {
+    const settings = await getSettings();
+    const before = (settings.warningPenalties || []).length;
+    settings.warningPenalties = (settings.warningPenalties || []).filter(p => p.id !== req.params.id);
+    if (settings.warningPenalties.length === before) return res.status(404).json({ error: "غير موجودة" });
+    settings.markModified("warningPenalties");
+    await settings.save();
+    await logEvent({ action: "حذف عقوبة تحذير", actorId: req.user.id, actorTag: req.user.username, details: req.params.id });
+    res.json({ ok: true, list: settings.warningPenalties });
+});
+
 app.post("/api/senior/personnel/:discord/warn", ensureSeniorAdmin, async (req, res) => {
     try {
-        const p = await issueWarning({ targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason, actorId: req.user.id, actorTag: req.user.username });
-        res.json({ ok: true, warnings: p.warnings });
+        const { p, dismissed } = await issueWarning({
+            targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason,
+            pointsToDeduct: req.body.pointsToDeduct, penaltyType: req.body.penaltyType,
+            actorId: req.user.id, actorTag: req.user.username,
+        });
+        res.json({ ok: true, warnings: p.warnings, dismissed });
     } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
@@ -1024,7 +1229,12 @@ app.get("/api/warnings/pending", async (req, res) => {
     if (!p || !p.warnings || !p.warnings.length) return res.json({ warning: null });
     const pending = p.warnings.filter(w => !w.acknowledged).sort((a, b) => a.createdAt - b.createdAt)[0];
     if (!pending) return res.json({ warning: null });
-    res.json({ warning: { id: pending._id, kind: pending.kind, reason: pending.reason, createdAt: pending.createdAt } });
+    res.json({ warning: {
+        id: pending._id, kind: pending.kind, reason: pending.reason, createdAt: pending.createdAt,
+        warningNumber: pending.warningNumber || null,
+        pointsDeducted: pending.pointsDeducted || 0,
+        penaltyLabel: pending.penaltyLabel || null,
+    } });
 });
 
 // اتعاهد وأقر بعدم تكرار ذلك
@@ -1380,9 +1590,22 @@ app.post("/api/sector/personnel/:discord/unit", ensureSectorLeader, async (req, 
 app.post("/api/sector/personnel/:discord/warn", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
     try {
-        const p = await issueWarning({ targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})` });
-        res.json({ ok: true, warnings: p.warnings });
+        const { p, dismissed } = await issueWarning({
+            targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason,
+            pointsToDeduct: req.body.pointsToDeduct, penaltyType: req.body.penaltyType,
+            actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`,
+        });
+        res.json({ ok: true, warnings: p.warnings, dismissed });
     } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// عدد التحذيرات لعضو القطاع — تستخدمها الواجهة لتحديد شكل فورم التحذير
+app.get("/api/sector/personnel/:discord/warning-info", ensureSectorLeader, async (req, res) => {
+    if (!(await ensureInMySector(req, res, req.params.discord))) return;
+    const p = await Personnel.findOne({ discord: req.params.discord }, { warnings: 1 });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const count = (p.warnings || []).filter(w => w.kind === "warning").length;
+    res.json({ count });
 });
 
 // إضافة ملاحظة على عضو القطاع
@@ -1513,6 +1736,7 @@ app.get("/", (req, res) => {
     .warn-title .tri { color: #f87171; }
     #warn-overlay.k-notice .warn-title .tri { color: #fbbf24; }
     .warn-line { border: none; border-top: 1px solid rgba(255,255,255,0.5); margin: 12px 0; }
+    .warn-extra { color: #fde047; font-size: 16px; font-weight: bold; margin-top: 4px; }
     .warn-reason { color: #fff; font-size: 19px; margin-top: 8px; line-height: 1.6; }
     .warn-ack-btn { margin-top: 26px; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.5); color: #fff; padding: 12px 22px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; }
     .warn-ack-btn:hover { background: rgba(255,255,255,0.2); }
@@ -1537,6 +1761,7 @@ app.get("/", (req, res) => {
     <div class="warn-box">
         <div class="warn-title"><span class="tri">⚠️</span><span id="warn-title-text">تحذير</span><span class="tri">⚠️</span></div>
         <hr class="warn-line">
+        <div class="warn-extra" id="warn-extra-text"></div>
         <div class="warn-reason" id="warn-reason-text"></div>
     </div>
     <button class="warn-ack-btn" id="warn-ack-btn" onclick="ackCurrentWarning()">🤝 اتعاهد وأقر بعدم تكرار ذلك</button>
@@ -1602,15 +1827,75 @@ function openWarnForm(discord, apiBase) {
         <div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button></div>\`;
     document.getElementById('wf-overlay').classList.add('open');
 }
-function warnFormReason(discord, apiBase, kind) {
+async function warnFormReason(discord, apiBase, kind) {
     const box = document.getElementById('wf-box');
-    box.innerHTML = \`
-        <h3>\${kind === 'warning' ? '⚠️ ضع سبب التحذير' : '🔔 ضع سبب الإشعار'}</h3>
-        <textarea id="wf-reason" placeholder="اكتب السبب هنا..."></textarea>
-        <div class="wf-actions">
-            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
-            <button class="btn sm" onclick="submitWarnForm('\${discord}','\${apiBase}','\${kind}')">إرسال</button>
-        </div>\`;
+    if (kind === 'notice') {
+        box.innerHTML = \`
+            <h3>🔔 ضع سبب الإشعار</h3>
+            <textarea id="wf-reason" placeholder="اكتب السبب هنا..."></textarea>
+            <div class="wf-actions">
+                <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+                <button class="btn sm" onclick="submitWarnForm('\${discord}','\${apiBase}','notice')">إرسال</button>
+            </div>\`;
+        return;
+    }
+
+    // تحذير: نحدد أول شي رقم التحذير (أول/ثاني/ثالث/فصل تلقائي) عشان نعرض الفورم المناسب
+    box.innerHTML = '<h3>⚠️ جارِ التحقق من عدد التحذيرات...</h3>';
+    let wn = 1;
+    try {
+        const info = await api(apiBase + discord + '/warning-info');
+        wn = (info.count || 0) + 1;
+    } catch (e) { toast(e.message); }
+
+    if (wn === 1) {
+        box.innerHTML = \`
+            <h3>⚠️ ضع سبب التحذير الأول</h3>
+            <textarea id="wf-reason" placeholder="اكتب السبب هنا..."></textarea>
+            <div class="wf-actions">
+                <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+                <button class="btn sm" onclick="submitWarnForm('\${discord}','\${apiBase}','warning')">إرسال</button>
+            </div>\`;
+    } else if (wn === 2) {
+        box.innerHTML = \`
+            <h3>⚠️ التحذير الثاني — حدد النقاط المخصومة</h3>
+            <textarea id="wf-reason" placeholder="اكتب السبب هنا..."></textarea>
+            <input type="number" id="wf-points" placeholder="عدد النقاط المخصومة" min="1">
+            <div class="wf-actions">
+                <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+                <button class="btn sm" onclick="submitWarnForm('\${discord}','\${apiBase}','warning')">إرسال</button>
+            </div>\`;
+    } else if (wn === 3) {
+        box.innerHTML = '<h3>⚠️ جارِ تحميل قائمة العقوبات...</h3>';
+        let penalties = [];
+        try { ({ list: penalties } = await api('/api/warn-penalties')); } catch (e) {}
+        if (!penalties.length) {
+            box.innerHTML = \`
+                <h3>⚠️ ما فيه عقوبات مضافة</h3>
+                <p style="font-size:13px;color:#fca5a5;line-height:1.6;">لازم تضيف عقوبة وحدة على الأقل من صفحة "⚖️ عقوبات التحذيرات" بلوحة كبار المسؤولين قبل إرسال التحذير الثالث.</p>
+                <div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إغلاق</button></div>\`;
+            return;
+        }
+        box.innerHTML = \`
+            <h3>⚠️ التحذير الثالث — اختر العقوبة الصارمة</h3>
+            <textarea id="wf-reason" placeholder="اكتب السبب هنا..."></textarea>
+            <select id="wf-penalty">
+                \${penalties.map(p => \`<option value="\${p.id}">\${p.label}</option>\`).join('')}
+            </select>
+            <div class="wf-actions">
+                <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+                <button class="btn sm" onclick="submitWarnForm('\${discord}','\${apiBase}','warning')">إرسال</button>
+            </div>\`;
+    } else {
+        box.innerHTML = \`
+            <h3>🚫 تحذير رقم \${wn} — سيتم فصل العضو تلقائيًا</h3>
+            <p style="font-size:13px;color:#fca5a5;margin-top:6px;line-height:1.6;">هذا العضو سبق واستلم عقوبة التحذير الثالث. أي تحذير جديد بعدها يعني فصله نهائيًا من الخدمة تلقائيًا فور الإرسال.</p>
+            <textarea id="wf-reason" placeholder="اكتب سبب هذا التحذير (سبب الفصل)..." style="margin-top:8px;"></textarea>
+            <div class="wf-actions">
+                <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+                <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="submitWarnForm('\${discord}','\${apiBase}','warning')">تأكيد الفصل</button>
+            </div>\`;
+    }
 }
 function closeWarnForm() {
     document.getElementById('wf-overlay').classList.remove('open');
@@ -1619,9 +1904,18 @@ function closeWarnForm() {
 async function submitWarnForm(discord, apiBase, kind) {
     const reason = document.getElementById('wf-reason').value;
     if (!reason || !reason.trim()) return toast('لازم تكتب السبب');
+    const body = { kind, reason };
+    const pointsEl = document.getElementById('wf-points');
+    if (pointsEl) {
+        const pts = parseInt(pointsEl.value);
+        if (!pts || pts < 1) return toast('حدد عدد نقاط صحيح');
+        body.pointsToDeduct = pts;
+    }
+    const penaltyEl = document.getElementById('wf-penalty');
+    if (penaltyEl) body.penaltyType = penaltyEl.value;
     try {
-        await api(apiBase + discord + '/warn', { method: 'POST', body: JSON.stringify({ kind, reason }) });
-        toast(kind === 'warning' ? '✅ تم إرسال التحذير' : '✅ تم إرسال الإشعار');
+        const result = await api(apiBase + discord + '/warn', { method: 'POST', body: JSON.stringify(body) });
+        toast(kind === 'warning' ? (result.dismissed ? '🚫 تم فصل العضو تلقائيًا' : '✅ تم إرسال التحذير') : '✅ تم إرسال الإشعار');
         closeWarnForm();
     } catch (e) { toast(e.message); }
 }
@@ -1663,8 +1957,14 @@ function showWarningOverlay(w) {
     const overlay = document.getElementById('warn-overlay');
     overlay.classList.remove('k-warning', 'k-notice');
     overlay.classList.add(w.kind === 'warning' ? 'k-warning' : 'k-notice');
-    document.getElementById('warn-title-text').textContent = w.kind === 'warning' ? 'تحذير' : 'إشعار';
+    const numLabel = { 1: 'تحذير أول', 2: 'تحذير ثاني', 3: 'تحذير ثالث' };
+    document.getElementById('warn-title-text').textContent = w.kind === 'warning' ? (numLabel[w.warningNumber] || 'تحذير') : 'إشعار';
+    let extra = '';
+    if (w.kind === 'warning' && w.warningNumber === 2 && w.pointsDeducted) extra = 'تم خصم ' + w.pointsDeducted + ' نقطة من رصيدك';
+    if (w.kind === 'warning' && w.warningNumber >= 3 && w.penaltyLabel) extra = 'العقوبة المطبقة: ' + w.penaltyLabel;
+    document.getElementById('warn-extra-text').textContent = extra;
     document.getElementById('warn-reason-text').textContent = w.reason;
+    document.getElementById('warn-ack-btn').textContent = w.kind === 'warning' ? '🤝 اتعاهد وأقر بعدم تكرار ذلك' : '✅ تم الاطلاع';
     overlay.classList.add('open');
 }
 async function ackCurrentWarning() {
@@ -2088,6 +2388,7 @@ function renderAdmin() {
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
             <div class="tab" onclick="adminTab('hire', this)">توظيف الإدارة</div>
             <div class="tab" onclick="adminTab('thresholds', this)">ترقيات النقاط</div>
+            <div class="tab" onclick="adminTab('penalties', this)">⚖️ عقوبات التحذيرات</div>
             <div class="tab" onclick="adminTab('log', this)">اللوق الشامل</div>
             <div class="tab" onclick="adminTab('notes', this)">📝 الملاحظات</div>
             <div class="tab" onclick="adminTab('settings', this)">الإعدادات</div>
@@ -2110,6 +2411,7 @@ function adminTab(name, el) {
     if (name === 'vehicles') loadVehicles();
     if (name === 'hire') loadHire();
     if (name === 'thresholds') loadThresholds();
+    if (name === 'penalties') loadPenaltiesPage();
     if (name === 'log') loadLog();
     if (name === 'notes') loadNotesPage();
     if (name === 'settings') loadSettings();
@@ -2707,6 +3009,7 @@ const LOG_META = {
     "حذف مخالفة نهائي":     { icon: "🗑️", label: "حذف مخالفة نهائي",    color: "#fca5a5", border: "#7f1d1d" },
     "تعيين قيادة قطاع":     { icon: "🎖️", label: "تعيين قيادة قطاع",    color: "#60a5fa", border: "#3b82f6" },
     "إزالة قيادة قطاع":     { icon: "🚫", label: "إزالة قيادة قطاع",    color: "#fca5a5", border: "#ef4444" },
+    "فصل تلقائي (تجاوز التحذيرات)": { icon: "🚫", label: "فصل تلقائي (تجاوز التحذيرات)", color: "#fca5a5", border: "#7f1d1d" },
     "إصدار تحذير":          { icon: "⚠️", label: "إصدار تحذير",         color: "#f87171", border: "#7f1d1d" },
     "إصدار إشعار":          { icon: "🔔", label: "إصدار إشعار",         color: "#fbbf24", border: "#78350f" },
     "تعاهد على تحذير":      { icon: "🤝", label: "تعاهد على تحذير",     color: "#4ade80", border: "#166534" },
@@ -2788,6 +3091,131 @@ async function deleteNote(discord, noteId) {
     if (!confirm('متأكد تبي تحذف هذي الملاحظة؟')) return;
     try { await api('/api/senior/personnel/' + discord + '/note/' + noteId, { method: 'DELETE' }); toast('تم الحذف'); loadNotesPage(); }
     catch (e) { toast(e.message); }
+}
+// صفحة إدارة عقوبات التحذيرات بلوحة كبار المسؤولين — إضافة / تعديل / حذف
+let editingPenaltyId = null;
+async function loadPenaltiesPage() {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let list;
+    try { ({ list } = await api('/api/senior/penalties')); }
+    catch (e) {
+        if (currentAdminTab !== 'penalties') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (currentAdminTab !== 'penalties') return;
+    editingPenaltyId = null;
+    renderPenaltiesPage(list);
+}
+const PENALTY_TYPE_LABELS = { points: 'خصم نقاط', resetPoints: 'تصفير النقاط', demote: 'تنزيل رتبة', demoteToFirst: 'تنزيل لأول رتبة', suspend: 'إيقاف مؤقت', combo: 'عقوبة مركّبة', dismiss: 'فصل نهائي' };
+function renderPenaltiesPage(list) {
+    const box = document.getElementById('admin-content');
+    if (!box) return;
+    box.innerHTML = \`
+        <div class="card">
+            <h3 style="color:var(--gold-soft);margin-bottom:8px;">⚖️ عقوبات التحذيرات</h3>
+            <p style="font-size:13px;color:#94a3b8;line-height:1.8;">
+                تصل هذي العقوبات للعضو تلقائيًا عند وصوله للتحذير الثالث — تختار وحدة منها وقت إرسال التحذير. تقدر تضيف / تعدّل / تحذف عقوبات حسب ما يناسبكم.<br>
+                <b style="color:#fca5a5;">ملاحظة:</b> أي تحذير رابع بعد عقوبة التحذير الثالث يفصل العضو تلقائيًا بغض النظر عن هذي القائمة.
+            </p>
+        </div>
+        <div class="card" id="penalty-form-card">
+            <h3 id="penalty-form-title" style="margin-bottom:10px;">➕ إضافة عقوبة جديدة</h3>
+            <input id="pn-label" placeholder="اسم العقوبة (مثال: إيقاف 4 أيام)">
+            <select id="pn-type" onchange="togglePenaltyFields()">
+                <option value="points">خصم نقاط</option>
+                <option value="resetPoints">تصفير النقاط بالكامل</option>
+                <option value="demote">تنزيل رتبة</option>
+                <option value="demoteToFirst">تنزيل لأول رتبة (جندي)</option>
+                <option value="suspend">إيقاف مؤقت (أيام)</option>
+                <option value="combo">عقوبة مركّبة (نقاط + رتبة + إيقاف)</option>
+                <option value="dismiss">فصل نهائي</option>
+            </select>
+            <input id="pn-value" type="number" min="1" placeholder="عدد النقاط المخصومة">
+            <input id="pn-ranks" type="number" min="1" placeholder="عدد الرتب المُنزّلة">
+            <input id="pn-days" type="number" min="1" placeholder="عدد أيام الإيقاف">
+            <div class="wf-actions" style="margin-top:6px;">
+                <button class="btn gray sm" id="pn-cancel-btn" style="display:none;" onclick="resetPenaltyForm()">إلغاء التعديل</button>
+                <button class="btn sm" onclick="savePenalty()">💾 حفظ</button>
+            </div>
+        </div>
+        \${list.length === 0 ? '<div class="card center" style="color:var(--muted);">لا توجد عقوبات مضافة حالياً — ضيف عقوبة من الفورم فوق</div>' : list.map((p, i) => \`
+        <div class="card row" style="align-items:center;">
+            <div>
+                <b>\${i + 1}. \${p.label}</b>
+                <div style="font-size:12px;color:#94a3b8;margin-top:2px;">
+                    \${PENALTY_TYPE_LABELS[p.type] || p.type}
+                    \${p.value ? ' • ' + p.value + ' نقطة' : ''}
+                    \${p.ranks ? ' • ' + p.ranks + ' رتبة' : ''}
+                    \${p.days ? ' • ' + p.days + ' يوم' : ''}
+                </div>
+            </div>
+            <div class="row" style="gap:6px;">
+                <button class="btn sm gray" onclick='editPenalty(\${JSON.stringify(p)})'>✏️ تعديل</button>
+                <button class="btn sm danger" onclick="deletePenalty('\${p.id}')">🗑️ حذف</button>
+            </div>
+        </div>\`).join('')}
+    \`;
+    togglePenaltyFields();
+}
+function togglePenaltyFields() {
+    const type = document.getElementById('pn-type').value;
+    document.getElementById('pn-value').style.display = (type === 'points' || type === 'combo') ? 'block' : 'none';
+    document.getElementById('pn-ranks').style.display = (type === 'demote' || type === 'combo') ? 'block' : 'none';
+    document.getElementById('pn-days').style.display = (type === 'suspend' || type === 'combo') ? 'block' : 'none';
+}
+function editPenalty(p) {
+    editingPenaltyId = p.id;
+    document.getElementById('penalty-form-title').textContent = '✏️ تعديل العقوبة';
+    document.getElementById('pn-label').value = p.label || '';
+    document.getElementById('pn-type').value = p.type || 'points';
+    document.getElementById('pn-value').value = p.value || '';
+    document.getElementById('pn-ranks').value = p.ranks || '';
+    document.getElementById('pn-days').value = p.days || '';
+    document.getElementById('pn-cancel-btn').style.display = 'inline-block';
+    togglePenaltyFields();
+    document.getElementById('penalty-form-card').scrollIntoView({ behavior: 'smooth' });
+}
+function resetPenaltyForm() {
+    editingPenaltyId = null;
+    document.getElementById('penalty-form-title').textContent = '➕ إضافة عقوبة جديدة';
+    document.getElementById('pn-label').value = '';
+    document.getElementById('pn-type').value = 'points';
+    document.getElementById('pn-value').value = '';
+    document.getElementById('pn-ranks').value = '';
+    document.getElementById('pn-days').value = '';
+    document.getElementById('pn-cancel-btn').style.display = 'none';
+    togglePenaltyFields();
+}
+async function savePenalty() {
+    const label = document.getElementById('pn-label').value;
+    const type = document.getElementById('pn-type').value;
+    const value = document.getElementById('pn-value').value;
+    const ranks = document.getElementById('pn-ranks').value;
+    const days = document.getElementById('pn-days').value;
+    if (!label || !label.trim()) return toast('لازم تكتب اسم العقوبة');
+    try {
+        let list;
+        if (editingPenaltyId) {
+            ({ list } = await api('/api/senior/penalties/' + editingPenaltyId, { method: 'PUT', body: JSON.stringify({ label, type, value, ranks, days }) }));
+            toast('تم تعديل العقوبة');
+        } else {
+            ({ list } = await api('/api/senior/penalties', { method: 'POST', body: JSON.stringify({ label, type, value, ranks, days }) }));
+            toast('تمت إضافة العقوبة');
+        }
+        editingPenaltyId = null;
+        renderPenaltiesPage(list);
+    } catch (e) { toast(e.message); }
+}
+async function deletePenalty(id) {
+    if (!confirm('متأكد تبي تحذف هذي العقوبة؟')) return;
+    try {
+        const { list } = await api('/api/senior/penalties/' + id, { method: 'DELETE' });
+        toast('تم الحذف');
+        renderPenaltiesPage(list);
+    } catch (e) { toast(e.message); }
 }
 async function loadSettings() {
     const { settings } = await api('/api/senior/settings');
