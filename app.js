@@ -1004,6 +1004,19 @@ app.post("/api/senior/personnel/:discord/warn", ensureSeniorAdmin, async (req, r
     } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// إشعار جماعي لكل الأعضاء المسجلين بالموقع
+app.post("/api/senior/personnel/warn-all", ensureSeniorAdmin, async (req, res) => {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
+    const entry = { kind: "notice", reason: reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username };
+    const result = await Personnel.updateMany(
+        { registeredName: { $ne: null } },
+        { $push: { warnings: entry } }
+    );
+    await logEvent({ action: "إصدار إشعار", actorId: req.user.id, actorTag: req.user.username, details: `📢 إشعار جماعي لكل الأعضاء (${result.modifiedCount}): ${reason.trim()}` });
+    res.json({ ok: true, count: result.modifiedCount });
+});
+
 // أقرب تحذير/إشعار لهذا المستخدم لسّه ما اتعاهد عليه — تستخدمها الواجهة للبولينج تعرضه بوجهه
 app.get("/api/warnings/pending", async (req, res) => {
     if (!req.isAuthenticated()) return res.json({ warning: null });
@@ -1609,6 +1622,29 @@ async function submitWarnForm(discord, apiBase, kind) {
     try {
         await api(apiBase + discord + '/warn', { method: 'POST', body: JSON.stringify({ kind, reason }) });
         toast(kind === 'warning' ? '✅ تم إرسال التحذير' : '✅ تم إرسال الإشعار');
+        closeWarnForm();
+    } catch (e) { toast(e.message); }
+}
+
+// ── إشعار للجميع (لكل الأعضاء المسجلين بالموقع) ─────────────────────────
+function openWarnAllForm() {
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📢 ضع نص الإشعار (سيصل لكل الأعضاء المسجلين)</h3>
+        <textarea id="wf-reason-all" placeholder="اكتب نص الإشعار هنا..."></textarea>
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitWarnAllForm()">إرسال للجميع</button>
+        </div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+async function submitWarnAllForm() {
+    const reason = document.getElementById('wf-reason-all').value;
+    if (!reason || !reason.trim()) return toast('لازم تكتب النص');
+    if (!confirm('متأكد تبي ترسل هذا الإشعار لكل الأعضاء المسجلين بالموقع؟')) return;
+    try {
+        const { count } = await api('/api/senior/personnel/warn-all', { method: 'POST', body: JSON.stringify({ reason }) });
+        toast('✅ تم الإرسال لـ ' + count + ' عضو');
         closeWarnForm();
     } catch (e) { toast(e.message); }
 }
@@ -2464,7 +2500,7 @@ async function viewSectorFile(discord) {
 
 async function loadPersonnel() {
     const box = document.getElementById('admin-content');
-    box.innerHTML = \`<div class="card"><input id="p-search" placeholder="بحث بالاسم / اليونت / التاق" onkeyup="if(event.key==='Enter') searchPersonnel()"><button class="btn sm" onclick="searchPersonnel()">بحث</button></div><div id="p-list"></div>\`;
+    box.innerHTML = \`<div class="card row"><h3 style="margin:0;">الحسابات</h3><button class="btn sm" style="background:#78350f;color:#fff;" onclick="openWarnAllForm()">📢 إشعار للجميع</button></div><div class="card"><input id="p-search" placeholder="بحث بالاسم / اليونت / التاق" onkeyup="if(event.key==='Enter') searchPersonnel()"><button class="btn sm" onclick="searchPersonnel()">بحث</button></div><div id="p-list"></div>\`;
     searchPersonnel();
 }
 let personnelCache = [];
