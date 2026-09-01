@@ -75,10 +75,9 @@ const CONFIG = {
         "الهروب من نقطة تفتيش",
     ],
 
-    MAX_PENDING_VIOLATIONS: 5, // أقصى عدد مخالفات معلّقة بانتظار المراجعة لنفس الشخص بنفس الوقت
-
     POINTS_ON_APPROVE: 1,
     POINTS_ON_REJECT: 1, // تُخصم (تُطرح) من نقاط العسكري عند رفض مخالفته
+    MAX_PENDING_ITEMS: 5, // أقصى عدد مخالفات/تقارير قيد المراجعة بنفس الوقت لنفس العسكري
     MAX_VEHICLES_ADD: 60,
     MAX_PHOTO_MB: 3,
 
@@ -185,7 +184,31 @@ const ViolationSchema = new mongoose.Schema({
     drugQuantity: { type: String, default: null },
     concealMethod: { type: String, default: null },
 });
+ViolationSchema.index({ status: 1, reviewedAt: -1 });
+ViolationSchema.index({ reporterDiscord: 1, createdAt: -1 });
 const Violation = mongoose.model("Violation", ViolationSchema);
+
+// طلبات ترقية/تنزيل أفراد يرسلها "مسؤول الأفراد" وتنتظر موافقة قائد/نائب القطاع
+const PromotionRequestSchema = new mongoose.Schema({
+    sector: String,
+    sectorLabel: String,
+    targetDiscord: String,
+    targetTag: String,
+    targetName: String,
+    fromRank: String,
+    toRank: String,
+    direction: { type: String, enum: ["up", "down"] },
+    requestedBy: String,
+    requestedByTag: String,
+    status: { type: String, default: "pending" }, // pending | approved | rejected
+    rejectReason: { type: String, default: null },
+    reviewedBy: String,
+    reviewedByTag: String,
+    reviewedAt: Date,
+    createdAt: { type: Date, default: Date.now },
+});
+PromotionRequestSchema.index({ sector: 1, status: 1, createdAt: -1 });
+const PromotionRequest = mongoose.model("PromotionRequest", PromotionRequestSchema);
 
 const VehicleSchema = new mongoose.Schema({
     name: { type: String, required: true, unique: true },
@@ -219,14 +242,17 @@ const SettingsSchema = new mongoose.Schema({
         patrol: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
+            personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
         },
         roadSecurity: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
+            personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
         },
         antiDrugs: {
             commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
             deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
+            personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
         },
     },
     violationsChannelId: String,
@@ -300,6 +326,21 @@ function getSectorRole(userId, settings) {
         if (sec.deputyId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key], role: "deputy" };
     }
     return null;
+}
+
+// يرجع القطاع اللي هذا الشخص "مسؤول أفراد" فيه، أو null
+function getPersonnelOfficerSector(userId, settings) {
+    const sl = settings.sectorLeadership || {};
+    for (const key of Object.keys(CONFIG.SECTORS)) {
+        const sec = sl[key];
+        if (sec && sec.personnelOfficerId === userId) return { sector: key, sectorLabel: CONFIG.SECTORS[key] };
+    }
+    return null;
+}
+
+// صلاحية مسؤول الأفراد تقتصر على رتبة "رئيس رقباء" وتحت
+function isJuniorRank(rank) {
+    return rankIndex(rank) <= rankIndex("رئيس رقباء");
 }
 
 function sectorRoleId(sectorKey) {
@@ -781,6 +822,33 @@ function canReviewSector(sectorInfo) {
     return sectorInfo.role === "senior" || sectorInfo.sector === "antiDrugs";
 }
 
+// يسمح لـ"مسؤول الأفراد" بالدخول لمساراته الخاصة، وكبار المسؤولين عبر ?sector= بالكويري
+async function ensurePersonnelOfficer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    if (isSeniorAdmin(req.user.id)) {
+        const q = (req.query.sector || req.body?.sector || "").trim();
+        if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
+        req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q] };
+        return next();
+    }
+    const settings = await getSettings();
+    const info = getPersonnelOfficerSector(req.user.id, settings);
+    if (!info) return res.status(403).json({ error: "هذا القسم لمسؤول الأفراد فقط" });
+    req.sectorInfo = info;
+    next();
+}
+
+// يتأكد أن الفرد المطلوب من أعضاء قطاع مسؤول الأفراد، وبرتبة رئيس رقباء فما دون (نطاق صلاحيته)
+async function ensureJuniorInMySector(req, res, discordId) {
+    const ids = await getSectorMemberIds(req.sectorInfo.sector);
+    if (ids === null) { res.status(503).json({ error: "تعذر التحقق من أعضاء القطاع حالياً، حاول مرة ثانية بعد شوي" }); return null; }
+    if (!ids.includes(discordId)) { res.status(403).json({ error: "هذا الشخص ليس من أعضاء قطاعك" }); return null; }
+    const p = await Personnel.findOne({ discord: discordId });
+    if (!p) { res.status(404).json({ error: "غير موجود" }); return null; }
+    if (!isJuniorRank(p.rank)) { res.status(403).json({ error: "صلاحيتك تشمل رتبة رئيس رقباء وتحت فقط" }); return null; }
+    return p;
+}
+
 app.get("/api/me", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const senior = isSeniorAdmin(req.user.id);
@@ -822,6 +890,12 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     const isAdmin = senior || settings.adminList.includes(req.user.id);
     const progress = await rankProgress(p, settings);
     const sectorInfo = senior ? null : getSectorRole(req.user.id, settings);
+    if (sectorInfo) {
+        const sec = (settings.sectorLeadership && settings.sectorLeadership[sectorInfo.sector]) || {};
+        sectorInfo.personnelOfficerId = sec.personnelOfficerId || null;
+        sectorInfo.personnelOfficerName = sec.personnelOfficerName || null;
+    }
+    const personnelOfficerInfo = senior ? null : getPersonnelOfficerSector(req.user.id, settings);
 
     res.json({
         blocked: false,
@@ -838,6 +912,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         isSeniorAdmin: senior,
         isAntiDrugs,
         sectorInfo,
+        personnelOfficerInfo,
         maintenance: settings.isMaintenance,
         violationsDisabled: settings.disableViolations,
         nextRank: progress.nextRank,
@@ -875,10 +950,10 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
         if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
         if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل مخالفات جديدة" });
 
-        // يمنع تسجيل مخالفة جديدة إذا وصل عدد مخالفاته المعلّقة للحد الأقصى المسموح
+        // يمنع تسجيل مخالفة جديدة إذا وصل عدد المخالفات/التقارير المعلّقة له للحد الأقصى
         const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
-        if (pendingCount >= CONFIG.MAX_PENDING_VIOLATIONS) {
-            return res.status(429).json({ error: `عندك ${CONFIG.MAX_PENDING_VIOLATIONS} مخالفات معلّقة بانتظار المراجعة، لازم تنقبل وحدة منها على الأقل قبل تسجيل مخالفة جديدة.` });
+        if (pendingCount >= CONFIG.MAX_PENDING_ITEMS) {
+            return res.status(429).json({ error: `عندك ${CONFIG.MAX_PENDING_ITEMS} مخالفات/تقارير معلّقة بانتظار المراجعة، لازم الإدارة تقبل أو ترفض وحدة منها قبل تسجيل مخالفة جديدة.` });
         }
 
         const last = await Violation.findOne({ reporterDiscord: req.user.id }).sort({ createdAt: -1 });
@@ -913,7 +988,7 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
 });
 
 app.get("/api/violations/mine", ensureAuth, async (req, res) => {
-    const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 });
+    const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 }).allowDiskUse(true);
     res.json({ list });
 });
 
@@ -931,6 +1006,12 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
         const p = await Personnel.findOne({ discord: req.user.id });
         if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
         if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل تقارير جديدة" });
+
+        // يمنع تسجيل تقرير جديد إذا وصل عدد المخالفات/التقارير المعلّقة له للحد الأقصى
+        const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
+        if (pendingCount >= CONFIG.MAX_PENDING_ITEMS) {
+            return res.status(429).json({ error: `عندك ${CONFIG.MAX_PENDING_ITEMS} مخالفات/تقارير معلّقة بانتظار المراجعة، لازم الإدارة تقبل أو ترفض وحدة منها قبل تسجيل تقرير جديد.` });
+        }
 
         const {
             category, suspectName, arrestLocation, vehicle,
@@ -1423,37 +1504,19 @@ app.get("/api/senior/log", ensureSeniorAdmin, async (req, res) => {
     res.json({ list });
 });
 
-// ── صفحة "المخالفات المقبولة" (كبار المسؤولين فقط) ──────────────────────
-// تعرض كل المخالفات/التقارير اللي تمت مراجعتها (مقبولة أو مرفوضة) مع زر حذف نهائي
-app.get("/api/senior/violations/reviewed", ensureSeniorAdmin, async (req, res) => {
-    const list = await Violation.find({ status: { $in: ["approved", "rejected"] } })
-        .sort({ reviewedAt: -1 }).limit(300);
-    res.json({ list });
-});
-
-// حذف نهائي لمخالفة/تقرير — ينحذف كلياً من قاعدة البيانات (يختفي من عند كبار المسؤولين وعند صاحبها بصفحة "مخالفاتي")
-app.delete("/api/senior/violations/:id", ensureSeniorAdmin, async (req, res) => {
-    const v = await Violation.findByIdAndDelete(req.params.id);
-    if (!v) return res.status(404).json({ error: "غير موجودة" });
-    await logEvent({
-        action: "حذف مخالفة نهائي", discordId: v.reporterDiscord, discordTag: v.reporterTag,
-        actorId: req.user.id, actorTag: req.user.username,
-        details: `${v.kind === "report" ? "تقرير" : "مخالفة"} — ${v.reporterName || v.reporterDiscord}`,
-    });
-    res.json({ ok: true });
-});
-
 // ── صفحة "قادة القطاعات" (كبار المسؤولين فقط) ────────────────────────────
 app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
     res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {} });
 });
 
+const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد" };
+
 app.post("/api/senior/sectors/:sector/assign", ensureSeniorAdmin, async (req, res) => {
     const { sector } = req.params;
     const { role, discordId } = req.body;
     if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
-    if (!["commander", "deputy"].includes(role)) return res.status(400).json({ error: "دور غير معروف" });
+    if (!SECTOR_ROLE_LABELS[role]) return res.status(400).json({ error: "دور غير معروف" });
     if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
 
     const person = await Personnel.findOne({ discord: discordId.trim() });
@@ -1465,19 +1528,14 @@ app.post("/api/senior/sectors/:sector/assign", ensureSeniorAdmin, async (req, re
     if (!settings.sectorLeadership) settings.sectorLeadership = {};
     if (!settings.sectorLeadership[sector]) settings.sectorLeadership[sector] = {};
     const displayName = person.registeredName || person.discordTag || person.discord;
-    if (role === "commander") {
-        settings.sectorLeadership[sector].commanderId = person.discord;
-        settings.sectorLeadership[sector].commanderName = displayName;
-    } else {
-        settings.sectorLeadership[sector].deputyId = person.discord;
-        settings.sectorLeadership[sector].deputyName = displayName;
-    }
+    settings.sectorLeadership[sector][`${role}Id`] = person.discord;
+    settings.sectorLeadership[sector][`${role}Name`] = displayName;
     settings.markModified("sectorLeadership");
     await settings.save();
     await logEvent({
         action: "تعيين قيادة قطاع", discordId: person.discord, discordTag: person.discordTag,
         actorId: req.user.id, actorTag: req.user.username,
-        details: `${CONFIG.SECTORS[sector]} — ${role === "commander" ? "قائد" : "نائب"} — ${displayName}`,
+        details: `${CONFIG.SECTORS[sector]} — ${SECTOR_ROLE_LABELS[role]} — ${displayName}`,
     });
     res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
 });
@@ -1486,19 +1544,19 @@ app.post("/api/senior/sectors/:sector/remove", ensureSeniorAdmin, async (req, re
     const { sector } = req.params;
     const { role } = req.body;
     if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
-    if (!["commander", "deputy"].includes(role)) return res.status(400).json({ error: "دور غير معروف" });
+    if (!SECTOR_ROLE_LABELS[role]) return res.status(400).json({ error: "دور غير معروف" });
 
     const settings = await getSettings();
     if (!settings.sectorLeadership || !settings.sectorLeadership[sector]) return res.json({ ok: true });
     const sec = settings.sectorLeadership[sector];
-    const removedName = role === "commander" ? sec.commanderName : sec.deputyName;
-    if (role === "commander") { sec.commanderId = null; sec.commanderName = null; }
-    else { sec.deputyId = null; sec.deputyName = null; }
+    const removedName = sec[`${role}Name`];
+    sec[`${role}Id`] = null;
+    sec[`${role}Name`] = null;
     settings.markModified("sectorLeadership");
     await settings.save();
     await logEvent({
         action: "إزالة قيادة قطاع", actorId: req.user.id, actorTag: req.user.username,
-        details: `${CONFIG.SECTORS[sector]} — ${role === "commander" ? "قائد" : "نائب"} — ${removedName || "-"}`,
+        details: `${CONFIG.SECTORS[sector]} — ${SECTOR_ROLE_LABELS[role]} — ${removedName || "-"}`,
     });
     res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
 });
@@ -1514,7 +1572,7 @@ app.get("/api/sector/members", ensureSectorLeader, async (req, res) => {
 app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const list = ids.length ? await Violation.find({ reporterDiscord: { $in: ids } }).sort({ createdAt: -1 }).limit(300) : [];
+    const list = ids.length ? await Violation.find({ reporterDiscord: { $in: ids }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
     res.json({ list, canReview: canReviewSector(req.sectorInfo) });
 });
 
@@ -1622,6 +1680,199 @@ app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, 
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `على ${p.registeredName || p.discord} (بواسطة قيادة ${req.sectorInfo.sectorLabel}): ${text.trim()}` });
     res.json({ ok: true, notes: p.notes });
+});
+
+// ── تعيين/إزالة "مسؤول الأفراد" (يقدر عليها قائد/نائب القطاع نفسه، أو كبار المسؤولين عبر ?sector=) ──
+// مسؤول أفراد واحد بس لكل قطاع — التعيين الجديد يستبدل القديم تلقائياً
+app.post("/api/sector/personnel-officer/assign", ensureSectorLeader, async (req, res) => {
+    const { discordId } = req.body;
+    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
+    const person = await Personnel.findOne({ discord: discordId.trim() });
+    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
+
+    const settings = await getSettings();
+    if (!settings.sectorLeadership) settings.sectorLeadership = {};
+    if (!settings.sectorLeadership[req.sectorInfo.sector]) settings.sectorLeadership[req.sectorInfo.sector] = {};
+    const displayName = person.registeredName || person.discordTag || person.discord;
+    settings.sectorLeadership[req.sectorInfo.sector].personnelOfficerId = person.discord;
+    settings.sectorLeadership[req.sectorInfo.sector].personnelOfficerName = displayName;
+    settings.markModified("sectorLeadership");
+    await settings.save();
+    await logEvent({
+        action: "تعيين مسؤول أفراد", discordId: person.discord, discordTag: person.discordTag,
+        actorId: req.user.id, actorTag: req.user.username,
+        details: `${req.sectorInfo.sectorLabel} — ${displayName} (بواسطة ${req.sectorInfo.role === "senior" ? "كبار المسؤولين" : "قيادة القطاع"})`,
+    });
+    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
+});
+
+app.post("/api/sector/personnel-officer/remove", ensureSectorLeader, async (req, res) => {
+    const settings = await getSettings();
+    const sec = settings.sectorLeadership && settings.sectorLeadership[req.sectorInfo.sector];
+    if (!sec || !sec.personnelOfficerId) return res.json({ ok: true });
+    const removedName = sec.personnelOfficerName;
+    sec.personnelOfficerId = null;
+    sec.personnelOfficerName = null;
+    settings.markModified("sectorLeadership");
+    await settings.save();
+    await logEvent({
+        action: "إزالة مسؤول أفراد", actorId: req.user.id, actorTag: req.user.username,
+        details: `${req.sectorInfo.sectorLabel} — ${removedName || "-"}`,
+    });
+    res.json({ ok: true, sectorLeadership: settings.sectorLeadership });
+});
+
+// ── طلبات ترقية/تنزيل الأفراد (يراجعها قائد/نائب القطاع — أي وحد منهم يكفي للموافقة) ──
+// هذي الطلبات مصدرها "مسؤول الأفراد" — هو يقترح، وقيادة القطاع توافق أو ترفض
+app.get("/api/sector/promotion-requests", ensureSectorLeader, async (req, res) => {
+    const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }).sort({ createdAt: -1 }).limit(100);
+    res.json({ list });
+});
+
+app.post("/api/sector/promotion-requests/:id/approve", ensureSectorLeader, async (req, res) => {
+    const r = await PromotionRequest.findById(req.params.id);
+    if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
+    if (r.sector !== req.sectorInfo.sector) return res.status(403).json({ error: "هذا الطلب مو من قطاعك" });
+    const p = await Personnel.findOne({ discord: r.targetDiscord });
+    if (!p) return res.status(404).json({ error: "الفرد غير موجود" });
+    const settings = await getSettings();
+    const oldRank = p.rank;
+    p.rank = r.toRank;
+    p.points = r.direction === "up" ? await pointsForReachingRank(r.toRank, settings) : 0;
+    await p.save();
+    r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    await r.save();
+    await logEvent({
+        action: r.direction === "up" ? "ترقية عسكري" : "تنزيل عسكري", discordId: p.discord, discordTag: p.discordTag,
+        actorId: req.user.id, actorTag: req.user.username,
+        details: `${oldRank} ← ${r.toRank} (موافقة على طلب مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
+    });
+    res.json({ ok: true, personnel: p });
+});
+
+app.post("/api/sector/promotion-requests/:id/reject", ensureSectorLeader, async (req, res) => {
+    const { reason } = req.body;
+    const r = await PromotionRequest.findById(req.params.id);
+    if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
+    if (r.sector !== req.sectorInfo.sector) return res.status(403).json({ error: "هذا الطلب مو من قطاعك" });
+    r.status = "rejected"; r.rejectReason = (reason || "").trim() || null;
+    r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    await r.save();
+    await logEvent({
+        action: "رفض طلب ترقية/تنزيل", discordId: r.targetDiscord, discordTag: r.targetTag,
+        actorId: req.user.id, actorTag: req.user.username,
+        details: `${r.fromRank} ← ${r.toRank} (طلب مسؤول أفراد ${req.sectorInfo.sectorLabel})${reason ? " — السبب: " + reason.trim() : ""}`,
+    });
+    res.json({ ok: true });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 4.4) مسارات "مسؤول الأفراد" — صلاحيته على رتبة رئيس رقباء وتحت فقط بقطاعه
+// ══════════════════════════════════════════════════════════════════════════
+
+app.get("/api/personnel-officer/members", ensurePersonnelOfficer, async (req, res) => {
+    const ids = await getSectorMemberIds(req.sectorInfo.sector);
+    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+    const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
+    const list = ids.length ? await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }).sort({ createdAt: -1 }) : [];
+    res.json({ list, sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel });
+});
+
+app.get("/api/personnel-officer/personnel/:discord", ensurePersonnelOfficer, async (req, res) => {
+    const p = await ensureJuniorInMySector(req, res, req.params.discord);
+    if (!p) return;
+    res.json({ personnel: p });
+});
+
+app.post("/api/personnel-officer/personnel/:discord/note", ensurePersonnelOfficer, async (req, res) => {
+    if (!(await ensureJuniorInMySector(req, res, req.params.discord))) return;
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
+    const p = await Personnel.findOneAndUpdate(
+        { discord: req.params.discord },
+        { $push: { notes: { text: text.trim(), addedBy: req.user.id, addedByTag: req.user.username } } },
+        { new: true }
+    );
+    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `على ${p.registeredName || p.discord} (بواسطة مسؤول أفراد ${req.sectorInfo.sectorLabel}): ${text.trim()}` });
+    res.json({ ok: true, notes: p.notes });
+});
+
+app.get("/api/personnel-officer/personnel/:discord/warning-info", ensurePersonnelOfficer, async (req, res) => {
+    const p = await ensureJuniorInMySector(req, res, req.params.discord);
+    if (!p) return;
+    const count = (p.warnings || []).filter(w => w.kind === "warning").length;
+    res.json({ count });
+});
+
+app.post("/api/personnel-officer/personnel/:discord/warn", ensurePersonnelOfficer, async (req, res) => {
+    if (!(await ensureJuniorInMySector(req, res, req.params.discord))) return;
+    try {
+        const { p, dismissed } = await issueWarning({
+            targetDiscord: req.params.discord, kind: req.body.kind, reason: req.body.reason,
+            pointsToDeduct: req.body.pointsToDeduct, penaltyType: req.body.penaltyType,
+            actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
+        });
+        res.json({ ok: true, warnings: p.warnings, dismissed });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// طلب ترقية/تنزيل — ما يصير مباشر، يروح كطلب معلّق لقائد/نائب القطاع
+app.post("/api/personnel-officer/personnel/:discord/promotion-request", ensurePersonnelOfficer, async (req, res) => {
+    const p = await ensureJuniorInMySector(req, res, req.params.discord);
+    if (!p) return;
+    const { direction } = req.body;
+    if (!["up", "down"].includes(direction)) return res.status(400).json({ error: "حدد الاتجاه" });
+    const idx = rankIndex(p.rank);
+    const newIdx = direction === "up" ? idx + 1 : idx - 1;
+    if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
+    const existing = await PromotionRequest.findOne({ targetDiscord: p.discord, status: "pending" });
+    if (existing) return res.status(400).json({ error: "يوجد طلب معلّق لهذا الفرد مسبقاً، انتظر رد القيادة" });
+    const doc = await PromotionRequest.create({
+        sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel,
+        targetDiscord: p.discord, targetTag: p.discordTag, targetName: p.registeredName,
+        fromRank: p.rank, toRank: CONFIG.MILITARY_RANKS[newIdx], direction,
+        requestedBy: req.user.id, requestedByTag: req.user.username, status: "pending",
+    });
+    await logEvent({
+        action: direction === "up" ? "طلب ترقية" : "طلب تنزيل", discordId: p.discord, discordTag: p.discordTag,
+        actorId: req.user.id, actorTag: req.user.username,
+        details: `${p.rank} ← ${CONFIG.MILITARY_RANKS[newIdx]} (طلب من مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
+    });
+    res.json({ ok: true, request: doc });
+});
+
+// طلباته السابقة (يشوف حالتها: معلّق/موافق عليه/مرفوض)
+app.get("/api/personnel-officer/requests", ensurePersonnelOfficer, async (req, res) => {
+    const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }).sort({ createdAt: -1 }).limit(100);
+    res.json({ list });
+});
+
+// مخالفات الأفراد (رئيس رقباء وتحت فقط) — عرض + قبول + رفض
+app.get("/api/personnel-officer/violations", ensurePersonnelOfficer, async (req, res) => {
+    const ids = await getSectorMemberIds(req.sectorInfo.sector);
+    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+    const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
+    const juniorIds = ids.length ? (await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, "discord")).map(p => p.discord) : [];
+    const list = juniorIds.length ? await Violation.find({ reporterDiscord: { $in: juniorIds }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
+    res.json({ list });
+});
+
+app.post("/api/personnel-officer/violations/:id/approve", ensurePersonnelOfficer, async (req, res) => {
+    const v = await Violation.findById(req.params.id);
+    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
+    if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
+    await approveViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`);
+    res.json({ ok: true });
+});
+
+app.post("/api/personnel-officer/violations/:id/reject", ensurePersonnelOfficer, async (req, res) => {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
+    const v = await Violation.findById(req.params.id);
+    if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
+    if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
+    await rejectViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, reason.trim());
+    res.json({ ok: true });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1980,6 +2231,9 @@ async function ackCurrentWarning() {
     } catch (e) { toast(e.message); }
     btn.disabled = false;
 }
+async function refreshMe() {
+    try { ME = await api('/api/me'); } catch (e) { /* تجاهل */ }
+}
 async function init() {
     try { ME = await api('/api/me'); } catch (e) { renderLogin(); return; }
     if (ME.blocked) { renderBlocked(ME.reason); return; }
@@ -2008,9 +2262,17 @@ function buildNav() {
     );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
+    if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
     links.innerHTML = items.map(i => \`<button onclick="\${i.fn}">\${i.label}</button>\`).join('');
     mobile.innerHTML = items.map(i => \`<button onclick="\${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
+}
+function renderFabs() {
+    const fabs = [];
+    if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
+    if (ME.sectorInfo) fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
+    if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
+    return fabs.map((f, i) => \`<button class="fab" style="bottom:\${25 + i * 65}px;" onclick="\${f.fn}">\${f.label}</button>\`).join('');
 }
 function toggleMobileMenu() { document.getElementById('mobile-menu').classList.toggle('open'); }
 function closeMobileMenu() { document.getElementById('mobile-menu').classList.remove('open'); }
@@ -2145,7 +2407,7 @@ function renderDashboard() {
             <div id="notes-box" style="margin:10px 0;"></div>
             <div id="mine-list">جارِ التحميل...</div>
         </div>
-        \${ME.isSeniorAdmin ? '<button class="fab" onclick="renderAdmin()">🛡️ لوحة كبار المسؤولين</button>' : ''}
+        \${renderFabs()}
     \`;
     loadMine();
     renderNotes();
@@ -2383,7 +2645,6 @@ function renderAdmin() {
     const tabsHtml = ME.isSeniorAdmin ? \`
         <div class="tabs">
             <div class="tab active" onclick="adminTab('pending', this)">المخالفات المعلّقة</div>
-            <div class="tab" onclick="adminTab('reviewed', this)">المخالفات المقبولة</div>
             <div class="tab" onclick="adminTab('sectors', this)">قادة القطاعات</div>
             <div class="tab" onclick="adminTab('personnel', this)">الحسابات</div>
             <div class="tab" onclick="adminTab('vehicles', this)">المركبات</div>
@@ -2406,7 +2667,6 @@ function adminTab(name, el) {
     if (el) el.classList.add('active');
     currentAdminTab = name;
     if (name === 'pending') loadPending();
-    if (name === 'reviewed') loadReviewed();
     if (name === 'sectors') loadSectors();
     if (name === 'personnel') loadPersonnel();
     if (name === 'vehicles') loadVehicles();
@@ -2500,43 +2760,6 @@ function rejectV(id) {
         .then(() => { toast('تم الرفض'); loadPending(); }).catch(e => toast(e.message));
 }
 
-// ── المخالفات المقبولة (كبار المسؤولين) ──────────────────────────────────
-async function loadReviewed() {
-    const box = document.getElementById('admin-content');
-    if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
-    let list;
-    try { ({ list } = await api('/api/senior/violations/reviewed')); }
-    catch (e) {
-        if (currentAdminTab !== 'reviewed') return;
-        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل، حاول تحدّث الصفحة. (\${e.message})</div>\`;
-        return;
-    }
-    if (currentAdminTab !== 'reviewed') return;
-    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات أو تقارير تمت مراجعتها بعد</div>'; return; }
-    box.innerHTML = list.map(v => \`
-        <div class="card">
-            <div class="row" style="align-items:flex-start;">
-                <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
-                    <div>
-                        <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
-                        <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
-                        <div style="color:var(--muted);font-size:13px;">المركبة: \${v.vehicle || '-'} \${v.plateNumber ? ('• اللوحة: ' + v.plateNumber) : ''}</div>
-                        <div style="margin-top:4px;"><span class="badge \${v.status}">\${v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>\${v.status === 'rejected' && v.rejectReason ? \` — \${v.rejectReason}\` : ''}</div>
-                        <div style="color:var(--muted);font-size:11px;margin-top:4px;">راجعها: \${v.reviewedByTag || v.reviewedBy || '-'}</div>
-                    </div>
-                </div>
-                <button class="btn danger sm" onclick="deleteReviewed('\${v._id}')">🗑️ حذف نهائي</button>
-            </div>
-        </div>\`).join('');
-}
-function deleteReviewed(id) {
-    if (!confirm('متأكد تبي تحذفها نهائياً؟ بتختفي من عندك ومن عند صاحبها.')) return;
-    api('/api/senior/violations/' + id, { method: 'DELETE' })
-        .then(() => { toast('تم الحذف'); loadReviewed(); }).catch(e => toast(e.message));
-}
-
 // ── قادة القطاعات (كبار المسؤولين) ───────────────────────────────────────
 let sectorsCache = { sectors: {}, leadership: {} };
 async function loadSectors() {
@@ -2578,13 +2801,22 @@ function renderSectorsBox() {
                     \${sec.deputyName ? \`<button class="btn danger sm" onclick="removeSectorRole('\${key}','deputy')">إزالة</button>\` : ''}
                 </div>
             </div>
+            <div class="row" style="margin-top:8px;">
+                <span>مسؤول الأفراد: <b style="color:\${sec.personnelOfficerName ? '#4ade80' : 'var(--muted)'};">\${sec.personnelOfficerName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openSectorPicker('\${key}','personnelOfficer')">مسؤول أفراد \${label}</button>
+                    \${sec.personnelOfficerName ? \`<button class="btn danger sm" onclick="removeSectorRole('\${key}','personnelOfficer')">إزالة</button>\` : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول الأفراد يتحكم بالأعضاء من رتبة رئيس رقباء وتحت فقط (ملاحظات، تحذيرات، ومخالفاتهم) — وطلبات الترقية/التنزيل اللي يسويها تروح لك أو للنائب بصفحة "ترقيات الأفراد" داخل لوحة قيادة القطاع للموافقة عليها.</div>
             <div id="picker-\${key}-commander"></div>
             <div id="picker-\${key}-deputy"></div>
+            <div id="picker-\${key}-personnelOfficer"></div>
         </div>\`;
     }).join('');
 }
 function openSectorPicker(sectorKey, role) {
-    ['commander', 'deputy'].forEach(r => {
+    ['commander', 'deputy', 'personnelOfficer'].forEach(r => {
         Object.keys(sectorsCache.sectors).forEach(k => {
             const el = document.getElementById('picker-' + k + '-' + r);
             if (el && (k !== sectorKey || r !== role)) el.innerHTML = '';
@@ -2643,13 +2875,60 @@ function renderSectorPanel() {
     if (!ME.sectorInfo) return renderDashboard();
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>🎖️ قيادة \${ME.sectorInfo.sectorLabel} (\${ME.sectorInfo.role === 'commander' ? 'قائد' : 'نائب'})</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="card">
+            <div class="row">
+                <span>مسؤول الأفراد: <b style="color:\${ME.sectorInfo.personnelOfficerName ? '#4ade80' : 'var(--muted)'};">\${ME.sectorInfo.personnelOfficerName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openPersonnelOfficerPicker()">تعيين / تغيير</button>
+                    \${ME.sectorInfo.personnelOfficerName ? \`<button class="btn danger sm" onclick="removePersonnelOfficer()">إزالة</button>\` : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:6px;">مسؤول الأفراد يتحكم بالأعضاء من رتبة رئيس رقباء وتحت فقط (ملاحظات وتحذيرات ومخالفاتهم). طلبات الترقية والتنزيل اللي يسويها ما تصير مباشرة — تجيك أو للنائب بتبويب "ترقيات الأفراد" تحت للموافقة عليها.</div>
+            <div id="po-picker"></div>
+        </div>
         <div class="tabs">
             <div class="tab active" onclick="sectorTab('members', this)">أعضاء القطاع</div>
             <div class="tab" onclick="sectorTab('violations', this)">مخالفات القطاع</div>
             <div class="tab" onclick="sectorTab('file', this)">عرض ملف عسكري</div>
+            <div class="tab" onclick="sectorTab('promotions', this)">ترقيات الأفراد</div>
         </div>
         <div id="sector-content"></div>\`;
     sectorTab('members');
+}
+async function openPersonnelOfficerPicker() {
+    const el = document.getElementById('po-picker');
+    if (!el) return;
+    if (el.innerHTML.trim()) { el.innerHTML = ''; return; }
+    el.innerHTML = '<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">جارِ التحميل...</div>';
+    try {
+        const { list } = await api('/api/sector/members');
+        if (list.length === 0) { el.innerHTML = '<p style="color:var(--muted);font-size:13px;margin-top:8px;">لا يوجد أعضاء بالقطاع حالياً</p>'; return; }
+        el.innerHTML = \`<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">\` +
+            list.filter(p => p.registeredName).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="assignPersonnelOfficer('\${p.discord}')">تعيين</button>
+                    </div>
+                </div>\`).join('') + \`</div>\`;
+    } catch (e) { el.innerHTML = '<p style="color:#f87171;font-size:13px;margin-top:8px;">' + e.message + '</p>'; }
+}
+async function assignPersonnelOfficer(discordId) {
+    try {
+        await api('/api/sector/personnel-officer/assign', { method: 'POST', body: JSON.stringify({ discordId }) });
+        toast('تم التعيين');
+        await refreshMe();
+        renderSectorPanel();
+    } catch (e) { toast(e.message); }
+}
+async function removePersonnelOfficer() {
+    if (!confirm('متأكد تبي تزيله من مسؤول الأفراد؟')) return;
+    try {
+        await api('/api/sector/personnel-officer/remove', { method: 'POST' });
+        toast('تم');
+        await refreshMe();
+        renderSectorPanel();
+    } catch (e) { toast(e.message); }
 }
 function sectorTab(name, el) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -2658,6 +2937,48 @@ function sectorTab(name, el) {
     if (name === 'members') loadSectorMembers();
     if (name === 'violations') loadSectorViolations();
     if (name === 'file') renderSectorFileSearch();
+    if (name === 'promotions') loadPromotionRequests();
+}
+async function loadPromotionRequests() {
+    const box = document.getElementById('sector-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/sector/promotion-requests'); }
+    catch (e) {
+        if (sectorPanelTab !== 'promotions') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (sectorPanelTab !== 'promotions') return;
+    const list = data.list || [];
+    const note = \`<div class="card" style="color:var(--muted);font-size:13px;">📩 هذي طلبات ترقية وتنزيل جاتك من مسؤول الأفراد بقطاعك — هو يقترح، وأنت أو النائب توافقون أو ترفضون. الموافقة تطبّق الترقية/التنزيل فعلياً على الفرد.</div>\`;
+    if (list.length === 0) { box.innerHTML = note + '<div class="card center" style="color:var(--muted);">لا توجد طلبات حالياً</div>'; return; }
+    box.innerHTML = note + list.map(r => \`
+        <div class="card">
+            <div class="row" style="align-items:flex-start;">
+                <div>
+                    <b>\${r.targetName || r.targetTag}</b>
+                    <div style="color:var(--gold-soft);margin-top:4px;">\${r.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل'}: \${r.fromRank} ← \${r.toRank}</div>
+                    <div style="color:var(--muted);font-size:12px;margin-top:2px;">من مسؤول الأفراد: \${r.requestedByTag || r.requestedBy}</div>
+                    <div style="margin-top:4px;"><span class="badge \${r.status}">\${r.status === 'pending' ? 'قيد المراجعة' : r.status === 'approved' ? 'تمت الموافقة' : 'مرفوض'}</span>\${r.status === 'rejected' && r.rejectReason ? \` — \${r.rejectReason}\` : ''}</div>
+                </div>
+                \${r.status === 'pending' ? \`
+                <div class="row" style="gap:8px;">
+                    <button class="btn sm" onclick="promoRequestApprove('\${r._id}')">قبول</button>
+                    <button class="btn danger sm" onclick="promoRequestReject('\${r._id}')">رفض</button>
+                </div>\` : ''}
+            </div>
+        </div>\`).join('');
+}
+function promoRequestApprove(id) {
+    api('/api/sector/promotion-requests/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('تمت الموافقة'); loadPromotionRequests(); }).catch(e => toast(e.message));
+}
+function promoRequestReject(id) {
+    const reason = prompt('سبب الرفض (اختياري):') || '';
+    api('/api/sector/promotion-requests/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+        .then(() => { toast('تم الرفض'); loadPromotionRequests(); }).catch(e => toast(e.message));
 }
 async function loadSectorMembers() {
     const box = document.getElementById('sector-content');
@@ -2799,6 +3120,112 @@ async function viewSectorFile(discord) {
                     p.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">\${n.text}</div>\`).join('') : ''}
             </div>\`;
     } catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">\${e.message}</div>\`; }
+}
+
+// ── لوحة "مسؤول الأفراد" — صلاحيته على رتبة رئيس رقباء وتحت فقط بقطاعه ────
+let poTab = 'members';
+function renderPersonnelOfficerPanel() {
+    if (!ME.personnelOfficerInfo) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>👥 مسؤول أفراد \${ME.personnelOfficerInfo.sectorLabel}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="card" style="color:var(--muted);font-size:13px;">صلاحيتك تشمل أفراد قطاعك من رتبة <b style="color:var(--gold-soft);">رئيس رقباء وتحت</b> فقط. طلبات الترقية/التنزيل ما تصير فورية — تروح كطلب لقائد أو نائب القطاع للموافقة.</div>
+        <div class="tabs">
+            <div class="tab active" onclick="poTabSwitch('members', this)">الأفراد</div>
+            <div class="tab" onclick="poTabSwitch('violations', this)">مخالفات الأفراد</div>
+        </div>
+        <div id="po-content"></div>\`;
+    poTabSwitch('members');
+}
+function poTabSwitch(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    poTab = name;
+    if (name === 'members') loadPoMembers();
+    if (name === 'violations') loadPoViolations();
+}
+async function loadPoMembers() {
+    const box = document.getElementById('po-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/personnel-officer/members'); }
+    catch (e) {
+        if (poTab !== 'members') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (poTab !== 'members') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أفراد برتبة رئيس رقباء وتحت بقطاعك حالياً</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                    <div style="font-size:13px;color:#94a3b8;">النقاط: \${p.points} \${p.isBlocked ? '• 🚫 موقوف' : ''}</div>
+                </div>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="poPromotionRequest('\${p.discord}','up')">⬆️ طلب ترقية</button>
+                    <button class="btn sm gray" onclick="poPromotionRequest('\${p.discord}','down')">⬇️ طلب تنزيل</button>
+                    <button class="btn sm gray" onclick="poAddNote('\${p.discord}')">📝 ملاحظة</button>
+                    <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/personnel-officer/personnel/')">⚠️ تحذير</button>
+                </div>
+            </div>
+        </div>\`).join('');
+}
+function poPromotionRequest(discord, direction) {
+    if (!confirm(direction === 'up' ? 'تبي ترسل طلب ترقية لهذا الفرد؟ الطلب بيروح لقائد أو نائب القطاع للموافقة، مو تنفيذ مباشر.' : 'تبي ترسل طلب تنزيل لهذا الفرد؟ الطلب بيروح لقائد أو نائب القطاع للموافقة، مو تنفيذ مباشر.')) return;
+    api('/api/personnel-officer/personnel/' + discord + '/promotion-request', { method: 'POST', body: JSON.stringify({ direction }) })
+        .then(() => toast('✅ تم إرسال الطلب لقيادة القطاع')).catch(e => toast(e.message));
+}
+function poAddNote(discord) {
+    const text = prompt('اكتب الملاحظة:');
+    if (text === null) return;
+    if (!text.trim()) return toast('اكتب الملاحظة');
+    api('/api/personnel-officer/personnel/' + discord + '/note', { method: 'POST', body: JSON.stringify({ text }) })
+        .then(() => toast('تمت الإضافة')).catch(e => toast(e.message));
+}
+async function loadPoViolations() {
+    const box = document.getElementById('po-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/personnel-officer/violations'); }
+    catch (e) {
+        if (poTab !== 'violations') return;
+        box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
+    if (poTab !== 'violations') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد مخالفات أو تقارير بعد</div>'; return; }
+    box.innerHTML = data.list.map(v => \`
+        <div class="card">
+            <div class="row" style="align-items:flex-start;">
+                <div class="row" style="gap:10px;align-items:flex-start;">
+                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    <div>
+                        <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
+                        <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
+                        <div style="margin-top:4px;"><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span></div>
+                    </div>
+                </div>
+                \${v.status === 'pending' ? \`
+                <div class="row" style="gap:8px;">
+                    <button class="btn sm" onclick="poApprove('\${v._id}')">قبول</button>
+                    <button class="btn danger sm" onclick="poReject('\${v._id}')">رفض</button>
+                </div>\` : ''}
+            </div>
+        </div>\`).join('');
+}
+function poApprove(id) {
+    api('/api/personnel-officer/violations/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('تم القبول'); loadPoViolations(); }).catch(e => toast(e.message));
+}
+function poReject(id) {
+    const reason = prompt('اكتب سبب الرفض:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب سبب');
+    api('/api/personnel-officer/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+        .then(() => { toast('تم الرفض'); loadPoViolations(); }).catch(e => toast(e.message));
 }
 
 async function loadPersonnel() {
