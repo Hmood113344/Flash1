@@ -889,13 +889,15 @@ app.get("/api/me", ensureAuth, async (req, res) => {
 
     const isAdmin = senior || settings.adminList.includes(req.user.id);
     const progress = await rankProgress(p, settings);
-    const sectorInfo = senior ? null : getSectorRole(req.user.id, settings);
+    // نجيب صلاحية القيادة وصلاحية مسؤول الأفراد بشكل مستقل — حتى لو الشخص كبير مسؤول
+    // عشان لو عنده أكثر من صلاحية بنفس الوقت (مثلاً: كبير مسؤول + مسؤول أفراد) تطلع له كل الأزرار
+    const sectorInfo = getSectorRole(req.user.id, settings);
     if (sectorInfo) {
         const sec = (settings.sectorLeadership && settings.sectorLeadership[sectorInfo.sector]) || {};
         sectorInfo.personnelOfficerId = sec.personnelOfficerId || null;
         sectorInfo.personnelOfficerName = sec.personnelOfficerName || null;
     }
-    const personnelOfficerInfo = senior ? null : getPersonnelOfficerSector(req.user.id, settings);
+    const personnelOfficerInfo = getPersonnelOfficerSector(req.user.id, settings);
 
     res.json({
         blocked: false,
