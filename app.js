@@ -1566,7 +1566,7 @@ app.get("/api/sector/members", ensureSectorLeader, async (req, res) => {
 app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const list = ids.length ? await Violation.find({ reporterDiscord: { $in: ids } }).sort({ createdAt: -1 }).limit(300) : [];
+    const list = ids.length ? await Violation.find({ reporterDiscord: { $in: ids }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
     res.json({ list, canReview: canReviewSector(req.sectorInfo) });
 });
 
@@ -1847,7 +1847,7 @@ app.get("/api/personnel-officer/violations", ensurePersonnelOfficer, async (req,
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
     const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
     const juniorIds = ids.length ? (await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, "discord")).map(p => p.discord) : [];
-    const list = juniorIds.length ? await Violation.find({ reporterDiscord: { $in: juniorIds } }).sort({ createdAt: -1 }).limit(300) : [];
+    const list = juniorIds.length ? await Violation.find({ reporterDiscord: { $in: juniorIds }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
     res.json({ list });
 });
 
@@ -2261,6 +2261,13 @@ function buildNav() {
     links.innerHTML = items.map(i => \`<button onclick="\${i.fn}">\${i.label}</button>\`).join('');
     mobile.innerHTML = items.map(i => \`<button onclick="\${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
 }
+function renderFabs() {
+    const fabs = [];
+    if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
+    if (ME.sectorInfo) fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
+    if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
+    return fabs.map((f, i) => \`<button class="fab" style="bottom:\${25 + i * 65}px;" onclick="\${f.fn}">\${f.label}</button>\`).join('');
+}
 function toggleMobileMenu() { document.getElementById('mobile-menu').classList.toggle('open'); }
 function closeMobileMenu() { document.getElementById('mobile-menu').classList.remove('open'); }
 function renderMinePage() {
@@ -2394,7 +2401,7 @@ function renderDashboard() {
             <div id="notes-box" style="margin:10px 0;"></div>
             <div id="mine-list">جارِ التحميل...</div>
         </div>
-        \${ME.isSeniorAdmin ? '<button class="fab" onclick="renderAdmin()">🛡️ لوحة كبار المسؤولين</button>' : ''}
+        \${renderFabs()}
     \`;
     loadMine();
     renderNotes();
