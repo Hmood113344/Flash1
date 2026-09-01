@@ -803,6 +803,13 @@ async function ensureAnyAdmin(req, res, next) {
 async function ensureSectorLeader(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     const settings = await getSettings();
+    // لو الشخص فعلياً قائد/نائب قطاع حقيقي (حتى لو كبير مسؤول بنفس الوقت) نستخدم قطاعه الحقيقي مباشرة
+    const realInfo = getSectorRole(req.user.id, settings);
+    if (realInfo) {
+        req.sectorInfo = realInfo;
+        req.settings = settings;
+        return next();
+    }
     if (isSeniorAdmin(req.user.id)) {
         const q = (req.query.sector || req.body?.sector || "").trim();
         if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
@@ -810,11 +817,7 @@ async function ensureSectorLeader(req, res, next) {
         req.settings = settings;
         return next();
     }
-    const info = getSectorRole(req.user.id, settings);
-    if (!info) return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات فقط" });
-    req.sectorInfo = info;
-    req.settings = settings;
-    next();
+    return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات فقط" });
 }
 
 // فقط قائد/نائب مكافحة المخدرات (أو كبار المسؤولين) يقدرون يقبلون/يرفضون مخالفات وتقارير القطاع
@@ -825,17 +828,20 @@ function canReviewSector(sectorInfo) {
 // يسمح لـ"مسؤول الأفراد" بالدخول لمساراته الخاصة، وكبار المسؤولين عبر ?sector= بالكويري
 async function ensurePersonnelOfficer(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    // لو الشخص فعلياً مسؤول أفراد حقيقي (حتى لو كبير مسؤول بنفس الوقت) نستخدم قطاعه الحقيقي مباشرة
+    const realInfo = getPersonnelOfficerSector(req.user.id, settings);
+    if (realInfo) {
+        req.sectorInfo = realInfo;
+        return next();
+    }
     if (isSeniorAdmin(req.user.id)) {
         const q = (req.query.sector || req.body?.sector || "").trim();
         if (!q || !CONFIG.SECTORS[q]) return res.status(400).json({ error: "حدد قطاع صحيح" });
         req.sectorInfo = { sector: q, sectorLabel: CONFIG.SECTORS[q] };
         return next();
     }
-    const settings = await getSettings();
-    const info = getPersonnelOfficerSector(req.user.id, settings);
-    if (!info) return res.status(403).json({ error: "هذا القسم لمسؤول الأفراد فقط" });
-    req.sectorInfo = info;
-    next();
+    return res.status(403).json({ error: "هذا القسم لمسؤول الأفراد فقط" });
 }
 
 // يتأكد أن الفرد المطلوب من أعضاء قطاع مسؤول الأفراد، وبرتبة رئيس رقباء فما دون (نطاق صلاحيته)
