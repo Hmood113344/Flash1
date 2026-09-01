@@ -183,6 +183,8 @@ const ViolationSchema = new mongoose.Schema({
     drugQuantity: { type: String, default: null },
     concealMethod: { type: String, default: null },
 });
+ViolationSchema.index({ status: 1, reviewedAt: -1 });
+ViolationSchema.index({ reporterDiscord: 1, createdAt: -1 });
 const Violation = mongoose.model("Violation", ViolationSchema);
 
 const VehicleSchema = new mongoose.Schema({
@@ -912,7 +914,7 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
 });
 
 app.get("/api/violations/mine", ensureAuth, async (req, res) => {
-    const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 });
+    const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 }).allowDiskUse(true);
     res.json({ list });
 });
 
@@ -1426,7 +1428,7 @@ app.get("/api/senior/log", ensureSeniorAdmin, async (req, res) => {
 // تعرض كل المخالفات/التقارير اللي تمت مراجعتها (مقبولة أو مرفوضة) مع زر حذف نهائي
 app.get("/api/senior/violations/reviewed", ensureSeniorAdmin, async (req, res) => {
     const list = await Violation.find({ status: { $in: ["approved", "rejected"] } })
-        .sort({ reviewedAt: -1 }).limit(300);
+        .sort({ reviewedAt: -1 }).limit(300).allowDiskUse(true);
     res.json({ list });
 });
 
