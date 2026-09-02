@@ -997,11 +997,37 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
 
 app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
     try {
-        const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 }).limit(500);
-        res.json({ list });
+        // نجيب المخالفات كاملة من قاعدة البيانات (سريع لأنه بين السيرفر والداتابيس)
+        // بس نرسل للمتصفح بدون محتوى الصورة الثقيل (base64) — بس علم إذا فيه صورة أو لا
+        // عشان القائمة تتحمّل بسرعة على الجوال. الصورة الكاملة تنجاب عند الضغط عليها فقط.
+        const list = await Violation.find({ reporterDiscord: req.user.id })
+            .sort({ createdAt: -1 })
+            .limit(500);
+        const slim = list.map(v => {
+            const obj = v.toObject();
+            obj.hasPhoto = !!obj.photo;
+            delete obj.photo;
+            return obj;
+        });
+        res.json({ list: slim });
     } catch (e) {
         console.error("❌ فشل تحميل مخالفاتي:", e);
         res.status(500).json({ error: "تعذر تحميل مخالفاتك، حاول مرة ثانية" });
+    }
+});
+
+// جلب صورة مخالفة واحدة عند الطلب فقط (مو ضمن القائمة) — يسرّع تحميل القوائم
+app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
+    try {
+        const v = await Violation.findById(req.params.id).select("photo reporterDiscord");
+        if (!v) return res.status(404).json({ error: "المخالفة غير موجودة" });
+        const settings = await getSettings();
+        const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id) || settings.adminList.includes(req.user.id);
+        if (!allowed) return res.status(403).json({ error: "غير مصرح" });
+        res.json({ photo: v.photo || null });
+    } catch (e) {
+        console.error("❌ فشل تحميل صورة المخالفة:", e);
+        res.status(500).json({ error: "تعذر تحميل الصورة" });
     }
 });
 
@@ -2080,6 +2106,15 @@ function openImageModal(src) {
     document.getElementById('img-modal-img').src = src;
     document.getElementById('img-modal').classList.add('open');
 }
+// يجيب صورة المخالفة عند الضغط فقط (بدل تحميلها كلها مع القائمة) — يسرّع تحميل الصفحة
+async function viewViolationPhoto(id) {
+    try {
+        toast('جارِ تحميل الصورة...');
+        const { photo } = await api('/api/violations/' + id + '/photo');
+        if (!photo) return toast('لا توجد صورة');
+        openImageModal(photo);
+    } catch (e) { toast(e.message); }
+}
 function closeImageModal() {
     document.getElementById('img-modal').classList.remove('open');
     document.getElementById('img-modal-img').src = '';
@@ -2447,7 +2482,7 @@ async function loadMine(silent) {
         if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);">لا توجد مخالفات مسجلة بعد</p>'; return; }
         box.innerHTML = \`<table><tr><th></th><th>النوع</th><th>المركبة</th><th>اللوحة</th><th>الحالة</th></tr>\` +
             list.map(v => \`<tr>
-                <td>\${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : '—'}</td>
+                <td>\${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض</button>\` : '—'}</td>
                 <td>\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</td><td>\${v.vehicle}</td><td>\${v.plateNumber}</td>
                 <td><span class="badge \${v.status}">\${v.status === 'pending' ? 'قيد المراجعة' : v.status === 'approved' ? 'مقبولة' : 'مرفوضة'}</span>\${v.status === 'rejected' && v.rejectReason ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">\${v.rejectReason}</div>\` : ''}</td>
             </tr>\`).join('') + '</table>';
@@ -3704,6 +3739,12 @@ app.use((err, req, res, next) => {
 
 process.on("unhandledRejection", (err) => {
     console.error("❌ Unhandled Rejection:", err);
+});
+
+// حماية أخيرة: لو صار خطأ متزامن غير متوقع بأي مكان (مثلاً بأحداث البوت)، نسجّله فقط
+// بدل ما نخلي نود.js يوقف السيرفر كامل ويسبب صفحة بيضاء لكل الزوار لين يعيد Render تشغيله
+process.on("uncaughtException", (err) => {
+    console.error("❌ Uncaught Exception:", err);
 });
 
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
