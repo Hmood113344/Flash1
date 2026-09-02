@@ -1022,7 +1022,8 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
         const v = await Violation.findById(req.params.id).select("photo reporterDiscord");
         if (!v) return res.status(404).json({ error: "المخالفة غير موجودة" });
         const settings = await getSettings();
-        const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id) || settings.adminList.includes(req.user.id);
+        const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id) || settings.adminList.includes(req.user.id)
+            || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
         res.json({ photo: v.photo || null });
     } catch (e) {
@@ -1100,7 +1101,15 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
 // ── مسارات الإداري المعيَّن (قبول/رفض فقط) ──────────────────────────────
 app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
     const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 });
-    res.json({ list });
+    // نرسل بدون محتوى الصورة الثقيل (base64) — بس علم إذا فيه صورة أو لا، عشان الصفحة ما تعلّق
+    // الصورة الكاملة تنجاب عند الضغط عليها فقط عبر /api/violations/:id/photo
+    const slim = list.map(v => {
+        const obj = v.toObject();
+        obj.hasPhoto = !!obj.photo;
+        delete obj.photo;
+        return obj;
+    });
+    res.json({ list: slim });
 });
 
 app.post("/api/admin/violations/:id/approve", ensureAnyAdmin, async (req, res) => {
@@ -1613,7 +1622,14 @@ app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
         const ids = await getSectorMemberIds(req.sectorInfo.sector);
         if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
         const list = ids.length ? await Violation.find({ reporterDiscord: { $in: ids }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
-        res.json({ list, canReview: canReviewSector(req.sectorInfo) });
+        // بدون محتوى الصورة الثقيل مع القائمة — تنجاب عند الضغط عليها فقط
+        const slim = list.map(v => {
+            const obj = v.toObject();
+            obj.hasPhoto = !!obj.photo;
+            delete obj.photo;
+            return obj;
+        });
+        res.json({ list: slim, canReview: canReviewSector(req.sectorInfo) });
     } catch (e) {
         console.error("❌ فشل تحميل مخالفات القطاع:", e);
         res.status(500).json({ error: "تعذر تحميل مخالفات القطاع، حاول مرة ثانية" });
@@ -1898,7 +1914,14 @@ app.get("/api/personnel-officer/violations", ensurePersonnelOfficer, async (req,
     const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
     const juniorIds = ids.length ? (await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, "discord")).map(p => p.discord) : [];
     const list = juniorIds.length ? await Violation.find({ reporterDiscord: { $in: juniorIds }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
-    res.json({ list });
+    // بدون محتوى الصورة الثقيل مع القائمة — تنجاب عند الضغط عليها فقط
+    const slim = list.map(v => {
+        const obj = v.toObject();
+        obj.hasPhoto = !!obj.photo;
+        delete obj.photo;
+        return obj;
+    });
+    res.json({ list: slim });
 });
 
 app.post("/api/personnel-officer/violations/:id/approve", ensurePersonnelOfficer, async (req, res) => {
@@ -2751,7 +2774,7 @@ async function loadPending() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">🧪 تقرير مكافحة المخدرات — \${v.reportCategory}</div>
@@ -2773,7 +2796,7 @@ async function loadPending() {
         <div class="card">
             <div class="row">
                 <div class="row" style="gap:10px;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.violationType}</div>
@@ -3102,7 +3125,7 @@ async function loadSectorViolations() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
                     <div>
                         <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
@@ -3254,7 +3277,7 @@ async function loadPoViolations() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.photo ? \`<img class="thumb" src="\${v.photo}" onclick="openImageModal('\${v.photo}')">\` : ''}
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
                     <div>
                         <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
