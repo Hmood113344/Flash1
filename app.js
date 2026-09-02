@@ -995,9 +995,14 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
     }
 });
 
-app.get("/api/violations/mine", ensureAuth, async (req, res) => {
-    const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 }).allowDiskUse(true);
-    res.json({ list });
+app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
+    try {
+        const list = await Violation.find({ reporterDiscord: req.user.id }).sort({ createdAt: -1 }).limit(500);
+        res.json({ list });
+    } catch (e) {
+        console.error("❌ فشل تحميل مخالفاتي:", e);
+        res.status(500).json({ error: "تعذر تحميل مخالفاتك، حاول مرة ثانية" });
+    }
 });
 
 // ── تقارير مديرية مكافحة المخدرات ────────────────────────────────────────
@@ -1578,10 +1583,15 @@ app.get("/api/sector/members", ensureSectorLeader, async (req, res) => {
 });
 
 app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
-    const ids = await getSectorMemberIds(req.sectorInfo.sector);
-    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const list = ids.length ? await Violation.find({ reporterDiscord: { $in: ids }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
-    res.json({ list, canReview: canReviewSector(req.sectorInfo) });
+    try {
+        const ids = await getSectorMemberIds(req.sectorInfo.sector);
+        if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+        const list = ids.length ? await Violation.find({ reporterDiscord: { $in: ids }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
+        res.json({ list, canReview: canReviewSector(req.sectorInfo) });
+    } catch (e) {
+        console.error("❌ فشل تحميل مخالفات القطاع:", e);
+        res.status(500).json({ error: "تعذر تحميل مخالفات القطاع، حاول مرة ثانية" });
+    }
 });
 
 app.post("/api/sector/violations/:id/approve", ensureSectorLeader, async (req, res) => {
@@ -3682,6 +3692,18 @@ init();
 </script>
 </body>
 </html>`);
+});
+
+// معالج أخطاء عام: أي خطأ غير متوقع بأي راوت (بدل ما يرجع صفحة HTML فاضية تسبب "خطأ" عامة بالواجهة)
+// نطبعه بالسجل ونرجع JSON واضح للمتصفح عشان يقدر يعرض الرسالة الحقيقية
+app.use((err, req, res, next) => {
+    console.error("❌ خطأ غير متوقع بالسيرفر:", err);
+    if (res.headersSent) return next(err);
+    res.status(500).json({ error: err.message || "صار خطأ غير متوقع، حاول مرة ثانية" });
+});
+
+process.on("unhandledRejection", (err) => {
+    console.error("❌ Unhandled Rejection:", err);
 });
 
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
