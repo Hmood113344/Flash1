@@ -2034,7 +2034,7 @@ app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
     res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {} });
 });
 
-const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد" };
+const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد", attendanceOfficer: "مسؤول تحضير" };
 
 app.post("/api/senior/sectors/:sector/assign", ensureSeniorAdmin, async (req, res) => {
     const { sector } = req.params;
@@ -2543,7 +2543,8 @@ app.get("/", (req, res) => {
     .fp-wrap { max-width: 420px; margin: 40px auto; text-align: center; padding: 0 16px; }
     .fp-circle { width: 160px; height: 160px; border-radius: 50%; border: 4px solid var(--border); background: var(--panel); display: flex; align-items: center; justify-content: center; margin: 20px auto; cursor: pointer; user-select: none; position: relative; overflow: hidden; transition: 0.15s; }
     .fp-circle .fp-fill { position: absolute; bottom: 0; left: 0; width: 100%; height: 0%; background: linear-gradient(180deg, var(--gold), var(--green)); transition: height linear; opacity: 0.55; }
-    .fp-circle .fp-icon { font-size: 56px; position: relative; z-index: 2; }
+    .fp-circle .fp-icon { font-size: 56px; position: relative; z-index: 2; color: var(--gold-soft); }
+    .fp-circle .fp-icon svg { width: 68px; height: 68px; display: block; }
     .fp-circle.scanning { border-color: var(--gold); box-shadow: 0 0 25px rgba(59,130,246,0.5); }
     .fp-status { margin-top: 14px; font-size: 14px; min-height: 20px; }
     .fp-status.ok { color: #4ade80; }
@@ -2877,9 +2878,7 @@ async function init() {
     lastKnownRank = ME.rank;
     buildNav();
     if (!ME.registeredName || !ME.unit) { renderSetup(); return; }
-    let att;
-    try { att = await api('/api/attendance/status'); } catch (e) { att = { status: 'out' }; }
-    if (att.status !== 'in') { renderFingerprint('checkin'); return; }
+    try { ME.attendanceStatus = (await api('/api/attendance/status')).status; } catch (e) { ME.attendanceStatus = 'out'; }
     renderDashboard();
     checkPendingWarning();
     startPolling();
@@ -3057,7 +3056,7 @@ async function doSetup() {
     try { await api('/api/profile/setup', { method: 'POST', body: JSON.stringify({ name, unit }) }); init(); }
     catch (e) { toast(e.message); }
 }
-// ── بوابة البصمة/التحضير — تظهر إلزامياً أول ما يسجل دخول (وعند الانصراف) ──
+// ── شاشة البصمة/التحضير — تُفتح بزر اختياري من الصفحة الرئيسية (تسجيل حضور/انصراف)، ليست بوابة إلزامية عند الدخول ──
 let fpHoldTimer = null, fpHoldStart = 0, fpScanning = false;
 function renderFingerprint(mode) {
     document.getElementById('app').innerHTML = \`
@@ -3068,10 +3067,19 @@ function renderFingerprint(mode) {
                 onmousedown="fpHoldStart_()" onmouseup="fpHoldEnd_()" onmouseleave="fpHoldEnd_()"
                 ontouchstart="fpHoldStart_(event)" ontouchend="fpHoldEnd_()">
                 <div class="fp-fill" id="fp-fill"></div>
-                <div class="fp-icon">🖐️</div>
+                <div class="fp-icon">
+                    <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linecap="round">
+                        <path d="M50 30 C35 30 25 42 25 55 C25 65 28 72 33 80" />
+                        <path d="M50 22 C68 22 82 38 82 56 C82 63 81 70 78 76" />
+                        <path d="M50 38 C41 38 34 46 34 55 C34 68 40 76 46 83" />
+                        <path d="M50 46 C45 46 42 50 42 55 C42 63 45 69 50 74" />
+                        <path d="M58 46 C63 49 66 53 67 60 C68 68 66 75 61 82" />
+                        <path d="M50 22 C32 22 18 37 18 55 C18 60 18.5 65 20 70" />
+                    </svg>
+                </div>
             </div>
             <div class="fp-status" id="fp-status"></div>
-            \${mode === 'checkout' ? '<button class="btn gray sm" onclick="renderDashboard()" style="margin-top:10px;">إلغاء</button>' : ''}
+            <button class="btn gray sm" onclick="renderDashboard()" style="margin-top:10px;">إلغاء</button>
         </div>\`;
     window.__fpMode = mode;
 }
@@ -3107,7 +3115,7 @@ async function doFingerprintScan() {
         } else {
             statusEl.textContent = data.status === 'in' ? '✅ تم تسجيل الحضور' : '✅ تم تسجيل الانصراف';
             statusEl.className = 'fp-status ok';
-            setTimeout(() => { data.status === 'in' ? init() : renderFingerprint('checkin'); }, 900);
+            setTimeout(() => { init(); }, 900);
         }
     } catch (e) {
         statusEl.textContent = 'تعذر الاتصال — ' + e.message;
@@ -3129,7 +3137,9 @@ function renderDashboard() {
             <div class="row" style="gap:8px;">
                 \${ME.isAdmin ? '<button class="btn gray sm" onclick="renderAdmin()">لوحة الإدارة</button>' : ''}
                 \${ME.sectorInfo ? \`<button class="btn gray sm" onclick="renderSectorPanel()">قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
-                <button class="btn gray sm" onclick="renderFingerprint('checkout')">🚪 تسجيل الانصراف</button>
+                \${ME.attendanceStatus === 'in'
+                    ? '<button class="btn gray sm" onclick="renderFingerprint(\'checkout\')">🚪 تسجيل الانصراف</button>'
+                    : '<button class="btn sm" onclick="renderFingerprint(\'checkin\')">🖐️ سجّل حضورك</button>'}
                 <a class="btn gray sm" href="/auth/logout">خروج</a>
             </div>
         </div>
@@ -3746,14 +3756,23 @@ function renderSectorsBox() {
                 </div>
             </div>
             <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول الأفراد يتحكم بالأعضاء من رتبة رئيس رقباء وتحت فقط (ملاحظات، تحذيرات، ومخالفاتهم) — وطلبات الترقية/التنزيل اللي يسويها تروح لك أو للنائب بصفحة "ترقيات الأفراد" داخل لوحة قيادة القطاع للموافقة عليها.</div>
+            <div class="row" style="margin-top:8px;">
+                <span>مسؤول التحضير: <b style="color:\${sec.attendanceOfficerName ? '#4ade80' : 'var(--muted)'};">\${sec.attendanceOfficerName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openSectorPicker('\${key}','attendanceOfficer')">مسؤول تحضير \${label}</button>
+                    \${sec.attendanceOfficerName ? \`<button class="btn danger sm" onclick="removeSectorRole('\${key}','attendanceOfficer')">إزالة</button>\` : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول التحضير يشوف حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) وآخر سجل حضور/انصراف لكل واحد منهم.</div>
             <div id="picker-\${key}-commander"></div>
             <div id="picker-\${key}-deputy"></div>
             <div id="picker-\${key}-personnelOfficer"></div>
+            <div id="picker-\${key}-attendanceOfficer"></div>
         </div>\`;
     }).join('');
 }
 function openSectorPicker(sectorKey, role) {
-    ['commander', 'deputy', 'personnelOfficer'].forEach(r => {
+    ['commander', 'deputy', 'personnelOfficer', 'attendanceOfficer'].forEach(r => {
         Object.keys(sectorsCache.sectors).forEach(k => {
             const el = document.getElementById('picker-' + k + '-' + r);
             if (el && (k !== sectorKey || r !== role)) el.innerHTML = '';
