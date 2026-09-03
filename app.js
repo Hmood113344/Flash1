@@ -1028,6 +1028,14 @@ app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
 });
 
 // جلب صورة مخالفة واحدة عند الطلب فقط (مو ضمن القائمة) — يسرّع تحميل القوائم
+const photoUrlCache = new Map(); // violationId -> { url, fetchedAt } — نتجنب نرجع نسأل ديسكورد كل ضغطة
+const PHOTO_CACHE_MS = 20 * 60 * 60 * 1000; // روابط مرفقات ديسكورد صالحة تقريباً 24 ساعة، نجدد قبل لا تنتهي
+function withTimeout(promise, ms) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms)),
+    ]);
+}
 app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
     try {
         const v = await Violation.findById(req.params.id).select("photo photoChannelId photoMessageId reporterDiscord");
@@ -1037,15 +1045,25 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
             || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
 
-        // الصورة محفوظة كمرفق برسالة ديسكورد — نجيب رابطها الطازج كل مرة (روابط مرفقات ديسكورد تنتهي صلاحيتها بعد فترة)
+        // الصورة محفوظة كمرفق برسالة ديسكورد — نجيب رابطها الطازج (روابط مرفقات ديسكورد تنتهي صلاحيتها بعد فترة)
         if (v.photoChannelId && v.photoMessageId) {
+            const cacheKey = v._id.toString();
+            const cached = photoUrlCache.get(cacheKey);
+            if (cached && (Date.now() - cached.fetchedAt) < PHOTO_CACHE_MS) {
+                return res.json({ photo: cached.url });
+            }
             try {
-                const channel = await client.channels.fetch(v.photoChannelId);
-                const msg = await channel.messages.fetch(v.photoMessageId);
+                // مهلة 10 ثواني بدل ما ننتظر إعادة محاولات ديسكورد التلقائية اللي ممكن توصل دقيقتين
+                const channel = client.channels.cache.get(v.photoChannelId) || await withTimeout(client.channels.fetch(v.photoChannelId), 10000);
+                const msg = await withTimeout(channel.messages.fetch(v.photoMessageId), 10000);
                 const att = msg.attachments.first();
-                if (att) return res.json({ photo: att.url });
+                if (att) {
+                    photoUrlCache.set(cacheKey, { url: att.url, fetchedAt: Date.now() });
+                    return res.json({ photo: att.url });
+                }
             } catch (e) {
                 console.error("❌ فشل جلب صورة المخالفة من ديسكورد:", e.message);
+                if (!v.photo) return res.status(503).json({ error: "تعذر جلب الصورة من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
                 // نكمل تحت لو فيه صورة احتياطية بقاعدة البيانات
             }
         }
@@ -2069,6 +2087,7 @@ app.get("/", (req, res) => {
     #photo-page .pp-back { background: none; border: none; color: #fff; font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 10px 14px; -webkit-tap-highlight-color: transparent; }
     #photo-page .pp-body { flex: 1; display: flex; align-items: center; justify-content: center; overflow: auto; touch-action: pinch-zoom; }
     #photo-page .pp-body img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    #photo-page .pp-loading { color: #cbd5e1; font-size: 14px; text-align: center; padding: 20px; }
 
     /* ── تحذير / إشعار (شاشة كاملة) ────────────────────────────────── */
     #warn-overlay { display: none; position: fixed; inset: 0; z-index: 3000; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 20px; text-align: center; }
@@ -2123,7 +2142,10 @@ app.get("/", (req, res) => {
 <div id="toast"></div>
 <div id="photo-page">
     <div class="pp-bar"><button class="pp-back" onclick="closePhotoPage()">‹ رجوع</button></div>
-    <div class="pp-body" onclick="if(event.target===this) closePhotoPage()"><img id="photo-page-img" src=""></div>
+    <div class="pp-body" onclick="if(event.target===this) closePhotoPage()">
+        <div id="photo-page-loading" class="pp-loading">جارِ تحميل الصورة...</div>
+        <img id="photo-page-img" src="" style="display:none;">
+    </div>
 </div>
 <footer><p>جميع الحقوق محفوظة © 2026 | <span style="color:#d4af37;font-weight:bold;">${CONFIG.SITE_NAME}</span></p></footer>
 
@@ -2153,11 +2175,24 @@ function toast(msg) {
     setTimeout(() => t.style.display = 'none', 2800);
 }
 // صفحة عرض الصورة بملء الشاشة (نفس أسلوب ديسكورد) — تفتح كصفحة ثانية فوق الموقع بدل نافذة منبثقة صغيرة
-function openPhotoPage(src) {
-    if (!src) return;
-    document.getElementById('photo-page-img').src = src;
+function openPhotoPage() {
+    const loading = document.getElementById('photo-page-loading');
+    const img = document.getElementById('photo-page-img');
+    loading.textContent = 'جارِ تحميل الصورة...';
+    loading.style.display = 'block';
+    img.style.display = 'none';
+    img.src = '';
     document.getElementById('photo-page').classList.add('open');
     history.pushState({ photoPage: true }, '');
+}
+function setPhotoPageImage(src) {
+    document.getElementById('photo-page-loading').style.display = 'none';
+    const img = document.getElementById('photo-page-img');
+    img.src = src;
+    img.style.display = 'block';
+}
+function setPhotoPageError(msg) {
+    document.getElementById('photo-page-loading').textContent = msg + ' — اضغط رجوع وحاول مرة ثانية';
 }
 function closePhotoPage(skipHistory) {
     document.getElementById('photo-page').classList.remove('open');
@@ -2170,12 +2205,12 @@ window.addEventListener('popstate', () => {
 });
 // يجيب صورة المخالفة عند الضغط فقط (بدل تحميلها كلها مع القائمة) — يسرّع تحميل الصفحة
 async function viewViolationPhoto(id) {
+    openPhotoPage();
     try {
-        toast('جارِ تحميل الصورة...');
         const { photo } = await api('/api/violations/' + id + '/photo');
-        if (!photo) return toast('لا توجد صورة');
-        openPhotoPage(photo);
-    } catch (e) { toast(e.message); }
+        if (!photo) return setPhotoPageError('لا توجد صورة');
+        setPhotoPageImage(photo);
+    } catch (e) { setPhotoPageError(e.message); }
 }
 
 // ── فورم إرسال تحذير/إشعار (فورم مخصص للموقع، مو نوافذ نظام الجهاز الافتراضية) ──
