@@ -70,6 +70,9 @@ const CONFIG = {
     // ── نظام البصمة/التحضير ──
     FP_HOLD_SECONDS: 3,   // مدة الضغط المطلوبة على البصمة
     FP_FAIL_RATE: 0.2,    // احتمال فشل البصمة عشوائياً
+    // لو ما وصلت أي "نبضة" من جهاز العضو (يعني طلع من الموقع/سكر التبويب) خلال هذي المدة وهو مسجّل "حاضر"،
+    // نعتبره منصرف تلقائياً ولازم يبصم من جديد. طالما الموقع مفتوح عنده (حتى لو قاعد ساعة) ما يصير تسجيل خروج تلقائي.
+    ATTENDANCE_TIMEOUT_MS: 5 * 60 * 1000,
 
     VIOLATION_TYPES: [
         "تجاوز السرعة المحددة",
@@ -231,6 +234,7 @@ const AttendanceStatusSchema = new mongoose.Schema({
     status: { type: String, enum: ["in", "out"], default: "out" },
     lastCheckInAt: { type: Date, default: null },
     lastCheckOutAt: { type: Date, default: null },
+    lastHeartbeatAt: { type: Date, default: null }, // آخر نبضة وهو مسجّل حاضر — نستخدمها لكشف طلوعه من الموقع بدون ما يسجل انصراف
     todayCount: { type: Number, default: 0 },
     updatedAt: { type: Date, default: Date.now },
 });
@@ -1088,13 +1092,42 @@ app.post("/api/profile/setup", ensureAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════
 // نظام البصمة/التحضير — بوابة إلزامية بعد تسجيل الدخول
 // ══════════════════════════════════════════════════════════════════════════
+// يفحص هل انقطعت "نبضات" العضو أكثر من ATTENDANCE_TIMEOUT_MS وهو مسجّل حاضر (يعني طلع من الموقع/سكر التبويب
+// بدون تسجيل انصراف يدوي) — إذا صار كذا نسجّله منصرف تلقائياً ونطلب منه يبصم من جديد. غير كذا نجدد نبضته.
+async function checkAttendanceTimeout(st, req) {
+    if (!st || st.status !== "in") return st;
+    const now = new Date();
+    if (st.lastHeartbeatAt && (now - st.lastHeartbeatAt) > CONFIG.ATTENDANCE_TIMEOUT_MS) {
+        st.status = "out";
+        st.lastCheckOutAt = now;
+        st.lastHeartbeatAt = null;
+        await st.save();
+        await AttendanceLog.create({
+            discord: req.user.id, discordTag: st.discordTag,
+            registeredName: st.registeredName, unit: st.unit, rank: st.rank,
+            type: "out", at: now,
+        });
+    } else {
+        st.lastHeartbeatAt = now;
+        await st.save();
+    }
+    return st;
+}
 app.get("/api/attendance/status", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     let st = await AttendanceStatus.findOne({ discord: req.user.id });
+    st = await checkAttendanceTimeout(st, req);
     res.json({
         status: st ? st.status : "out",
         lockAttendance: !!settings.lockAttendance,
     });
+});
+
+// نبضة دورية ترسلها الواجهة كل شوي طالما الموقع مفتوح عند العضو وهو مسجّل حاضر — تجدد مهلة الـ 5 دقايق
+app.post("/api/attendance/heartbeat", ensureAuth, async (req, res) => {
+    let st = await AttendanceStatus.findOne({ discord: req.user.id });
+    st = await checkAttendanceTimeout(st, req);
+    res.json({ status: st ? st.status : "out" });
 });
 
 app.post("/api/attendance/scan", ensureAuth, async (req, res) => {
@@ -2684,6 +2717,7 @@ let reportVehiclePhoto = null;
 let currentAdminTab = null;
 let pollTimer = null;
 let blockedPollTimer = null;
+let attHeartbeatTimer = null;
 
 async function api(url, opts) {
     const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -2905,6 +2939,7 @@ function buildNav() {
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
     if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
+    if (ME.attendanceOfficerInfo) items.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
     items.push({ label: '🚪 خروج', fn: "location.href='/auth/logout'" });
     links.innerHTML = items.map(i => \`<button onclick="\${i.fn}">\${i.label}</button>\`).join('');
     mobile.innerHTML = items.map(i => \`<button onclick="\${i.fn}; closeMobileMenu();">\${i.label}</button>\`).join('');
@@ -2914,6 +2949,7 @@ function renderFabs() {
     if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
     if (ME.sectorInfo) fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
+    if (ME.attendanceOfficerInfo) fabs.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
     return fabs.map((f, i) => \`<button class="fab" style="bottom:\${25 + i * 65}px;" onclick="\${f.fn}">\${f.label}</button>\`).join('');
 }
 function toggleMobileMenu() { document.getElementById('mobile-menu').classList.toggle('open'); }
@@ -2973,6 +3009,21 @@ async function submitLeaveRequest() {
 function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollTick, 5000);
+    if (attHeartbeatTimer) clearInterval(attHeartbeatTimer);
+    attHeartbeatTimer = setInterval(sendAttendanceHeartbeat, 60000);
+    sendAttendanceHeartbeat(); // نبضة فورية عند فتح اللوحة عشان ما تنتظر أول دقيقة
+}
+// نرسلها كل دقيقة طالما اللوحة مفتوحة عنده — لو رجعت الحالة "منصرف" (يعني انقطعت نبضاته أكثر من 5 دقايق
+// بسبب طلوعه من الموقع/سكر التبويب) نوقفه فوراً ونطلب منه يبصم من جديد
+async function sendAttendanceHeartbeat() {
+    try {
+        const att = await api('/api/attendance/heartbeat', { method: 'POST' });
+        if (att.status !== 'in') {
+            clearInterval(pollTimer);
+            clearInterval(attHeartbeatTimer);
+            renderFingerprint('checkin');
+        }
+    } catch (e) { /* تجاهل فشل النبضة المؤقت (انقطاع نت لحظي) */ }
 }
 async function pollTick() {
     if (!ME || ME.blocked) return;
@@ -2981,6 +3032,7 @@ async function pollTick() {
         if (fresh.blocked) {
             // صار حظر/إيقاف/صيانة/إغلاق تسجيل وهو شغّال بالموقع — نوقفه فوراً ونعرض السبب
             clearInterval(pollTimer);
+            clearInterval(attHeartbeatTimer);
             ME = fresh;
             renderBlocked(fresh.reason);
             startBlockedRecheck();
@@ -3061,6 +3113,8 @@ async function doSetup() {
 // ── بوابة البصمة/التحضير — تظهر إلزامياً أول ما يسجل دخول (وعند الانصراف) ──
 let fpHoldTimer = null, fpHoldStart = 0, fpScanning = false;
 function renderFingerprint(mode) {
+    document.getElementById('nav-links').innerHTML = '';
+    document.getElementById('mobile-menu').innerHTML = '';
     document.getElementById('app').innerHTML = \`
         <div class="fp-wrap">
             <h2>\${mode === 'checkin' ? '🖐️ سجّل حضورك' : '🖐️ سجّل انصرافك'}</h2>
@@ -3957,6 +4011,33 @@ async function loadSectorAttendance() {
         return;
     }
     if (sectorPanelTab !== 'attendance') return;
+    if (!data.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بالقطاع</div>'; return; }
+    box.innerHTML = data.list.map(m => \`
+        <div class="card row">
+            <div>
+                <b>\${m.name || 'غير مسجل بالموقع'}</b>
+                <div class="sub" style="font-size:12px;color:var(--muted);">\${m.unit || '-'} • \${m.rank || '-'}</div>
+                \${!m.registeredForAttendance ? '<div style="font-size:12px;color:#fca5a5;margin-top:2px;">لم يبصم من قبل</div>' :
+                    \`<div style="font-size:11px;color:var(--muted);margin-top:2px;">آخر حضور: \${m.lastCheckInAt ? new Date(m.lastCheckInAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'} • آخر انصراف: \${m.lastCheckOutAt ? new Date(m.lastCheckOutAt).toLocaleString('ar-SA', { timeZone: 'Asia/Riyadh' }) : '-'}</div>\`}
+            </div>
+            <span class="badge \${m.status === 'in' ? 'approved' : 'pending'}">\${m.status === 'in' ? '✅ حاضر' : '⭕ منصرف'}</span>
+        </div>\`).join('');
+}
+// ── لوحة مستقلة لـ"مسؤول التحضير" (لمن ما يكون بنفس الوقت قائد/نائب قطاع) — نفس بيانات تبويب "حضور القطاع" ──
+function renderAttendanceOfficerPanel() {
+    if (!ME.attendanceOfficerInfo) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>🖐️ لوحة التحضير — \${ME.attendanceOfficerInfo.sectorLabel}</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div style="color:var(--muted);font-size:12px;margin-bottom:6px;">حضور أعضاء القطاع (المسجلين بالبصمة وغير المسجلين) وآخر سجل حضور/انصراف لكل واحد منهم.</div>
+        <div id="ao-panel-content"><div class="card">جارِ التحميل...</div></div>\`;
+    loadAttendanceOfficerPanel();
+}
+async function loadAttendanceOfficerPanel() {
+    const box = document.getElementById('ao-panel-content');
+    if (!box) return;
+    let data;
+    try { data = await api('/api/sector/attendance'); }
+    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
     if (!data.list.length) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء بالقطاع</div>'; return; }
     box.innerHTML = data.list.map(m => \`
         <div class="card row">
