@@ -774,17 +774,6 @@ function ensureAuth(req, res, next) {
     res.status(401).json({ error: "غير مسجّل دخول" });
 }
 
-// يشيل محتوى الصورة الثقيل (base64) من قائمة مخالفات ويستبدلها بعلم hasPhoto فقط
-// — يمنع تعليق الصفحة عند تحميل قوائم فيها عدد كبير من المخالفات المصوّرة
-function slimPhotos(list) {
-    return list.map(v => {
-        const obj = v.toObject ? v.toObject() : v;
-        obj.hasPhoto = !!obj.photo;
-        delete obj.photo;
-        return obj;
-    });
-}
-
 async function ensureSeniorAdmin(req, res, next) {
     if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
     if (!isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "هذا القسم لكبار المسؤولين فقط" });
@@ -1008,19 +997,16 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
 
 app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
     try {
-        // نجيب المخالفات كاملة من قاعدة البيانات (سريع لأنه بين السيرفر والداتابيس)
-        // بس نرسل للمتصفح بدون محتوى الصورة الثقيل (base64) — بس علم إذا فيه صورة أو لا
-        // عشان القائمة تتحمّل بسرعة على الجوال. الصورة الكاملة تنجاب عند الضغط عليها فقط.
-        const list = await Violation.find({ reporterDiscord: req.user.id })
-            .sort({ createdAt: -1 })
-            .limit(500);
-        const slim = list.map(v => {
-            const obj = v.toObject();
-            obj.hasPhoto = !!obj.photo;
-            delete obj.photo;
-            return obj;
-        });
-        res.json({ list: slim });
+        // نستثني محتوى الصورة الثقيل (base64) من الاستعلام نفسه بدل ما نجيبه ونرميه بعدين —
+        // هذا يقطع أبطأ جزء (نقل البيانات الضخمة بين قاعدة البيانات والسيرفر) مو بس بين السيرفر والمتصفح
+        const list = await Violation.aggregate([
+            { $match: { reporterDiscord: req.user.id } },
+            { $sort: { createdAt: -1 } },
+            { $limit: 500 },
+            { $addFields: { hasPhoto: { $cond: [{ $ifNull: ["$photo", false] }, true, false] } } },
+            { $project: { photo: 0 } }
+        ]);
+        res.json({ list });
     } catch (e) {
         console.error("❌ فشل تحميل مخالفاتي:", e);
         res.status(500).json({ error: "تعذر تحميل مخالفاتك، حاول مرة ثانية" });
@@ -1033,42 +1019,13 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
         const v = await Violation.findById(req.params.id).select("photo reporterDiscord");
         if (!v) return res.status(404).json({ error: "المخالفة غير موجودة" });
         const settings = await getSettings();
-        const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id) || settings.adminList.includes(req.user.id);
+        const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id) || settings.adminList.includes(req.user.id)
+            || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
         res.json({ photo: v.photo || null });
     } catch (e) {
         console.error("❌ فشل تحميل صورة المخالفة:", e);
         res.status(500).json({ error: "تعذر تحميل الصورة" });
-    }
-});
-
-// يفتح صورة المخالفة كصفحة مستقلة (تبويب جديد) بنفس أسلوب روابط صور ديسكورد
-// — بدل ما تنجاب الصورة كـ JSON base64 وتتحط داخل مودال، هنا نرجعها كملف صورة حقيقي
-// بهيدر Content-Type صحيح، فالمتصفح يفتحها ويعرضها مباشرة زي أي رابط صورة عادي
-app.get("/api/violations/:id/photo-file", ensureAuth, async (req, res) => {
-    try {
-        const v = await Violation.findById(req.params.id).select("photo reporterDiscord");
-        if (!v || !v.photo) return res.status(404).send("لا توجد صورة لهذه المخالفة");
-        const settings = await getSettings();
-        const allowed = v.reporterDiscord === req.user.id
-            || isSeniorAdmin(req.user.id)
-            || settings.adminList.includes(req.user.id)
-            || !!getSectorRole(req.user.id, settings)
-            || !!getPersonnelOfficerSector(req.user.id, settings);
-        if (!allowed) return res.status(403).send("غير مصرح لك بعرض هذه الصورة");
-        if (v.photo.startsWith("data:image")) {
-            const match = v.photo.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
-            if (!match) return res.status(404).send("صيغة الصورة غير صالحة");
-            const buffer = Buffer.from(match[2], "base64");
-            res.setHeader("Content-Type", match[1]);
-            res.setHeader("Cache-Control", "private, max-age=3600");
-            return res.end(buffer);
-        }
-        // لو الصورة مخزنة كرابط مباشر (نادر) نحوّل المستخدم له مباشرة
-        return res.redirect(v.photo);
-    } catch (e) {
-        console.error("❌ فشل عرض صورة المخالفة:", e);
-        res.status(500).send("تعذر تحميل الصورة");
     }
 });
 
@@ -1140,8 +1097,14 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
 
 // ── مسارات الإداري المعيَّن (قبول/رفض فقط) ──────────────────────────────
 app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
-    const list = await Violation.find({ status: "pending" }).sort({ createdAt: 1 });
-    res.json({ list: slimPhotos(list) });
+    // نستثني محتوى الصورة الثقيل من الاستعلام نفسه (مو بعد ما نجيبه) — الصورة تنجاب عند الضغط فقط
+    const list = await Violation.aggregate([
+        { $match: { status: "pending" } },
+        { $sort: { createdAt: 1 } },
+        { $addFields: { hasPhoto: { $cond: [{ $ifNull: ["$photo", false] }, true, false] } } },
+        { $project: { photo: 0 } }
+    ]);
+    res.json({ list });
 });
 
 app.post("/api/admin/violations/:id/approve", ensureAnyAdmin, async (req, res) => {
@@ -1653,8 +1616,15 @@ app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
     try {
         const ids = await getSectorMemberIds(req.sectorInfo.sector);
         if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-        const list = ids.length ? await Violation.find({ reporterDiscord: { $in: ids }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
-        res.json({ list: slimPhotos(list), canReview: canReviewSector(req.sectorInfo) });
+        // نستثني محتوى الصورة الثقيل من الاستعلام نفسه — الصورة تنجاب عند الضغط فقط
+        const list = ids.length ? await Violation.aggregate([
+            { $match: { reporterDiscord: { $in: ids }, status: "pending" } },
+            { $sort: { createdAt: -1 } },
+            { $limit: 300 },
+            { $addFields: { hasPhoto: { $cond: [{ $ifNull: ["$photo", false] }, true, false] } } },
+            { $project: { photo: 0 } }
+        ]) : [];
+        res.json({ list, canReview: canReviewSector(req.sectorInfo) });
     } catch (e) {
         console.error("❌ فشل تحميل مخالفات القطاع:", e);
         res.status(500).json({ error: "تعذر تحميل مخالفات القطاع، حاول مرة ثانية" });
@@ -1938,8 +1908,15 @@ app.get("/api/personnel-officer/violations", ensurePersonnelOfficer, async (req,
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
     const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
     const juniorIds = ids.length ? (await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, "discord")).map(p => p.discord) : [];
-    const list = juniorIds.length ? await Violation.find({ reporterDiscord: { $in: juniorIds }, status: "pending" }).sort({ createdAt: -1 }).limit(300) : [];
-    res.json({ list: slimPhotos(list) });
+    // نستثني محتوى الصورة الثقيل من الاستعلام نفسه — الصورة تنجاب عند الضغط فقط
+    const list = juniorIds.length ? await Violation.aggregate([
+        { $match: { reporterDiscord: { $in: juniorIds }, status: "pending" } },
+        { $sort: { createdAt: -1 } },
+        { $limit: 300 },
+        { $addFields: { hasPhoto: { $cond: [{ $ifNull: ["$photo", false] }, true, false] } } },
+        { $project: { photo: 0 } }
+    ]) : [];
+    res.json({ list });
 });
 
 app.post("/api/personnel-officer/violations/:id/approve", ensurePersonnelOfficer, async (req, res) => {
@@ -2058,8 +2035,13 @@ app.get("/", (req, res) => {
     .login-screen { text-align: center; padding: 4rem 2rem; }
     .login-screen h1 { font-size: 3rem; color: #3b82f6; text-shadow: 0 0 20px rgba(59,130,246,0.5); margin-bottom: 10px; }
     footer { text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--muted); font-size: 0.9rem; }
-    .thumb-btn { background: rgba(212,175,55,0.12); border: 1px solid var(--gold); color: var(--gold-soft); border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; }
-    .thumb-btn:hover { background: rgba(212,175,55,0.22); }
+    /* صفحة عرض الصورة بملء الشاشة — نفس أسلوب ديسكورد */
+    #photo-page { display: none; position: fixed; inset: 0; z-index: 5000; background: #000; flex-direction: column; }
+    #photo-page.open { display: flex; }
+    #photo-page .pp-bar { display: flex; align-items: center; padding: env(safe-area-inset-top,14px) 8px 10px; background: rgba(0,0,0,0.55); flex-shrink: 0; }
+    #photo-page .pp-back { background: none; border: none; color: #fff; font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 10px 14px; -webkit-tap-highlight-color: transparent; }
+    #photo-page .pp-body { flex: 1; display: flex; align-items: center; justify-content: center; overflow: auto; touch-action: pinch-zoom; }
+    #photo-page .pp-body img { max-width: 100%; max-height: 100%; object-fit: contain; }
 
     /* ── تحذير / إشعار (شاشة كاملة) ────────────────────────────────── */
     #warn-overlay { display: none; position: fixed; inset: 0; z-index: 3000; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 20px; text-align: center; }
@@ -2112,6 +2094,10 @@ app.get("/", (req, res) => {
 <div class="mobile-menu" id="mobile-menu"></div>
 <div class="wrap" id="app"><div class="card center">جارِ التحميل...</div></div>
 <div id="toast"></div>
+<div id="photo-page">
+    <div class="pp-bar"><button class="pp-back" onclick="closePhotoPage()">‹ رجوع</button></div>
+    <div class="pp-body" onclick="if(event.target===this) closePhotoPage()"><img id="photo-page-img" src=""></div>
+</div>
 <footer><p>جميع الحقوق محفوظة © 2026 | <span style="color:#d4af37;font-weight:bold;">${CONFIG.SITE_NAME}</span></p></footer>
 
 <script>
@@ -2139,11 +2125,30 @@ function toast(msg) {
     t.textContent = msg; t.style.display = 'block';
     setTimeout(() => t.style.display = 'none', 2800);
 }
-// يفتح صورة المخالفة بتبويب جديد مباشرة من الرابط (نفس أسلوب فتح صور ديسكورد) —
-// ما يجيب أي base64 ضمن الصفحة، فالقوائم تفضل خفيفة وسريعة حتى لو فيها مخالفات كثيرة
-function viewViolationPhoto(id) {
-    if (!id) return;
-    window.open('/api/violations/' + id + '/photo-file', '_blank');
+// صفحة عرض الصورة بملء الشاشة (نفس أسلوب ديسكورد) — تفتح كصفحة ثانية فوق الموقع بدل نافذة منبثقة صغيرة
+function openPhotoPage(src) {
+    if (!src) return;
+    document.getElementById('photo-page-img').src = src;
+    document.getElementById('photo-page').classList.add('open');
+    history.pushState({ photoPage: true }, '');
+}
+function closePhotoPage(skipHistory) {
+    document.getElementById('photo-page').classList.remove('open');
+    document.getElementById('photo-page-img').src = '';
+    if (!skipHistory && history.state && history.state.photoPage) history.back();
+}
+window.addEventListener('popstate', () => {
+    const pp = document.getElementById('photo-page');
+    if (pp.classList.contains('open')) closePhotoPage(true);
+});
+// يجيب صورة المخالفة عند الضغط فقط (بدل تحميلها كلها مع القائمة) — يسرّع تحميل الصفحة
+async function viewViolationPhoto(id) {
+    try {
+        toast('جارِ تحميل الصورة...');
+        const { photo } = await api('/api/violations/' + id + '/photo');
+        if (!photo) return toast('لا توجد صورة');
+        openPhotoPage(photo);
+    } catch (e) { toast(e.message); }
 }
 
 // ── فورم إرسال تحذير/إشعار (فورم مخصص للموقع، مو نوافذ نظام الجهاز الافتراضية) ──
@@ -2777,7 +2782,7 @@ async function loadPending() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.hasPhoto ? \`<button class="thumb-btn" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">🧪 تقرير مكافحة المخدرات — \${v.reportCategory}</div>
@@ -2799,7 +2804,7 @@ async function loadPending() {
         <div class="card">
             <div class="row">
                 <div class="row" style="gap:10px;">
-                    \${v.hasPhoto ? \`<button class="thumb-btn" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
                     <div>
                         <b>\${v.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.violationType}</div>
@@ -3128,7 +3133,7 @@ async function loadSectorViolations() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.hasPhoto ? \`<button class="thumb-btn" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
                     <div>
                         <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
@@ -3280,7 +3285,7 @@ async function loadPoViolations() {
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div class="row" style="gap:10px;align-items:flex-start;">
-                    \${v.hasPhoto ? \`<button class="thumb-btn" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
+                    \${v.hasPhoto ? \`<button class="btn sm gray" onclick="viewViolationPhoto('\${v._id}')">📷 عرض الصورة</button>\` : ''}
                     <div>
                         <b>\${v.reporterName || v.reporterTag}</b> <span style="color:var(--muted);font-size:12px;">(\${v.reporterUnit || '-'})</span>
                         <div style="color:var(--gold-soft);margin-top:4px;">\${v.kind === 'report' ? ('🧪 تقرير مكافحة مخدرات — ' + v.reportCategory) : v.violationType}</div>
