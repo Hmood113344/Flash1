@@ -162,7 +162,9 @@ const ViolationSchema = new mongoose.Schema({
     vehicle: String,
     vehiclePhoto: { type: String, default: null },
     plateNumber: String,
-    photo: { type: String, default: null }, // data URL أو رابط
+    photo: { type: String, default: null }, // احتياطي فقط — يُستخدم بس لو تعذر رفع الصورة لديسكورد (نادراً)
+    photoChannelId: { type: String, default: null }, // الصورة الحقيقية محفوظة كمرفق برسالة بقناة ديسكورد، مو بقاعدة البيانات
+    photoMessageId: { type: String, default: null },
     status: { type: String, default: "pending" },
     rejectReason: { type: String, default: null },
     reviewedBy: String,
@@ -491,25 +493,39 @@ function buildViolationButtons(id, disabled = false) {
 }
 
 // إرسال المخالفة تلقائياً لقناة المخالفات فور تسجيلها من الموقع
-async function postViolationToChannel(v) {
+// يرفع صورة المخالفة كمرفق برسالة القناة، ويحفظ مرجع الرسالة بدل ما يخزن الصورة نفسها بقاعدة البيانات.
+// إذا تعذر الرفع لأي سبب (البوت متوقف، القناة محذوفة...) نحفظ الصورة احتياطياً بقاعدة البيانات عشان ما تضيع.
+async function postViolationToChannel(v, rawPhoto) {
     const settings = await getSettings();
-    if (!botReady || !settings.violationsChannelId) return;
+    if (!botReady || !settings.violationsChannelId) {
+        if (rawPhoto) { v.photo = rawPhoto; await v.save().catch(() => {}); }
+        return;
+    }
     try {
         const channel = await client.channels.fetch(settings.violationsChannelId);
         const embed = buildViolationEmbed(v);
         const components = [buildViolationButtons(v._id.toString())];
         const files = [];
-        if (v.photo && v.photo.startsWith("data:image")) {
-            const base64Data = v.photo.split(",")[1];
+        if (rawPhoto && rawPhoto.startsWith("data:image")) {
+            const base64Data = rawPhoto.split(",")[1];
             const buffer = Buffer.from(base64Data, "base64");
-            const ext = v.photo.includes("image/png") ? "png" : "jpg";
+            const ext = rawPhoto.includes("image/png") ? "png" : "jpg";
             const fname = `violation_${v._id}.${ext}`;
             files.push(new AttachmentBuilder(buffer, { name: fname }));
             embed.setImage(`attachment://${fname}`);
         }
         const msg = await channel.send({ embeds: [embed], components, files });
         pendingMessages.set(v._id.toString(), { channelId: msg.channelId, messageId: msg.id });
-    } catch (e) { console.error("❌ فشل إرسال المخالفة للقناة:", e.message); }
+        if (rawPhoto) {
+            v.photoChannelId = msg.channelId;
+            v.photoMessageId = msg.id;
+            await v.save();
+        }
+    } catch (e) {
+        console.error("❌ فشل إرسال المخالفة للقناة:", e.message);
+        // احتياط: لا نخسر الصورة لو فشل الرفع لديسكورد
+        if (rawPhoto) { v.photo = rawPhoto; await v.save().catch(() => {}); }
+    }
 }
 
 // تحديث رسالة المخالفة بالقناة بعد قبول/رفض (سواء من البوت أو من الموقع)
@@ -985,10 +1001,9 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
             reporterDiscord: req.user.id, reporterTag: req.user.username,
             reporterName: p.registeredName, reporterUnit: p.unit,
             violationType, vehicle, vehiclePhoto: vehicleDoc?.photo || null,
-            photo: photo || null,
             plateNumber: generatePlate(), status: "pending",
         });
-        postViolationToChannel(v).catch(() => {});
+        await postViolationToChannel(v, photo);
         res.json({ ok: true, violation: v });
     } finally {
         violationLocks.delete(req.user.id);
@@ -997,14 +1012,13 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
 
 app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
     try {
-        // نستثني محتوى الصورة الثقيل (base64) من الاستعلام نفسه بدل ما نجيبه ونرميه بعدين —
-        // هذا يقطع أبطأ جزء (نقل البيانات الضخمة بين قاعدة البيانات والسيرفر) مو بس بين السيرفر والمتصفح
+        // نشيل الصورة الثقيلة (base64) *قبل* الفرز — لو فرزنا والصورة لسا موجودة يتجاوز حد الذاكرة المسموح لفرز MongoDB ويطيح بخطأ
         const list = await Violation.aggregate([
             { $match: { reporterDiscord: req.user.id } },
+            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+            { $project: { photo: 0 } },
             { $sort: { createdAt: -1 } },
-            { $limit: 500 },
-            { $addFields: { hasPhoto: { $cond: [{ $ifNull: ["$photo", false] }, true, false] } } },
-            { $project: { photo: 0 } }
+            { $limit: 500 }
         ]);
         res.json({ list });
     } catch (e) {
@@ -1016,12 +1030,25 @@ app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
 // جلب صورة مخالفة واحدة عند الطلب فقط (مو ضمن القائمة) — يسرّع تحميل القوائم
 app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
     try {
-        const v = await Violation.findById(req.params.id).select("photo reporterDiscord");
+        const v = await Violation.findById(req.params.id).select("photo photoChannelId photoMessageId reporterDiscord");
         if (!v) return res.status(404).json({ error: "المخالفة غير موجودة" });
         const settings = await getSettings();
         const allowed = v.reporterDiscord === req.user.id || isSeniorAdmin(req.user.id) || settings.adminList.includes(req.user.id)
             || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings);
         if (!allowed) return res.status(403).json({ error: "غير مصرح" });
+
+        // الصورة محفوظة كمرفق برسالة ديسكورد — نجيب رابطها الطازج كل مرة (روابط مرفقات ديسكورد تنتهي صلاحيتها بعد فترة)
+        if (v.photoChannelId && v.photoMessageId) {
+            try {
+                const channel = await client.channels.fetch(v.photoChannelId);
+                const msg = await channel.messages.fetch(v.photoMessageId);
+                const att = msg.attachments.first();
+                if (att) return res.json({ photo: att.url });
+            } catch (e) {
+                console.error("❌ فشل جلب صورة المخالفة من ديسكورد:", e.message);
+                // نكمل تحت لو فيه صورة احتياطية بقاعدة البيانات
+            }
+        }
         res.json({ photo: v.photo || null });
     } catch (e) {
         console.error("❌ فشل تحميل صورة المخالفة:", e);
@@ -1086,9 +1113,9 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
             drugType: category === "مخدرات" ? drugType : null,
             drugQuantity: category === "مخدرات" ? drugQuantity : null,
             concealMethod: category === "مخدرات" ? concealMethod : null,
-            photo: photo || null, plateNumber: generatePlate(), status: "pending",
+            plateNumber: generatePlate(), status: "pending",
         });
-        postViolationToChannel(v).catch(() => {});
+        await postViolationToChannel(v, photo);
         res.json({ ok: true, report: v });
     } finally {
         reportLocks.delete(req.user.id);
@@ -1097,12 +1124,12 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
 
 // ── مسارات الإداري المعيَّن (قبول/رفض فقط) ──────────────────────────────
 app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
-    // نستثني محتوى الصورة الثقيل من الاستعلام نفسه (مو بعد ما نجيبه) — الصورة تنجاب عند الضغط فقط
+    // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
     const list = await Violation.aggregate([
         { $match: { status: "pending" } },
-        { $sort: { createdAt: 1 } },
-        { $addFields: { hasPhoto: { $cond: [{ $ifNull: ["$photo", false] }, true, false] } } },
-        { $project: { photo: 0 } }
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $project: { photo: 0 } },
+        { $sort: { createdAt: 1 } }
     ]);
     res.json({ list });
 });
@@ -1616,13 +1643,13 @@ app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
     try {
         const ids = await getSectorMemberIds(req.sectorInfo.sector);
         if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-        // نستثني محتوى الصورة الثقيل من الاستعلام نفسه — الصورة تنجاب عند الضغط فقط
+        // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
         const list = ids.length ? await Violation.aggregate([
             { $match: { reporterDiscord: { $in: ids }, status: "pending" } },
+            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+            { $project: { photo: 0 } },
             { $sort: { createdAt: -1 } },
-            { $limit: 300 },
-            { $addFields: { hasPhoto: { $cond: [{ $ifNull: ["$photo", false] }, true, false] } } },
-            { $project: { photo: 0 } }
+            { $limit: 300 }
         ]) : [];
         res.json({ list, canReview: canReviewSector(req.sectorInfo) });
     } catch (e) {
@@ -1908,13 +1935,13 @@ app.get("/api/personnel-officer/violations", ensurePersonnelOfficer, async (req,
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
     const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
     const juniorIds = ids.length ? (await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, "discord")).map(p => p.discord) : [];
-    // نستثني محتوى الصورة الثقيل من الاستعلام نفسه — الصورة تنجاب عند الضغط فقط
+    // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
     const list = juniorIds.length ? await Violation.aggregate([
         { $match: { reporterDiscord: { $in: juniorIds }, status: "pending" } },
+        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $project: { photo: 0 } },
         { $sort: { createdAt: -1 } },
-        { $limit: 300 },
-        { $addFields: { hasPhoto: { $cond: [{ $ifNull: ["$photo", false] }, true, false] } } },
-        { $project: { photo: 0 } }
+        { $limit: 300 }
     ]) : [];
     res.json({ list });
 });
