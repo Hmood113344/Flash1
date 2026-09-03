@@ -1618,6 +1618,25 @@ app.post("/api/senior/personnel/warn-all", ensureSeniorAdmin, async (req, res) =
     res.json({ ok: true, count: result.modifiedCount });
 });
 
+// إشعار جماعي لكل أعضاء قطاع معيّن (حسب رول ديسكورد الخاص بالقطاع) — لقائد ونائب القطاع فقط
+app.post("/api/sector/notice-all", ensureSectorLeader, async (req, res) => {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب النص" });
+    const memberIds = await getSectorMemberIds(req.sectorInfo.sector);
+    if (memberIds === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية" });
+    const fullReason = `📢 إشعار لقطاع ${req.sectorInfo.sectorLabel}: ${reason.trim()}`;
+    const entry = { kind: "notice", reason: fullReason, issuedBy: req.user.id, issuedByTag: req.user.username };
+    const result = await Personnel.updateMany(
+        { discord: { $in: memberIds }, registeredName: { $ne: null } },
+        { $push: { warnings: entry } }
+    );
+    await logEvent({
+        action: "إصدار إشعار قطاع", actorId: req.user.id, actorTag: req.user.username,
+        details: `📢 إشعار لقطاع ${req.sectorInfo.sectorLabel} (${result.modifiedCount}): ${reason.trim()}`,
+    });
+    res.json({ ok: true, count: result.modifiedCount });
+});
+
 // أقرب تحذير/إشعار لهذا المستخدم لسّه ما اتعاهد عليه — تستخدمها الواجهة للبولينج تعرضه بوجهه
 app.get("/api/warnings/pending", async (req, res) => {
     if (!req.isAuthenticated()) return res.json({ warning: null });
@@ -3884,7 +3903,12 @@ let sectorMembersCache = [];
 function renderSectorPanel() {
     if (!ME.sectorInfo) return renderDashboard();
     document.getElementById('app').innerHTML = \`
-        <div class="card row"><h2>🎖️ قيادة \${ME.sectorInfo.sectorLabel} (\${ME.sectorInfo.role === 'commander' ? 'قائد' : 'نائب'})</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="card row"><h2>🎖️ قيادة \${ME.sectorInfo.sectorLabel} (\${ME.sectorInfo.role === 'commander' ? 'قائد' : 'نائب'})</h2>
+            <div class="row" style="gap:8px;">
+                <button class="btn sm" style="background:#78350f;color:#fff;" onclick="openSectorNoticeForm()">📢 إشعار لأفراد القطاع</button>
+                <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
+            </div>
+        </div>
         <div class="card">
             <div class="row">
                 <span>مسؤول الأفراد: <b style="color:\${ME.sectorInfo.personnelOfficerName ? '#4ade80' : 'var(--muted)'};">\${ME.sectorInfo.personnelOfficerName || 'غير معيّن'}</b></span>
@@ -3917,6 +3941,29 @@ function renderSectorPanel() {
         </div>
         <div id="sector-content"></div>\`;
     sectorTab('members');
+}
+// ── إشعار لكل أعضاء القطاع (حسب رول ديسكورد) — لقائد ونائب القطاع فقط ─────────
+function openSectorNoticeForm() {
+    if (!ME.sectorInfo) return;
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📢 ضع نص الإشعار (سيصل لكل أعضاء \${ME.sectorInfo.sectorLabel} المسجلين بالموقع)</h3>
+        <textarea id="wf-reason-sector" placeholder="اكتب نص الإشعار هنا..."></textarea>
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitSectorNoticeForm()">إرسال لأفراد القطاع</button>
+        </div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+async function submitSectorNoticeForm() {
+    const reason = document.getElementById('wf-reason-sector').value;
+    if (!reason || !reason.trim()) return toast('لازم تكتب النص');
+    if (!confirm('متأكد تبي ترسل هذا الإشعار لكل أعضاء ' + ME.sectorInfo.sectorLabel + '؟')) return;
+    try {
+        const { count } = await api('/api/sector/notice-all', { method: 'POST', body: JSON.stringify({ reason }) });
+        toast('✅ تم الإرسال لـ ' + count + ' عضو');
+        closeWarnForm();
+    } catch (e) { toast(e.message); }
 }
 async function openAttendanceOfficerPicker() {
     const el = document.getElementById('ao-picker');
