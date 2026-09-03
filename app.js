@@ -836,9 +836,9 @@ async function ensureSectorLeader(req, res, next) {
     return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات فقط" });
 }
 
-// فقط قائد/نائب مكافحة المخدرات (أو كبار المسؤولين) يقدرون يقبلون/يرفضون مخالفات وتقارير القطاع
+// أي قائد أو نائب قطاع حقيقي (أو كبير مسؤول) يقدر يقبل/يرفض مخالفات وتقارير قطاعه
 function canReviewSector(sectorInfo) {
-    return sectorInfo.role === "senior" || sectorInfo.sector === "antiDrugs";
+    return sectorInfo.role === "senior" || sectorInfo.role === "commander" || sectorInfo.role === "deputy";
 }
 
 // يسمح لـ"مسؤول الأفراد" بالدخول لمساراته الخاصة، وكبار المسؤولين عبر ?sector= بالكويري
@@ -1015,7 +1015,7 @@ app.get("/api/violations/mine", ensureAuth, async (req, res, next) => {
         // نشيل الصورة الثقيلة (base64) *قبل* الفرز — لو فرزنا والصورة لسا موجودة يتجاوز حد الذاكرة المسموح لفرز MongoDB ويطيح بخطأ
         const list = await Violation.aggregate([
             { $match: { reporterDiscord: req.user.id } },
-            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+            { $addFields: { hasPhoto: { $or: [{ $and: [{ $ne: ["$photo", null] }, { $ne: ["$photo", ""] }] }, { $and: [{ $ne: ["$photoMessageId", null] }, { $ne: ["$photoMessageId", ""] }] }] } } },
             { $project: { photo: 0 } },
             { $sort: { createdAt: -1 } },
             { $limit: 500 }
@@ -1145,7 +1145,7 @@ app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
     // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
     const list = await Violation.aggregate([
         { $match: { status: "pending" } },
-        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $addFields: { hasPhoto: { $or: [{ $and: [{ $ne: ["$photo", null] }, { $ne: ["$photo", ""] }] }, { $and: [{ $ne: ["$photoMessageId", null] }, { $ne: ["$photoMessageId", ""] }] }] } } },
         { $project: { photo: 0 } },
         { $sort: { createdAt: 1 } }
     ]);
@@ -1664,7 +1664,7 @@ app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
         // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
         const list = ids.length ? await Violation.aggregate([
             { $match: { reporterDiscord: { $in: ids }, status: "pending" } },
-            { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+            { $addFields: { hasPhoto: { $or: [{ $and: [{ $ne: ["$photo", null] }, { $ne: ["$photo", ""] }] }, { $and: [{ $ne: ["$photoMessageId", null] }, { $ne: ["$photoMessageId", ""] }] }] } } },
             { $project: { photo: 0 } },
             { $sort: { createdAt: -1 } },
             { $limit: 300 }
@@ -1956,7 +1956,7 @@ app.get("/api/personnel-officer/violations", ensurePersonnelOfficer, async (req,
     // نشيل الصورة قبل الفرز عشان ما يتجاوز الفرز حد الذاكرة
     const list = juniorIds.length ? await Violation.aggregate([
         { $match: { reporterDiscord: { $in: juniorIds }, status: "pending" } },
-        { $addFields: { hasPhoto: { $or: [{ $ifNull: ["$photo", false] }, { $ifNull: ["$photoMessageId", false] }] } } },
+        { $addFields: { hasPhoto: { $or: [{ $and: [{ $ne: ["$photo", null] }, { $ne: ["$photo", ""] }] }, { $and: [{ $ne: ["$photoMessageId", null] }, { $ne: ["$photoMessageId", ""] }] }] } } },
         { $project: { photo: 0 } },
         { $sort: { createdAt: -1 } },
         { $limit: 300 }
