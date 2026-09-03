@@ -2878,7 +2878,9 @@ async function init() {
     lastKnownRank = ME.rank;
     buildNav();
     if (!ME.registeredName || !ME.unit) { renderSetup(); return; }
-    try { ME.attendanceStatus = (await api('/api/attendance/status')).status; } catch (e) { ME.attendanceStatus = 'out'; }
+    let att;
+    try { att = await api('/api/attendance/status'); } catch (e) { att = { status: 'out' }; }
+    if (att.status !== 'in') { renderFingerprint('checkin'); return; }
     renderDashboard();
     checkPendingWarning();
     startPolling();
@@ -3056,7 +3058,7 @@ async function doSetup() {
     try { await api('/api/profile/setup', { method: 'POST', body: JSON.stringify({ name, unit }) }); init(); }
     catch (e) { toast(e.message); }
 }
-// ── شاشة البصمة/التحضير — تُفتح بزر اختياري من الصفحة الرئيسية (تسجيل حضور/انصراف)، ليست بوابة إلزامية عند الدخول ──
+// ── بوابة البصمة/التحضير — تظهر إلزامياً أول ما يسجل دخول (وعند الانصراف) ──
 let fpHoldTimer = null, fpHoldStart = 0, fpScanning = false;
 function renderFingerprint(mode) {
     document.getElementById('app').innerHTML = \`
@@ -3079,7 +3081,7 @@ function renderFingerprint(mode) {
                 </div>
             </div>
             <div class="fp-status" id="fp-status"></div>
-            <button class="btn gray sm" onclick="renderDashboard()" style="margin-top:10px;">إلغاء</button>
+            \${mode === 'checkout' ? '<button class="btn gray sm" onclick="renderDashboard()" style="margin-top:10px;">إلغاء</button>' : ''}
         </div>\`;
     window.__fpMode = mode;
 }
@@ -3115,7 +3117,7 @@ async function doFingerprintScan() {
         } else {
             statusEl.textContent = data.status === 'in' ? '✅ تم تسجيل الحضور' : '✅ تم تسجيل الانصراف';
             statusEl.className = 'fp-status ok';
-            setTimeout(() => { init(); }, 900);
+            setTimeout(() => { data.status === 'in' ? init() : renderFingerprint('checkin'); }, 900);
         }
     } catch (e) {
         statusEl.textContent = 'تعذر الاتصال — ' + e.message;
@@ -3137,9 +3139,7 @@ function renderDashboard() {
             <div class="row" style="gap:8px;">
                 \${ME.isAdmin ? '<button class="btn gray sm" onclick="renderAdmin()">لوحة الإدارة</button>' : ''}
                 \${ME.sectorInfo ? \`<button class="btn gray sm" onclick="renderSectorPanel()">قيادة \${ME.sectorInfo.sectorLabel}</button>\` : ''}
-                \${ME.attendanceStatus === 'in'
-                    ? '<button class="btn gray sm" onclick="renderFingerprint(\'checkout\')">🚪 تسجيل الانصراف</button>'
-                    : '<button class="btn sm" onclick="renderFingerprint(\'checkin\')">🖐️ سجّل حضورك</button>'}
+                <button class="btn gray sm" onclick="renderFingerprint('checkout')">🚪 تسجيل الانصراف</button>
                 <a class="btn gray sm" href="/auth/logout">خروج</a>
             </div>
         </div>
