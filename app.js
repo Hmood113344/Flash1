@@ -70,6 +70,9 @@ const CONFIG = {
     // ── نظام البصمة/التحضير ──
     FP_HOLD_SECONDS: 3,   // مدة الضغط المطلوبة على البصمة
     FP_FAIL_RATE: 0.2,    // احتمال فشل البصمة عشوائياً
+    // لو ما وصلت أي "نبضة" من جهاز العضو (يعني طلع من الموقع/سكر التبويب) خلال هذي المدة وهو مسجّل "حاضر"،
+    // نعتبره منصرف تلقائياً ولازم يبصم من جديد. طالما الموقع مفتوح عنده ما يصير تسجيل خروج تلقائي مهما طالت المدة.
+    ATTENDANCE_TIMEOUT_MS: 60 * 60 * 1000,
 
     VIOLATION_TYPES: [
         "تجاوز السرعة المحددة",
@@ -231,6 +234,7 @@ const AttendanceStatusSchema = new mongoose.Schema({
     status: { type: String, enum: ["in", "out"], default: "out" },
     lastCheckInAt: { type: Date, default: null },
     lastCheckOutAt: { type: Date, default: null },
+    lastHeartbeatAt: { type: Date, default: null }, // آخر نبضة وهو مسجّل حاضر — نستخدمها لكشف طلوعه من الموقع بدون ما يسجل انصراف
     todayCount: { type: Number, default: 0 },
     updatedAt: { type: Date, default: Date.now },
 });
@@ -1088,13 +1092,42 @@ app.post("/api/profile/setup", ensureAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════
 // نظام البصمة/التحضير — بوابة إلزامية بعد تسجيل الدخول
 // ══════════════════════════════════════════════════════════════════════════
+// يفحص هل انقطعت "نبضات" العضو أكثر من ATTENDANCE_TIMEOUT_MS وهو مسجّل حاضر (يعني طلع من الموقع/سكر التبويب
+// بدون تسجيل انصراف يدوي) — إذا صار كذا نسجّله منصرف تلقائياً ونطلب منه يبصم من جديد. غير كذا نجدد نبضته.
+async function checkAttendanceTimeout(st, req) {
+    if (!st || st.status !== "in") return st;
+    const now = new Date();
+    if (st.lastHeartbeatAt && (now - st.lastHeartbeatAt) > CONFIG.ATTENDANCE_TIMEOUT_MS) {
+        st.status = "out";
+        st.lastCheckOutAt = now;
+        st.lastHeartbeatAt = null;
+        await st.save();
+        await AttendanceLog.create({
+            discord: req.user.id, discordTag: st.discordTag,
+            registeredName: st.registeredName, unit: st.unit, rank: st.rank,
+            type: "out", at: now,
+        });
+    } else {
+        st.lastHeartbeatAt = now;
+        await st.save();
+    }
+    return st;
+}
 app.get("/api/attendance/status", ensureAuth, async (req, res) => {
     const settings = await getSettings();
-    const st = await AttendanceStatus.findOne({ discord: req.user.id });
+    let st = await AttendanceStatus.findOne({ discord: req.user.id });
+    st = await checkAttendanceTimeout(st, req);
     res.json({
         status: st ? st.status : "out",
         lockAttendance: !!settings.lockAttendance,
     });
+});
+
+// نبضة دورية ترسلها الواجهة كل شوي طالما الموقع مفتوح عند العضو وهو مسجّل حاضر — تجدد مهلة الساعة
+app.post("/api/attendance/heartbeat", ensureAuth, async (req, res) => {
+    let st = await AttendanceStatus.findOne({ discord: req.user.id });
+    st = await checkAttendanceTimeout(st, req);
+    res.json({ status: st ? st.status : "out" });
 });
 
 app.post("/api/attendance/scan", ensureAuth, async (req, res) => {
@@ -2703,6 +2736,7 @@ let reportVehiclePhoto = null;
 let currentAdminTab = null;
 let pollTimer = null;
 let blockedPollTimer = null;
+let attHeartbeatTimer = null;
 
 async function api(url, opts) {
     const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -2994,6 +3028,21 @@ async function submitLeaveRequest() {
 function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollTick, 5000);
+    if (attHeartbeatTimer) clearInterval(attHeartbeatTimer);
+    attHeartbeatTimer = setInterval(sendAttendanceHeartbeat, 5 * 60000);
+    sendAttendanceHeartbeat(); // نبضة فورية عند فتح اللوحة
+}
+// نرسلها كل 5 دقايق طالما اللوحة مفتوحة عنده — لو رجعت الحالة "منصرف" (يعني انقطعت نبضاته أكثر من ساعة
+// بسبب طلوعه من الموقع/سكر التبويب) نوقفه فوراً ونطلب منه يبصم من جديد
+async function sendAttendanceHeartbeat() {
+    try {
+        const att = await api('/api/attendance/heartbeat', { method: 'POST' });
+        if (att.status !== 'in') {
+            clearInterval(pollTimer);
+            clearInterval(attHeartbeatTimer);
+            renderFingerprint('checkin');
+        }
+    } catch (e) { /* تجاهل فشل النبضة المؤقت (انقطاع نت لحظي) */ }
 }
 async function pollTick() {
     if (!ME || ME.blocked) return;
@@ -3002,6 +3051,7 @@ async function pollTick() {
         if (fresh.blocked) {
             // صار حظر/إيقاف/صيانة/إغلاق تسجيل وهو شغّال بالموقع — نوقفه فوراً ونعرض السبب
             clearInterval(pollTimer);
+            clearInterval(attHeartbeatTimer);
             ME = fresh;
             renderBlocked(fresh.reason);
             startBlockedRecheck();
