@@ -1006,6 +1006,11 @@ app.get("/auth/discord/callback", (req, res, next) => {
             // مثال شائع: "Failed to obtain access token" — يصير غالباً لو الرابط انفتح مرتين
             // أو تصفّح متصفح الجوال جهّز (prefetch) الرابط قبل الضغط عليه فعلياً، فينستهلك الكود قبل لا يوصل السيرفر
             console.error("❌ فشل تسجيل الدخول عبر ديسكورد:", err.message);
+            console.error("🔎 تفاصيل إضافية للتشخيص — callbackURL المستخدم:", CONFIG.DISCORD_CALLBACK_URL);
+            console.error("🔎 host اللي وصل بيه الطلب:", req.headers.host, "| x-forwarded-host:", req.headers["x-forwarded-host"], "| x-forwarded-proto:", req.headers["x-forwarded-proto"]);
+            if (err.oauthError) console.error("🔎 err.oauthError:", JSON.stringify(err.oauthError));
+            if (err.data) console.error("🔎 err.data (رد ديسكورد الفعلي):", err.data);
+            if (err.body) console.error("🔎 err.body:", err.body);
             return res.redirect("/?loginError=1");
         }
         if (!user) return res.redirect("/");
