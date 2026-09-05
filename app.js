@@ -1000,7 +1000,21 @@ passport.use(new DiscordStrategy({
 }, (accessToken, refreshToken, profile, done) => done(null, profile)));
 
 app.get("/auth/discord", passport.authenticate("discord"));
-app.get("/auth/discord/callback", passport.authenticate("discord", { failureRedirect: "/" }), (req, res) => res.redirect("/"));
+app.get("/auth/discord/callback", (req, res, next) => {
+    passport.authenticate("discord", (err, user) => {
+        if (err) {
+            // مثال شائع: "Failed to obtain access token" — يصير غالباً لو الرابط انفتح مرتين
+            // أو تصفّح متصفح الجوال جهّز (prefetch) الرابط قبل الضغط عليه فعلياً، فينستهلك الكود قبل لا يوصل السيرفر
+            console.error("❌ فشل تسجيل الدخول عبر ديسكورد:", err.message);
+            return res.redirect("/?loginError=1");
+        }
+        if (!user) return res.redirect("/");
+        req.logIn(user, (loginErr) => {
+            if (loginErr) { console.error("❌ فشل تسجيل الدخول (session):", loginErr.message); return res.redirect("/?loginError=1"); }
+            res.redirect("/");
+        });
+    })(req, res, next);
+});
 app.get("/auth/logout", (req, res) => { req.logout(() => res.redirect("/")); });
 
 function ensureAuth(req, res, next) {
@@ -3746,10 +3760,16 @@ function startBlockedRecheck() {
 function renderLogin() {
     document.getElementById('nav-links').innerHTML = '';
     document.getElementById('mobile-menu').innerHTML = '';
+    const hadError = new URLSearchParams(window.location.search).get('loginError') === '1';
+    if (hadError && window.history.replaceState) window.history.replaceState({}, '', window.location.pathname);
     document.getElementById('app').innerHTML = \`
         <div class="login-screen">
             <h1>${CONFIG.SITE_NAME}</h1>
             <p style="color:var(--muted);margin-bottom:28px;">نظام إدارة عسكري لمنسوبي الجهات العسكرية</p>
+            \${hadError ? \`<div class="card" style="border-color:#f59e0b;max-width:360px;margin:0 auto 20px;">
+                <p style="color:#f59e0b;font-weight:bold;">⚠️ صار خطأ بتسجيل الدخول</p>
+                <p style="color:var(--muted);font-size:13px;margin-top:6px;">جرب مرة ثانية، وتأكد إنك ما تفتح رابط قديم أو مكرر — اضغط الزر تحت من جديد.</p>
+            </div>\` : ''}
             <a href="/auth/discord" style="display:inline-flex;align-items:center;justify-content:center;gap:10px;background:#5865F2;color:#fff;font-weight:bold;font-size:16px;padding:16px 34px;border-radius:10px;text-decoration:none;box-shadow:0 6px 18px rgba(88,101,242,0.4);">
                 <span>🔒</span><span>تسجيل الدخول عبر ديسكورد</span>
             </a>
