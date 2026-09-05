@@ -5555,7 +5555,7 @@ function openMPReportForm(returnFn) {
             <textarea id="mpr-duty" placeholder="اكتب وش سويت خلال الاستلام..."></textarea>
         </div>
         <div class="card">
-            <label>2) كم عدد الجولات/الدوريات اللي سويتها خلال الشفت؟</label>
+            <label>2) كم عدد الدوريات اللي شاركت في الاستلام؟</label>
             <input type="number" id="mpr-patrols" min="0" placeholder="0">
         </div>
         <div class="card">
