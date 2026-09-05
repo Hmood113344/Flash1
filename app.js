@@ -2872,7 +2872,10 @@ app.post("/api/summon/enter", ensureAuth, async (req, res) => {
 app.post("/api/mp/reports/submit", ensureMPMember, async (req, res) => {
     const { dutyReport, notesIssued } = req.body;
     if (!dutyReport || !dutyReport.trim()) return res.status(400).json({ error: "اكتب وش سويت بالاستلام" });
+    const settings = req.settings;
     const p = await Personnel.findOne({ discord: req.user.id });
+    const mpRole = getMPRole(req.user.id, settings); // "commander" | "deputy" | null
+    const isLeader = !!mpRole;
     const doc = await MPReport.create({
         reporterDiscord: req.user.id, reporterTag: req.user.username,
         reporterName: p?.registeredName || req.user.username, reporterRank: p?.rank || "-",
@@ -2881,9 +2884,24 @@ app.post("/api/mp/reports/submit", ensureMPMember, async (req, res) => {
             discord: n.discord, tag: n.tag, name: n.name,
             kind: n.kind === "warning" ? "warning" : "note", reason: (n.reason || "").slice(0, 500),
         })) : [],
-        status: "pending",
+        status: isLeader ? "approved" : "pending",
+        reviewedBy: isLeader ? req.user.id : undefined,
+        reviewedByTag: isLeader ? req.user.username : undefined,
+        reviewedAt: isLeader ? new Date() : undefined,
     });
-    await logEvent({ action: "تسجيل تقرير شرطة عسكرية", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)", details: "تقرير جديد بانتظار المراجعة" });
+    if (isLeader) {
+        await Personnel.findOneAndUpdate({ discord: req.user.id }, { $inc: { points: CONFIG.MP_REPORT_POINTS_APPROVE } });
+        await checkAutoPromotion(req.user.id);
+        // لو النائب هو اللي قدّم، يوصل إشعار للقائد بتقريره
+        if (mpRole === "deputy" && settings.mpLeadership?.commanderId) {
+            await Personnel.findOneAndUpdate({ discord: settings.mpLeadership.commanderId }, { $push: { warnings: {
+                kind: "notice",
+                reason: `النائب ${p?.registeredName || req.user.username} قدّم تقرير شرطة عسكرية جديد — راجعه من لوحة الشرطة العسكرية.`,
+                issuedBy: req.user.id, issuedByTag: req.user.username,
+            } } });
+        }
+    }
+    await logEvent({ action: "تسجيل تقرير شرطة عسكرية", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username + (isLeader ? " (قيادة الشرطة العسكرية)" : " (شرطة عسكرية)"), details: isLeader ? "تقرير مقبول تلقائياً" : "تقرير جديد بانتظار المراجعة" });
     res.json({ ok: true, report: doc });
 });
 app.get("/api/mp/reports/pending", ensureMPLeader, async (req, res) => {
@@ -5022,7 +5040,10 @@ function renderMPPanel() {
     if (!ME.mpInfo && !ME.isSeniorAdmin) return renderDashboard();
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>🚔 لوحة الشرطة العسكرية \${ME.mpInfo ? ('(' + (ME.mpInfo.role === 'commander' ? 'قائد' : 'نائب') + ')') : '(كبار المسؤولين)'}</h2>
-            <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
+            <div class="row" style="gap:8px;">
+                <button class="btn sm" onclick="openMPReportForm('renderMPPanel()')">+ تسجيل تقرير جديد</button>
+                <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
+            </div>
         </div>
         <div class="tabs">
             <div class="tab active" onclick="mpTabSwitch('members', this)">👤 العساكر</div>
@@ -5044,6 +5065,7 @@ function mpTabSwitch(name, el) {
     if (name === 'log') loadMPSectorLog();
     if (name === 'po') loadMPPOBox();
 }
+let mpLeaderListCache = [];
 async function loadMPMembers() {
     const box = document.getElementById('mp-content');
     if (!box) return;
@@ -5052,8 +5074,21 @@ async function loadMPMembers() {
     try { data = await api('/api/mp/members'); }
     catch (e) { if (mpTab !== 'members') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
     if (mpTab !== 'members') return;
-    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد عساكر مسجلين بعد</div>'; return; }
-    box.innerHTML = data.list.map(p => \`
+    mpLeaderListCache = data.list;
+    renderMPLeaderMembersList(mpLeaderListCache);
+}
+function filterMPLeaderMembers(q) {
+    q = (q || '').trim();
+    if (!q) return renderMPLeaderMembersList(mpLeaderListCache);
+    const filtered = mpLeaderListCache.filter(p => (p.registeredName || p.discordTag || '').includes(q) || (p.unit || '').includes(q));
+    renderMPLeaderMembersList(filtered);
+}
+function renderMPLeaderMembersList(list) {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    const searchBar = '<div class="card"><input id="mp-leader-search" placeholder="🔍 ابحث بالاسم..." value="' + (document.getElementById('mp-leader-search') ? document.getElementById('mp-leader-search').value : '') + '" oninput="filterMPLeaderMembers(this.value)"></div>';
+    if (list.length === 0) { box.innerHTML = searchBar + '<div class="card center" style="color:var(--muted);">لا يوجد نتائج</div>'; return; }
+    box.innerHTML = searchBar + list.map(p => \`
         <div class="card">
             <div class="row">
                 <div>
@@ -5271,15 +5306,17 @@ function mpPoReportDecide(id, action) {
 // بوابة عضو الشرطة العسكرية العادي — العساكر (ملاحظة + طلب استدعاء) + تسجيل تقرير
 // ══════════════════════════════════════════════════════════════════════════
 let mpMemberTab = 'members';
+let mpMemberListCache = [];
 function renderMPMemberPanel() {
     if (!ME.isMilitaryPolice) return renderDashboard();
     document.getElementById('app').innerHTML = \`
         <div class="card row"><h2>🚔 الشرطة العسكرية</h2>
             <div class="row" style="gap:8px;">
-                <button class="btn sm" onclick="openMPReportForm()">+ تسجيل تقرير جديد</button>
+                <button class="btn sm" onclick="openMPReportForm('renderMPMemberPanel()')">+ تسجيل تقرير جديد</button>
                 <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
             </div>
         </div>
+        <div class="card"><input id="mp-member-search" placeholder="🔍 ابحث بالاسم..." oninput="filterMPMemberList(this.value)"></div>
         <div id="mp-member-content"></div>\`;
     loadMPMemberMembers();
 }
@@ -5290,8 +5327,20 @@ async function loadMPMemberMembers() {
     let data;
     try { data = await api('/api/mp/members'); }
     catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
-    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد عساكر مسجلين بعد</div>'; return; }
-    box.innerHTML = data.list.map(p => \`
+    mpMemberListCache = data.list;
+    renderMPMemberList(mpMemberListCache);
+}
+function filterMPMemberList(q) {
+    q = (q || '').trim();
+    if (!q) return renderMPMemberList(mpMemberListCache);
+    const filtered = mpMemberListCache.filter(p => (p.registeredName || p.discordTag || '').includes(q) || (p.unit || '').includes(q));
+    renderMPMemberList(filtered);
+}
+function renderMPMemberList(list) {
+    const box = document.getElementById('mp-member-content');
+    if (!box) return;
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد نتائج</div>'; return; }
+    box.innerHTML = list.map(p => \`
         <div class="card">
             <div class="row">
                 <div>
@@ -5308,10 +5357,12 @@ async function loadMPMemberMembers() {
 }
 // ── فورم تسجيل تقرير الشرطة العسكرية ──
 let mpReportNotes = [];
-function openMPReportForm() {
+let mpReportReturnFn = 'renderMPMemberPanel()';
+function openMPReportForm(returnFn) {
     mpReportNotes = [];
+    mpReportReturnFn = returnFn || 'renderMPMemberPanel()';
     document.getElementById('app').innerHTML = \`
-        <div class="card row"><h2>📝 تسجيل تقرير شرطة عسكرية</h2><button class="btn gray sm" onclick="renderMPMemberPanel()">رجوع</button></div>
+        <div class="card row"><h2>📝 تسجيل تقرير شرطة عسكرية</h2><button class="btn gray sm" onclick="\${mpReportReturnFn}">رجوع</button></div>
         <div class="card">
             <label>وش سويت بالاستلام؟</label>
             <textarea id="mpr-duty" placeholder="اكتب وش سويت خلال الاستلام..."></textarea>
@@ -5351,9 +5402,9 @@ async function submitMPReport() {
     const dutyReport = document.getElementById('mpr-duty').value;
     if (!dutyReport || !dutyReport.trim()) return toast('اكتب وش سويت بالاستلام');
     try {
-        await api('/api/mp/reports/submit', { method: 'POST', body: JSON.stringify({ dutyReport, notesIssued: mpReportNotes }) });
-        toast('✅ تم إرسال التقرير للمراجعة');
-        renderMPMemberPanel();
+        const r = await api('/api/mp/reports/submit', { method: 'POST', body: JSON.stringify({ dutyReport, notesIssued: mpReportNotes }) });
+        toast(r.report && r.report.status === 'approved' ? '✅ تم قبول تقريرك' : '✅ تم إرسال التقرير للمراجعة');
+        Function(mpReportReturnFn)();
     } catch (e) { toast(e.message); }
 }
 
