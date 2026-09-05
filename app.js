@@ -48,7 +48,6 @@ const CONFIG = {
         "1500064767082233926",
         "1545415273438249010",
         "1505185480394932455",
-        
     ],
 
     // آيديات كبار المسؤولين — نفس أسلوب ملف البنك (مصفوفة ثابتة بالكود)
@@ -592,6 +591,25 @@ async function isMilitary(discordId) {
 }
 
 // هل هذا الشخص حامل رتبة الشرطة العسكرية بديسكورد؟
+// يرسل رسالة خاصة (DM) للعسكري المستدعى فيها زر "دخول الاستدعاء" يفتح روم الفويس مباشرة
+async function sendSummonDM(discordId, timeLabel) {
+    if (!botReady) return;
+    try {
+        const user = await client.users.fetch(discordId);
+        const embed = new EmbedBuilder()
+            .setTitle("📣 لديك استدعاء")
+            .setColor(0xf59e0b)
+            .setDescription(`عليك استدعاء من الشرطة العسكرية.\n**الوقت:** ${timeLabel || "الآن"}`)
+            .setTimestamp();
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setLabel("🚪 دخول الاستدعاء").setStyle(ButtonStyle.Link).setURL(CONFIG.MP_SUMMON_VOICE_URL),
+        );
+        await user.send({ embeds: [embed], components: [row] });
+    } catch (e) {
+        console.error("❌ فشل إرسال رسالة الاستدعاء الخاصة:", e.message);
+    }
+}
+
 async function isMilitaryPoliceMember(discordId) {
     if (!botReady) return false;
     try {
@@ -2832,6 +2850,7 @@ app.post("/api/mp/personnel/:discord/summon", ensureMPMember, async (req, res) =
         actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)",
         details: `${p.registeredName || p.discord} — ${timeLabel}`,
     });
+    if (isLeaderOrSenior) sendSummonDM(p.discord, timeLabel);
     res.json({ ok: true, pending: !isLeaderOrSenior });
 });
 app.post("/api/mp/personnel/:discord/summon/stop", ensureMPLeader, async (req, res) => {
@@ -2851,6 +2870,7 @@ app.post("/api/mp/summon-requests/:discord/approve", ensureMPLeader, async (req,
     p.summon.status = "approved"; p.summon.setBy = req.user.id; p.summon.setByTag = req.user.username; p.summon.setAt = new Date();
     await p.save();
     await logEvent({ action: "قبول طلب استدعاء", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: p.registeredName || p.discord });
+    sendSummonDM(p.discord, p.summon.timeLabel);
     res.json({ ok: true });
 });
 app.post("/api/mp/summon-requests/:discord/reject", ensureMPLeader, async (req, res) => {
