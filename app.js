@@ -107,6 +107,11 @@ const CONFIG = {
         antiDrugs: "مكافحة المخدرات",
     },
 
+    // ── الشرطة العسكرية ──
+    MILITARY_POLICE_ROLE_ID: process.env.MILITARY_POLICE_ROLE_ID || "1545415273438249010",
+    MP_SUMMON_VOICE_URL: "https://discord.com/channels/1497233353030766662/1545415195243843644",
+    MP_REPORT_POINTS_APPROVE: 1, // نقاط قبول تقرير الشرطة العسكرية
+
     // عقوبات التحذير الثالث — المسؤول يختار وحدة منها وقت إرسال التحذير الثالث لأي عسكري
     WARNING_PENALTIES: [
         { id: "deduct5",          label: "خصم 5 نقاط",                        type: "points",  value: 5 },
@@ -139,9 +144,19 @@ const PersonnelSchema = new mongoose.Schema({
     rank: { type: String, default: "جندي" },
     points: { type: Number, default: 0 },
     notes: [{
-        text: String, addedBy: String, addedByTag: String,
+        text: String, image: { type: String, default: null }, addedBy: String, addedByTag: String,
         createdAt: { type: Date, default: Date.now }
     }],
+    // ── استدعاء الشرطة العسكرية ──
+    summon: {
+        status: { type: String, enum: ["none", "pending", "approved"], default: "none" }, // pending: طلب استدعاء بانتظار قبول القيادة | approved: استدعاء فعّال
+        mode: { type: String, default: null },       // "now" | "scheduled"
+        timeLabel: { type: String, default: null },  // نص الوقت المعروض (مثال: "10:30 مساء")
+        unlockAt: { type: Date, default: null },      // وقت فتح الروم فعلياً
+        requestedBy: { type: String, default: null }, requestedByTag: { type: String, default: null },
+        setBy: { type: String, default: null }, setByTag: { type: String, default: null }, setAt: { type: Date, default: null },
+        enteredAt: { type: Date, default: null },     // وقت ضغط العضو على "دخول الاستدعاء"
+    },
     // تحذيرات/إشعارات صادرة له — تظهر بوجهه كشاشة كاملة لين يتعاهد عليها
     warnings: [{
         kind: { type: String, enum: ["warning", "notice"], default: "warning" }, // تحذير | إشعار
@@ -222,6 +237,23 @@ const PromotionRequestSchema = new mongoose.Schema({
 });
 PromotionRequestSchema.index({ sector: 1, status: 1, createdAt: -1 });
 const PromotionRequest = mongoose.model("PromotionRequest", PromotionRequestSchema);
+
+// تقارير الشرطة العسكرية (يسجلها أي شخص معه رتبة الشرطة العسكرية بدل تسجيل مخالفة)
+const MPReportSchema = new mongoose.Schema({
+    reporterDiscord: String, reporterTag: String, reporterName: String, reporterRank: String,
+    dutyReport: String, // وش سوى بالاستلام
+    notesIssued: [{ // العساكر اللي عطاهم ملاحظة/تحذير خلال الشفت
+        discord: String, tag: String, name: String,
+        kind: { type: String, enum: ["note", "warning"], default: "note" },
+        reason: String,
+    }],
+    status: { type: String, default: "pending" }, // pending | approved | rejected
+    rejectReason: { type: String, default: null },
+    reviewedBy: String, reviewedByTag: String, reviewedAt: Date,
+    createdAt: { type: Date, default: Date.now },
+});
+MPReportSchema.index({ status: 1, createdAt: -1 });
+const MPReport = mongoose.model("MPReport", MPReportSchema);
 
 // ── نظام البصمة/التحضير ──
 const AttendanceStatusSchema = new mongoose.Schema({
@@ -322,6 +354,12 @@ const SettingsSchema = new mongoose.Schema({
             personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
             attendanceOfficerId: { type: String, default: null }, attendanceOfficerName: { type: String, default: null },
         },
+    },
+    // قيادة الشرطة العسكرية (قائد/نائب يعيّنهم كبار المسؤولين، ومسؤول أفراد يعيّنه القائد/النائب)
+    mpLeadership: {
+        commanderId: { type: String, default: null }, commanderName: { type: String, default: null },
+        deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
+        personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
     },
     violationsChannelId: String,
     // عقوبات التحذير الثالث — قابلة للإضافة/التعديل/الحذف من لوحة كبار المسؤولين (صفحة عقوبات التحذيرات)
@@ -425,6 +463,33 @@ function isJuniorRank(rank) {
     return rankIndex(rank) <= rankIndex("رئيس رقباء");
 }
 
+// ── قيادة الشرطة العسكرية ────────────────────────────────────────────────
+function getMPRole(userId, settings) {
+    const sl = settings.mpLeadership || {};
+    if (sl.commanderId === userId) return "commander";
+    if (sl.deputyId === userId) return "deputy";
+    return null;
+}
+function isMPPersonnelOfficer(userId, settings) {
+    const sl = settings.mpLeadership || {};
+    return !!(sl.personnelOfficerId && sl.personnelOfficerId === userId);
+}
+// يحسب وقت فتح الروم فعلياً: "الآن" = فوراً، "وقت محدد" = اليوم بذاك الوقت (أو بكرة لو الوقت فات اليوم)
+function computeSummonUnlockAt(mode, hour, minute, ampm) {
+    if (mode !== "scheduled") return new Date();
+    let h = parseInt(hour, 10) % 12;
+    if (ampm === "مساء") h += 12;
+    const d = new Date();
+    d.setSeconds(0, 0);
+    d.setHours(h, parseInt(minute, 10) || 0);
+    if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+    return d;
+}
+// هل هذا الشخص محظور عليه استخدام الموقع مؤقتاً بسبب استدعاء نشط لم يدخل له بعد؟
+function isSummonBlocking(p) {
+    return !!(p && p.summon && p.summon.status === "approved" && !p.summon.enteredAt);
+}
+
 function sectorRoleId(sectorKey) {
     if (sectorKey === "patrol") return CONFIG.PATROL_ROLE_ID;
     if (sectorKey === "roadSecurity") return CONFIG.ROAD_SECURITY_ROLE_ID;
@@ -520,6 +585,30 @@ async function isMilitary(discordId) {
     } catch (e) {
         console.error("❌ isMilitary خطأ:", e.message);
         return { ok: false, reason: e.message };
+    }
+}
+
+// هل هذا الشخص حامل رتبة الشرطة العسكرية بديسكورد؟
+async function isMilitaryPoliceMember(discordId) {
+    if (!botReady) return false;
+    try {
+        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+        const member = await guild.members.fetch(discordId);
+        return member.roles.cache.has(CONFIG.MILITARY_POLICE_ROLE_ID);
+    } catch (e) { return false; }
+}
+// يرجع آيديات كل حاملي رتبة الشرطة العسكرية، أو null لو تعذر الجلب فعلياً
+async function getMilitaryPoliceMemberIds() {
+    if (!botReady) return null;
+    try {
+        const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+        const role = await guild.roles.fetch(CONFIG.MILITARY_POLICE_ROLE_ID);
+        if (!role) return [];
+        await ensureGuildMembersFetched(guild);
+        return role.members.map(m => m.id);
+    } catch (e) {
+        console.error("❌ فشل جلب أعضاء الشرطة العسكرية:", e.message);
+        return null;
     }
 }
 
@@ -645,6 +734,9 @@ async function syncViolationMessage(v) {
 }
 
 async function approveViolation(v, actorId, actorTag) {
+    // لو على صاحب المخالفة استدعاء نشط لسا ما دخل له، مخالفاته تبقى مجمدة لحد ما ينتهي الاستدعاء
+    const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
+    if (isSummonBlocking(reporter)) return { blocked: true };
     v.status = "approved"; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
     await v.save();
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_APPROVE : CONFIG.POINTS_ON_APPROVE;
@@ -653,9 +745,12 @@ async function approveViolation(v, actorId, actorTag) {
     await syncViolationMessage(v);
     const label = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
     await logEvent({ action: v.kind === "report" ? "قبول تقرير" : "قبول مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${label} — ${v.reporterName}` });
+    return { blocked: false };
 }
 
 async function rejectViolation(v, actorId, actorTag, reason) {
+    const reporter = await Personnel.findOne({ discord: v.reporterDiscord });
+    if (isSummonBlocking(reporter)) return { blocked: true };
     v.status = "rejected"; v.rejectReason = reason; v.reviewedBy = actorId; v.reviewedByTag = actorTag; v.reviewedAt = new Date();
     await v.save();
     const pts = v.kind === "report" ? CONFIG.REPORT_POINTS_REJECT : CONFIG.POINTS_ON_REJECT;
@@ -664,6 +759,7 @@ async function rejectViolation(v, actorId, actorTag, reason) {
     await syncViolationMessage(v);
     const rlabel = v.kind === "report" ? `تقرير مكافحة مخدرات (${v.reportCategory})` : v.violationType;
     await logEvent({ action: v.kind === "report" ? "رفض تقرير" : "رفض مخالفة", discordId: v.reporterDiscord, discordTag: v.reporterTag, actorId, actorTag, details: `${rlabel} — ${v.reporterName} — السبب: ${reason}` });
+    return { blocked: false };
 }
 
 const commands = [
@@ -933,9 +1029,9 @@ async function ensureSectorLeader(req, res, next) {
     return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات فقط" });
 }
 
-// فقط قائد/نائب مكافحة المخدرات (أو كبار المسؤولين) يقدرون يقبلون/يرفضون مخالفات وتقارير القطاع
+// قائد/نائب أي قطاع (الدوريات، أمن الطرق، مكافحة المخدرات) أو كبار المسؤولين يقدرون يقبلون/يرفضون مخالفات وتقارير قطاعهم
 function canReviewSector(sectorInfo) {
-    return sectorInfo.role === "senior" || sectorInfo.sector === "antiDrugs";
+    return true;
 }
 
 // يسمح لـ"مسؤول الأفراد" بالدخول لمساراته الخاصة، وكبار المسؤولين عبر ?sector= بالكويري
@@ -988,6 +1084,35 @@ async function ensureAttendanceViewer(req, res, next) {
         return next();
     }
     return res.status(403).json({ error: "هذا القسم لقادة ونواب القطاعات ومسؤول التحضير فقط" });
+}
+
+// يسمح لقائد/نائب الشرطة العسكرية (أو كبار المسؤولين) بدخول لوحة الشرطة العسكرية كاملة
+async function ensureMPLeader(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    const role = getMPRole(req.user.id, settings);
+    if (role) { req.mpRole = role; req.settings = settings; return next(); }
+    if (isSeniorAdmin(req.user.id)) { req.mpRole = "senior"; req.settings = settings; return next(); }
+    return res.status(403).json({ error: "هذا القسم لقيادة الشرطة العسكرية فقط" });
+}
+// يسمح لمسؤول أفراد الشرطة العسكرية (أو كبار المسؤولين)
+async function ensureMPPersonnelOfficer(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    if (isMPPersonnelOfficer(req.user.id, settings) || isSeniorAdmin(req.user.id)) { req.settings = settings; return next(); }
+    return res.status(403).json({ error: "هذا القسم لمسؤول أفراد الشرطة العسكرية فقط" });
+}
+// يسمح لأي حامل رتبة الشرطة العسكرية (عادي أو قيادة) بدخول ميزات الملاحظة/الاستدعاء/تسجيل التقرير
+async function ensureMPMember(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    if (isSeniorAdmin(req.user.id) || getMPRole(req.user.id, settings) || isMPPersonnelOfficer(req.user.id, settings)) {
+        req.settings = settings; return next();
+    }
+    const has = await isMilitaryPoliceMember(req.user.id);
+    if (!has) return res.status(403).json({ error: "هذا القسم لمنسوبي الشرطة العسكرية فقط" });
+    req.settings = settings;
+    next();
 }
 
 // يتأكد أن الفرد المطلوب من أعضاء قطاع مسؤول الأفراد، وبرتبة رئيس رقباء فما دون (نطاق صلاحيته)
@@ -1054,6 +1179,20 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     const personnelOfficerInfo = getPersonnelOfficerSector(req.user.id, settings);
     const attendanceOfficerInfo = getAttendanceOfficerSector(req.user.id, settings);
 
+    // ── الشرطة العسكرية ──
+    const mpRole = getMPRole(req.user.id, settings); // "commander" | "deputy" | null
+    const mpPersonnelOfficer = isMPPersonnelOfficer(req.user.id, settings);
+    let isMilitaryPolice = !!(mpRole || mpPersonnelOfficer || senior);
+    if (!isMilitaryPolice) isMilitaryPolice = await isMilitaryPoliceMember(req.user.id);
+    const mpInfo = mpRole ? {
+        role: mpRole,
+        label: mpRole === "commander" ? settings.mpLeadership?.commanderName : settings.mpLeadership?.deputyName,
+    } : null;
+    const summon = (p.summon && p.summon.status !== "none") ? {
+        status: p.summon.status, mode: p.summon.mode, timeLabel: p.summon.timeLabel,
+        unlockAt: p.summon.unlockAt, enteredAt: p.summon.enteredAt,
+    } : null;
+
     res.json({
         blocked: false,
         discordId: req.user.id,
@@ -1072,6 +1211,11 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         sectorInfo,
         personnelOfficerInfo,
         attendanceOfficerInfo,
+        mpInfo,
+        mpPersonnelOfficer,
+        isMilitaryPolice,
+        summon,
+        summonLocked: isSummonBlocking(p),
         maintenance: settings.isMaintenance,
         violationsDisabled: settings.disableViolations,
         nextRank: progress.nextRank,
@@ -1197,6 +1341,7 @@ app.post("/api/violations/submit", ensureAuth, async (req, res) => {
         const p = await Personnel.findOne({ discord: req.user.id });
         if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
         if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل مخالفات جديدة" });
+        if (isSummonBlocking(p)) return res.status(403).json({ error: "🚨 عليك استدعاء نشط من الشرطة العسكرية، لازم تدخل الاستدعاء أولاً قبل أي إجراء بالموقع" });
 
         // يمنع تسجيل مخالفة جديدة إذا وصل عدد المخالفات/التقارير المعلّقة له للحد الأقصى
         const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
@@ -1312,6 +1457,7 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
         const p = await Personnel.findOne({ discord: req.user.id });
         if (!p || !p.registeredName || !p.unit) return res.status(400).json({ error: "أكمل بياناتك (الاسم واليونت) أولاً" });
         if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل تقارير جديدة" });
+        if (isSummonBlocking(p)) return res.status(403).json({ error: "🚨 عليك استدعاء نشط من الشرطة العسكرية، لازم تدخل الاستدعاء أولاً قبل أي إجراء بالموقع" });
 
         // يمنع تسجيل تقرير جديد إذا وصل عدد المخالفات/التقارير المعلّقة له للحد الأقصى
         const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
@@ -1379,7 +1525,8 @@ app.get("/api/admin/pending", ensureAnyAdmin, async (req, res) => {
 app.post("/api/admin/violations/:id/approve", ensureAnyAdmin, async (req, res) => {
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    await approveViolation(v, req.user.id, req.user.username);
+    const r = await approveViolation(v, req.user.id, req.user.username);
+    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -1388,7 +1535,8 @@ app.post("/api/admin/violations/:id/reject", ensureAnyAdmin, async (req, res) =>
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    await rejectViolation(v, req.user.id, req.user.username, reason.trim());
+    const r = await rejectViolation(v, req.user.id, req.user.username, reason.trim());
+    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -1401,11 +1549,13 @@ app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
 });
 
 app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, res) => {
-    const { text } = req.body;
+    const { text, image } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
+    if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
+    if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
     const p = await Personnel.findOneAndUpdate(
         { discord: req.params.discord },
-        { $push: { notes: { text: text.trim(), addedBy: req.user.id, addedByTag: req.user.username } } },
+        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username } } },
         { new: true }
     );
     if (!p) return res.status(404).json({ error: "غير موجود" });
@@ -1680,7 +1830,7 @@ app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
         for (const n of p.notes) {
             flat.push({
                 noteId: n._id, discord: p.discord, personnelName: p.registeredName || p.discordTag || p.discord,
-                text: n.text, addedBy: n.addedBy, addedByTag: n.addedByTag, createdAt: n.createdAt,
+                text: n.text, image: n.image || null, addedBy: n.addedBy, addedByTag: n.addedByTag, createdAt: n.createdAt,
             });
         }
     }
@@ -1881,6 +2031,7 @@ app.post("/api/leave/request", ensureAuth, async (req, res) => {
 
     const p = await Personnel.findOne({ discord: req.user.id });
     if (!p || !p.registeredName) return res.status(400).json({ error: "أكمل بياناتك بالموقع أولاً" });
+    if (isSummonBlocking(p)) return res.status(403).json({ error: "🚨 عليك استدعاء نشط من الشرطة العسكرية، لازم تدخل الاستدعاء أولاً قبل أي إجراء بالموقع" });
     const balance = p.leaveBalance ?? CONFIG.DEFAULT_LEAVE_BALANCE;
     if (d > balance) return res.status(400).json({ error: `رصيدك الحالي ${balance} يوم فقط، ما يكفي لهذا الطلب` });
 
@@ -2083,7 +2234,7 @@ app.get("/api/senior/log", ensureSeniorAdmin, async (req, res) => {
 // ── صفحة "قادة القطاعات" (كبار المسؤولين فقط) ────────────────────────────
 app.get("/api/senior/sectors", ensureSeniorAdmin, async (req, res) => {
     const settings = await getSettings();
-    res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {} });
+    res.json({ sectors: CONFIG.SECTORS, leadership: settings.sectorLeadership || {}, mpLeadership: settings.mpLeadership || {} });
 });
 
 const SECTOR_ROLE_LABELS = { commander: "قائد", deputy: "نائب", personnelOfficer: "مسؤول أفراد", attendanceOfficer: "مسؤول تحضير" };
@@ -2165,20 +2316,22 @@ app.get("/api/sector/violations", ensureSectorLeader, async (req, res) => {
 });
 
 app.post("/api/sector/violations/:id/approve", ensureSectorLeader, async (req, res) => {
-    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "قبول المخالفات والتقارير مخصص لقيادة مكافحة المخدرات فقط" });
+    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "قبول المخالفات والتقارير مخصص لقيادة القطاع فقط" });
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    await approveViolation(v, req.user.id, req.user.username);
+    const r = await approveViolation(v, req.user.id, req.user.username);
+    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
 app.post("/api/sector/violations/:id/reject", ensureSectorLeader, async (req, res) => {
-    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "رفض المخالفات والتقارير مخصص لقيادة مكافحة المخدرات فقط" });
+    if (!canReviewSector(req.sectorInfo)) return res.status(403).json({ error: "رفض المخالفات والتقارير مخصص لقيادة القطاع فقط" });
     const { reason } = req.body;
     if (!reason || !reason.trim()) return res.status(400).json({ error: "لازم تكتب سبب الرفض" });
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
-    await rejectViolation(v, req.user.id, req.user.username, reason.trim());
+    const r = await rejectViolation(v, req.user.id, req.user.username, reason.trim());
+    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -2258,11 +2411,13 @@ app.get("/api/sector/personnel/:discord/warning-info", ensureSectorLeader, async
 // إضافة ملاحظة على عضو القطاع
 app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
-    const { text } = req.body;
+    const { text, image } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
+    if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
+    if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
     const p = await Personnel.findOneAndUpdate(
         { discord: req.params.discord },
-        { $push: { notes: { text: text.trim(), addedBy: req.user.id, addedByTag: req.user.username } } },
+        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username } } },
         { new: true }
     );
     if (!p) return res.status(404).json({ error: "غير موجود" });
@@ -2451,11 +2606,13 @@ app.get("/api/personnel-officer/personnel/:discord", ensurePersonnelOfficer, asy
 
 app.post("/api/personnel-officer/personnel/:discord/note", ensurePersonnelOfficer, async (req, res) => {
     if (!(await ensureJuniorInMySector(req, res, req.params.discord))) return;
-    const { text } = req.body;
+    const { text, image } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
+    if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
+    if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
     const p = await Personnel.findOneAndUpdate(
         { discord: req.params.discord },
-        { $push: { notes: { text: text.trim(), addedBy: req.user.id, addedByTag: req.user.username } } },
+        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username } } },
         { new: true }
     );
     await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `على ${p.registeredName || p.discord} (بواسطة مسؤول أفراد ${req.sectorInfo.sectorLabel}): ${text.trim()}` });
@@ -2533,7 +2690,8 @@ app.post("/api/personnel-officer/violations/:id/approve", ensurePersonnelOfficer
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
-    await approveViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`);
+    const r = await approveViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`);
+    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن قبول مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
@@ -2543,12 +2701,290 @@ app.post("/api/personnel-officer/violations/:id/reject", ensurePersonnelOfficer,
     const v = await Violation.findById(req.params.id);
     if (!v || v.status !== "pending") return res.status(404).json({ error: "غير موجودة" });
     if (!(await ensureJuniorInMySector(req, res, v.reporterDiscord))) return;
-    await rejectViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, reason.trim());
+    const r = await rejectViolation(v, req.user.id, req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, reason.trim());
+    if (r.blocked) return res.status(403).json({ error: "على هذا العسكري استدعاء نشط، لا يمكن رفض مخالفاته حتى ينتهي الاستدعاء" });
     res.json({ ok: true });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// 4.5) APIs مخصصة لموقع البنك (ربط رواتب العساكر) — بدون تسجيل دخول ديسكورد
+// 4.5) الشرطة العسكرية
+// ══════════════════════════════════════════════════════════════════════════
+
+// ── تعيين/إزالة قائد ونائب الشرطة العسكرية (كبار المسؤولين فقط) ──
+app.get("/api/senior/mp/leadership", ensureSeniorAdmin, async (req, res) => {
+    const settings = await getSettings();
+    res.json({ mpLeadership: settings.mpLeadership || {} });
+});
+app.post("/api/senior/mp/assign", ensureSeniorAdmin, async (req, res) => {
+    const { role, discordId } = req.body; // role: commander | deputy
+    if (!["commander", "deputy"].includes(role)) return res.status(400).json({ error: "حدد الدور" });
+    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
+    const person = await Personnel.findOne({ discord: discordId.trim() });
+    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
+    const settings = await getSettings();
+    if (!settings.mpLeadership) settings.mpLeadership = {};
+    const displayName = person.registeredName || person.discordTag || person.discord;
+    settings.mpLeadership[role + "Id"] = person.discord;
+    settings.mpLeadership[role + "Name"] = displayName;
+    settings.markModified("mpLeadership");
+    await settings.save();
+    await logEvent({
+        action: "تعيين " + (role === "commander" ? "قائد" : "نائب") + " الشرطة العسكرية",
+        discordId: person.discord, discordTag: person.discordTag,
+        actorId: req.user.id, actorTag: req.user.username, details: displayName,
+    });
+    res.json({ ok: true, mpLeadership: settings.mpLeadership });
+});
+app.post("/api/senior/mp/remove", ensureSeniorAdmin, async (req, res) => {
+    const { role } = req.body;
+    if (!["commander", "deputy"].includes(role)) return res.status(400).json({ error: "حدد الدور" });
+    const settings = await getSettings();
+    if (!settings.mpLeadership) settings.mpLeadership = {};
+    const removedName = settings.mpLeadership[role + "Name"];
+    settings.mpLeadership[role + "Id"] = null;
+    settings.mpLeadership[role + "Name"] = null;
+    settings.markModified("mpLeadership");
+    await settings.save();
+    await logEvent({ action: "إزالة " + (role === "commander" ? "قائد" : "نائب") + " الشرطة العسكرية", actorId: req.user.id, actorTag: req.user.username, details: removedName || "-" });
+    res.json({ ok: true, mpLeadership: settings.mpLeadership });
+});
+
+// ── تعيين/إزالة مسؤول أفراد الشرطة العسكرية (قائد/نائب الشرطة العسكرية أو كبار المسؤولين) ──
+app.post("/api/mp/personnel-officer/assign", ensureMPLeader, async (req, res) => {
+    const { discordId } = req.body;
+    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
+    const person = await Personnel.findOne({ discord: discordId.trim() });
+    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع (أكمل بياناته) قبل تعيينه" });
+    const settings = req.settings;
+    if (!settings.mpLeadership) settings.mpLeadership = {};
+    settings.mpLeadership.personnelOfficerId = person.discord;
+    settings.mpLeadership.personnelOfficerName = person.registeredName || person.discordTag || person.discord;
+    settings.markModified("mpLeadership");
+    await settings.save();
+    await logEvent({ action: "تعيين مسؤول أفراد الشرطة العسكرية", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: settings.mpLeadership.personnelOfficerName });
+    res.json({ ok: true, mpLeadership: settings.mpLeadership });
+});
+app.post("/api/mp/personnel-officer/remove", ensureMPLeader, async (req, res) => {
+    const settings = req.settings;
+    if (!settings.mpLeadership) settings.mpLeadership = {};
+    const removedName = settings.mpLeadership.personnelOfficerName;
+    settings.mpLeadership.personnelOfficerId = null;
+    settings.mpLeadership.personnelOfficerName = null;
+    settings.markModified("mpLeadership");
+    await settings.save();
+    await logEvent({ action: "إزالة مسؤول أفراد الشرطة العسكرية", actorId: req.user.id, actorTag: req.user.username, details: removedName || "-" });
+    res.json({ ok: true, mpLeadership: settings.mpLeadership });
+});
+
+// ── "العساكر" — كل العساكر المسجلين بالموقع، من أعلى رتبة لأقل رتبة (لأي حامل رتبة شرطة عسكرية) ──
+app.get("/api/mp/members", ensureMPMember, async (req, res) => {
+    const list = await Personnel.find({ registeredName: { $ne: null } }, { notes: 0 });
+    list.sort((a, b) => rankIndex(b.rank) - rankIndex(a.rank));
+    res.json({ list });
+});
+
+// ── ملاحظة على أي عسكري (فورم: سبب + صورة إجبارية) ──
+app.post("/api/mp/personnel/:discord/note", ensureMPMember, async (req, res) => {
+    const { text, image } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
+    if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
+    if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
+    const p = await Personnel.findOneAndUpdate(
+        { discord: req.params.discord },
+        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username + " (شرطة عسكرية)" } } },
+        { new: true }
+    );
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)", details: `على ${p.registeredName || p.discord}` });
+    res.json({ ok: true, notes: p.notes });
+});
+
+// ── الاستدعاء ──
+// أي حامل رتبة شرطة عسكرية يقدر يرسل استدعاء: لو كان قائد/نائب/كبير مسؤول يصير فعّال فوراً،
+// لو عضو عادي يصير "طلب استدعاء" بانتظار قبول القيادة
+app.post("/api/mp/personnel/:discord/summon", ensureMPMember, async (req, res) => {
+    const { mode, hour, minute, ampm } = req.body;
+    if (!["now", "scheduled"].includes(mode)) return res.status(400).json({ error: "حدد نوع وقت الاستدعاء" });
+    const p = await Personnel.findOne({ discord: req.params.discord });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    if (p.summon && p.summon.status && p.summon.status !== "none") return res.status(400).json({ error: "يوجد استدعاء قائم على هذا الشخص بالفعل" });
+    let timeLabel = "الآن";
+    if (mode === "scheduled") {
+        if (!hour || !minute || !ampm || !["صباح", "مساء"].includes(ampm)) return res.status(400).json({ error: "حدد وقت الاستدعاء كاملاً (الساعة، الدقيقة، صباح/مساء)" });
+        timeLabel = `${hour}:${String(minute).padStart(2, "0")} ${ampm}`;
+    }
+    const unlockAt = computeSummonUnlockAt(mode, hour, minute, ampm);
+    const settings = req.settings;
+    const isLeaderOrSenior = !!getMPRole(req.user.id, settings) || isSeniorAdmin(req.user.id);
+    p.summon = {
+        status: isLeaderOrSenior ? "approved" : "pending",
+        mode, timeLabel, unlockAt,
+        requestedBy: req.user.id, requestedByTag: req.user.username,
+        setBy: isLeaderOrSenior ? req.user.id : null, setByTag: isLeaderOrSenior ? req.user.username : null,
+        setAt: isLeaderOrSenior ? new Date() : null, enteredAt: null,
+    };
+    await p.save();
+    await logEvent({
+        action: isLeaderOrSenior ? "استدعاء عسكري" : "طلب استدعاء", discordId: p.discord, discordTag: p.discordTag,
+        actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)",
+        details: `${p.registeredName || p.discord} — ${timeLabel}`,
+    });
+    res.json({ ok: true, pending: !isLeaderOrSenior });
+});
+app.post("/api/mp/personnel/:discord/summon/stop", ensureMPLeader, async (req, res) => {
+    const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, { summon: { status: "none" } }, { new: true });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent({ action: "إيقاف استدعاء", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: p.registeredName || p.discord });
+    res.json({ ok: true });
+});
+// طلبات الاستدعاء المعلّقة (المرسلة من أعضاء عاديين) — تحتاج قبول القيادة
+app.get("/api/mp/summon-requests", ensureMPLeader, async (req, res) => {
+    const list = await Personnel.find({ "summon.status": "pending" }, "discord discordTag registeredName rank summon");
+    res.json({ list });
+});
+app.post("/api/mp/summon-requests/:discord/approve", ensureMPLeader, async (req, res) => {
+    const p = await Personnel.findOne({ discord: req.params.discord });
+    if (!p || !p.summon || p.summon.status !== "pending") return res.status(404).json({ error: "غير موجود" });
+    p.summon.status = "approved"; p.summon.setBy = req.user.id; p.summon.setByTag = req.user.username; p.summon.setAt = new Date();
+    await p.save();
+    await logEvent({ action: "قبول طلب استدعاء", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: p.registeredName || p.discord });
+    res.json({ ok: true });
+});
+app.post("/api/mp/summon-requests/:discord/reject", ensureMPLeader, async (req, res) => {
+    const p = await Personnel.findOneAndUpdate({ discord: req.params.discord, "summon.status": "pending" }, { summon: { status: "none" } }, { new: true });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent({ action: "رفض طلب استدعاء", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: p.registeredName || p.discord });
+    res.json({ ok: true });
+});
+// دخول الاستدعاء — يستخدمها العضو نفسه لما يجيه إشعار "لديك استدعاء"
+app.post("/api/summon/enter", ensureAuth, async (req, res) => {
+    const p = await Personnel.findOne({ discord: req.user.id });
+    if (!p || !p.summon || p.summon.status !== "approved") return res.status(400).json({ error: "لا يوجد استدعاء نشط عليك" });
+    if (p.summon.unlockAt && new Date(p.summon.unlockAt).getTime() > Date.now()) {
+        return res.status(400).json({ error: `الروم بيفتح الساعة ${p.summon.timeLabel}`, locked: true, timeLabel: p.summon.timeLabel });
+    }
+    p.summon.enteredAt = new Date();
+    await p.save();
+    res.json({ ok: true, url: CONFIG.MP_SUMMON_VOICE_URL });
+});
+
+// ── تقارير الشرطة العسكرية ──
+app.post("/api/mp/reports/submit", ensureMPMember, async (req, res) => {
+    const { dutyReport, notesIssued } = req.body;
+    if (!dutyReport || !dutyReport.trim()) return res.status(400).json({ error: "اكتب وش سويت بالاستلام" });
+    const p = await Personnel.findOne({ discord: req.user.id });
+    const doc = await MPReport.create({
+        reporterDiscord: req.user.id, reporterTag: req.user.username,
+        reporterName: p?.registeredName || req.user.username, reporterRank: p?.rank || "-",
+        dutyReport: dutyReport.trim(),
+        notesIssued: Array.isArray(notesIssued) ? notesIssued.slice(0, 50).map(n => ({
+            discord: n.discord, tag: n.tag, name: n.name,
+            kind: n.kind === "warning" ? "warning" : "note", reason: (n.reason || "").slice(0, 500),
+        })) : [],
+        status: "pending",
+    });
+    await logEvent({ action: "تسجيل تقرير شرطة عسكرية", discordId: req.user.id, discordTag: req.user.username, actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)", details: "تقرير جديد بانتظار المراجعة" });
+    res.json({ ok: true, report: doc });
+});
+app.get("/api/mp/reports/pending", ensureMPLeader, async (req, res) => {
+    const list = await MPReport.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200);
+    res.json({ list });
+});
+app.post("/api/mp/reports/:id/approve", ensureMPLeader, async (req, res) => {
+    const r = await MPReport.findById(req.params.id);
+    if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
+    r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    await r.save();
+    await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $inc: { points: CONFIG.MP_REPORT_POINTS_APPROVE } });
+    await checkAutoPromotion(r.reporterDiscord);
+    await logEvent({ action: "قبول تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: `+${CONFIG.MP_REPORT_POINTS_APPROVE} نقطة` });
+    res.json({ ok: true });
+});
+app.post("/api/mp/reports/:id/reject", ensureMPLeader, async (req, res) => {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الرفض" });
+    const r = await MPReport.findById(req.params.id);
+    if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
+    r.status = "rejected"; r.rejectReason = reason.trim(); r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    await r.save();
+    await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $push: { warnings: { kind: "notice", reason: "تم رفض تقريرك — انتبه المرة الجاية. السبب: " + reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username } } });
+    await logEvent({ action: "رفض تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: reason.trim() });
+    res.json({ ok: true });
+});
+
+// ── لوق القطاعات (كل شي يسويه القادة/النواب/مسؤولي الأفراد بكل القطاعات — بدون كبار المسؤولين) ──
+app.get("/api/mp/sector-log", ensureMPLeader, async (req, res) => {
+    const list = await Log.find({ actorTag: { $regex: /قيادة|مسؤول أفراد/ } }).sort({ createdAt: -1 }).limit(300);
+    res.json({ list });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 4.6) مسارات مسؤول أفراد الشرطة العسكرية — نطاقه: أعضاء الشرطة العسكرية أنفسهم (ما عدا القائد والنائب)
+// ══════════════════════════════════════════════════════════════════════════
+app.get("/api/mp/po/members", ensureMPPersonnelOfficer, async (req, res) => {
+    const ids = await getMilitaryPoliceMemberIds();
+    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء الشرطة العسكرية من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+    const settings = req.settings;
+    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
+    const filtered = ids.filter(id => !excludeIds.includes(id));
+    const list = filtered.length ? await Personnel.find({ discord: { $in: filtered } }).sort({ createdAt: -1 }) : [];
+    res.json({ list });
+});
+app.post("/api/mp/po/personnel/:discord/note", ensureMPPersonnelOfficer, async (req, res) => {
+    const settings = req.settings;
+    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
+    if (excludeIds.includes(req.params.discord)) return res.status(403).json({ error: "ما تقدر تحط ملاحظة على القائد أو النائب" });
+    const ids = await getMilitaryPoliceMemberIds();
+    if (ids === null) return res.status(503).json({ error: "تعذر التحقق من أعضاء الشرطة العسكرية حالياً، حاول مرة ثانية بعد شوي" });
+    if (!ids.includes(req.params.discord)) return res.status(403).json({ error: "هذا الشخص ليس من أعضاء الشرطة العسكرية" });
+    const { text, image } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
+    if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
+    if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
+    const p = await Personnel.findOneAndUpdate(
+        { discord: req.params.discord },
+        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)" } } },
+        { new: true }
+    );
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: `على ${p.registeredName || p.discord}` });
+    res.json({ ok: true, notes: p.notes });
+});
+// تقارير الشرطة العسكرية بنظر مسؤول الأفراد — تستثني تقارير القائد والنائب
+app.get("/api/mp/po/reports/pending", ensureMPPersonnelOfficer, async (req, res) => {
+    const settings = req.settings;
+    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
+    const list = await MPReport.find({ status: "pending", reporterDiscord: { $nin: excludeIds } }).sort({ createdAt: -1 }).limit(200);
+    res.json({ list });
+});
+app.post("/api/mp/po/reports/:id/approve", ensureMPPersonnelOfficer, async (req, res) => {
+    const settings = req.settings;
+    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
+    const r = await MPReport.findById(req.params.id);
+    if (!r || r.status !== "pending" || excludeIds.includes(r.reporterDiscord)) return res.status(404).json({ error: "غير موجود" });
+    r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    await r.save();
+    await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $inc: { points: CONFIG.MP_REPORT_POINTS_APPROVE } });
+    await checkAutoPromotion(r.reporterDiscord);
+    await logEvent({ action: "قبول تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: `+${CONFIG.MP_REPORT_POINTS_APPROVE} نقطة` });
+    res.json({ ok: true });
+});
+app.post("/api/mp/po/reports/:id/reject", ensureMPPersonnelOfficer, async (req, res) => {
+    const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الرفض" });
+    const settings = req.settings;
+    const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
+    const r = await MPReport.findById(req.params.id);
+    if (!r || r.status !== "pending" || excludeIds.includes(r.reporterDiscord)) return res.status(404).json({ error: "غير موجود" });
+    r.status = "rejected"; r.rejectReason = reason.trim(); r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    await r.save();
+    await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $push: { warnings: { kind: "notice", reason: "تم رفض تقريرك — انتبه المرة الجاية. السبب: " + reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username } } });
+    await logEvent({ action: "رفض تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: reason.trim() });
+    res.json({ ok: true });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 4.7) APIs مخصصة لموقع البنك (ربط رواتب العساكر) — بدون تسجيل دخول ديسكورد
 //      يستخدمها البنك فقط للحصول على قائمة الرتب ورتبة كل عسكري مسجل
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -2863,6 +3299,105 @@ async function submitWarnForm(discord, apiBase, kind) {
     } catch (e) { toast(e.message); }
 }
 
+// ── فورم ملاحظة موحّد (سبب + صورة إجبارية) — يستخدمه كبار المسؤولين/قادة القطاعات/مسؤولي الأفراد/الشرطة العسكرية ──
+let noteFormCtx = null;
+let noteImageData = null;
+function openNoteForm(discord, apiBase, reloadCall) {
+    noteFormCtx = { discord, apiBase, reloadCall };
+    noteImageData = null;
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📝 إضافة ملاحظة</h3>
+        <textarea id="nf-text" placeholder="اكتب سبب الملاحظة..."></textarea>
+        <label style="margin-top:8px;display:block;font-size:13px;color:var(--muted);">صورة الملاحظة (إجبارية)</label>
+        <input type="file" id="nf-image" accept="image/*" onchange="previewNoteImage()">
+        <img id="nf-preview" style="display:none;max-width:100%;border-radius:8px;margin-top:8px;">
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitNoteForm()">إرسال</button>
+        </div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+function previewNoteImage() {
+    const input = document.getElementById('nf-image');
+    const file = input.files[0];
+    if (!file) { noteImageData = null; return; }
+    if (file.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); input.value = ''; noteImageData = null; return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+        noteImageData = reader.result;
+        const img = document.getElementById('nf-preview');
+        if (img) { img.src = noteImageData; img.style.display = 'block'; }
+    };
+    reader.readAsDataURL(file);
+}
+async function submitNoteForm() {
+    const text = document.getElementById('nf-text').value;
+    if (!text || !text.trim()) return toast('اكتب الملاحظة');
+    if (!noteImageData) return toast('لازم ترفق صورة مع الملاحظة');
+    try {
+        await api(noteFormCtx.apiBase + noteFormCtx.discord + '/note', { method: 'POST', body: JSON.stringify({ text, image: noteImageData }) });
+        toast('✅ تمت إضافة الملاحظة');
+        closeWarnForm();
+        noteImageData = null;
+        if (noteFormCtx.reloadCall) { try { Function(noteFormCtx.reloadCall)(); } catch (e) {} }
+    } catch (e) { toast(e.message); }
+}
+
+// ── فورم الاستدعاء (الآن / وقت محدد + صباح أو مساء) ──
+let summonFormCtx = null;
+function openSummonForm(discord, apiPath, reloadCall) {
+    summonFormCtx = { discord, apiPath, reloadCall };
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📣 استدعاء عسكري</h3>
+        <div class="wf-choice-row">
+            <button class="wf-warning" onclick="summonPickMode('now')">⏱️ الآن</button>
+            <button class="wf-notice" onclick="summonPickMode('scheduled')">🕒 وقت محدد</button>
+        </div>
+        <div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button></div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+function summonPickMode(mode) {
+    const box = document.getElementById('wf-box');
+    if (mode === 'now') {
+        box.innerHTML = \`
+            <h3>⏱️ استدعاء فوري</h3>
+            <p style="font-size:13px;color:var(--muted);margin-top:6px;">بيوصل للعضو إشعار "لديك استدعاء" فوراً.</p>
+            <div class="wf-actions">
+                <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+                <button class="btn sm" onclick="submitSummonForm('now')">إرسال</button>
+            </div>\`;
+        return;
+    }
+    box.innerHTML = \`
+        <h3>🕒 حدد وقت الاستدعاء</h3>
+        <div class="row" style="gap:8px;">
+            <input type="number" id="sf-hour" placeholder="الساعة (1-12)" min="1" max="12" style="width:33%;">
+            <input type="number" id="sf-minute" placeholder="الدقيقة" min="0" max="59" style="width:33%;">
+            <select id="sf-ampm" style="width:33%;"><option value="صباح">صباح</option><option value="مساء">مساء</option></select>
+        </div>
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitSummonForm('scheduled')">إرسال</button>
+        </div>\`;
+}
+async function submitSummonForm(mode) {
+    const body = { mode };
+    if (mode === 'scheduled') {
+        body.hour = document.getElementById('sf-hour').value;
+        body.minute = document.getElementById('sf-minute').value;
+        body.ampm = document.getElementById('sf-ampm').value;
+        if (!body.hour || !body.minute) return toast('حدد الوقت كاملاً');
+    }
+    try {
+        const r = await api(summonFormCtx.apiPath + summonFormCtx.discord + '/summon', { method: 'POST', body: JSON.stringify(body) });
+        toast(r.pending ? '✅ تم إرسال طلب الاستدعاء لقيادة الشرطة العسكرية' : '✅ تم إرسال الاستدعاء');
+        closeWarnForm();
+        if (summonFormCtx.reloadCall) { try { Function(summonFormCtx.reloadCall)(); } catch (e) {} }
+    } catch (e) { toast(e.message); }
+}
+
 // ── إشعار للجميع (لكل الأعضاء المسجلين بالموقع) ─────────────────────────
 function openWarnAllForm() {
     const box = document.getElementById('wf-box');
@@ -2930,6 +3465,7 @@ async function init() {
     if (ME.blocked) { renderBlocked(ME.reason); return; }
     lastKnownRank = ME.rank;
     buildNav();
+    if (checkSummonGate()) return;
     if (!ME.registeredName || !ME.unit) { renderSetup(); return; }
     let att;
     try { att = await api('/api/attendance/status'); } catch (e) { att = { status: 'out' }; }
@@ -2956,6 +3492,9 @@ function buildNav() {
         { label: '🪪 بطاقتي', fn: 'renderCard()' },
     );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
+    if (ME.mpInfo || ME.isSeniorAdmin) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
+    else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
+    else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) items.push({ label: '👥 مسؤول الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     if (ME.attendanceOfficerInfo) items.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
@@ -2966,6 +3505,9 @@ function buildNav() {
 function renderFabs() {
     const fabs = [];
     if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
+    if (ME.mpInfo || ME.isSeniorAdmin) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
+    else if (ME.mpPersonnelOfficer) fabs.push({ label: '🚔 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
+    else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
     if (ME.personnelOfficerInfo) fabs.push({ label: '👥 لوحة الأفراد', fn: 'renderPersonnelOfficerPanel()' });
     if (ME.attendanceOfficerInfo) fabs.push({ label: '🖐️ لوحة التحضير', fn: 'renderAttendanceOfficerPanel()' });
@@ -3252,7 +3794,7 @@ function renderNotes() {
     if (!box) return;
     if (!ME.notes || ME.notes.length === 0) { box.innerHTML = ''; return; }
     box.innerHTML = '<div style="font-size:13px;color:var(--gold-soft);margin-bottom:6px;">ملاحظات عليك:</div>' +
-        ME.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-bottom:6px;font-size:13px;">\${n.text}</div>\`).join('');
+        ME.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-bottom:6px;font-size:13px;">\${n.text}\${n.image ? \`<img src="\${n.image}" style="max-width:180px;border-radius:6px;margin-top:6px;display:block;cursor:pointer;" onclick="setPhotoPageImage('\${n.image}');openPhotoPage();">\` : ''}</div>\`).join('');
 }
 async function loadMine(silent) {
     const box = document.getElementById('mine-list');
@@ -3801,6 +4343,7 @@ function renderSectorsBox() {
     const box = document.getElementById('admin-content');
     if (!box) return;
     const keys = Object.keys(sectorsCache.sectors);
+    const mp = sectorsCache.mpLeadership || {};
     box.innerHTML = keys.map(key => {
         const label = sectorsCache.sectors[key];
         const sec = (sectorsCache.leadership && sectorsCache.leadership[key]) || {};
@@ -3842,7 +4385,71 @@ function renderSectorsBox() {
             <div id="picker-\${key}-personnelOfficer"></div>
             <div id="picker-\${key}-attendanceOfficer"></div>
         </div>\`;
-    }).join('');
+    }).join('') + \`
+        <div class="card">
+            <h3>🚔 الشرطة العسكرية</h3>
+            <div class="row" style="margin-top:8px;">
+                <span>القائد: <b style="color:\${mp.commanderName ? '#4ade80' : 'var(--muted)'};">\${mp.commanderName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm" onclick="openMPPicker('commander')">قائد الشرطة العسكرية</button>
+                    \${mp.commanderName ? '<button class="btn danger sm" onclick="removeMPRole(\\'commander\\')">إزالة</button>' : ''}
+                </div>
+            </div>
+            <div class="row" style="margin-top:8px;">
+                <span>النائب: <b style="color:\${mp.deputyName ? '#4ade80' : 'var(--muted)'};">\${mp.deputyName || 'غير معيّن'}</b></span>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openMPPicker('deputy')">نائب الشرطة العسكرية</button>
+                    \${mp.deputyName ? '<button class="btn danger sm" onclick="removeMPRole(\\'deputy\\')">إزالة</button>' : ''}
+                </div>
+            </div>
+            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول أفراد الشرطة العسكرية يعيّنه القائد أو النائب من داخل لوحة الشرطة العسكرية نفسها.</div>
+            <div id="picker-mp-commander"></div>
+            <div id="picker-mp-deputy"></div>
+        </div>\`;
+}
+function openMPPicker(role) {
+    ['commander', 'deputy'].forEach(r => {
+        const el = document.getElementById('picker-mp-' + r);
+        if (el && r !== role) el.innerHTML = '';
+    });
+    const el = document.getElementById('picker-mp-' + role);
+    if (!el) return;
+    if (el.innerHTML.trim()) { el.innerHTML = ''; return; }
+    el.innerHTML = \`
+        <div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
+            <input placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="searchMPCandidate('\${role}', this.value)">
+            <div id="cand-mp-\${role}"></div>
+        </div>\`;
+}
+let mpSearchTimer = null;
+function searchMPCandidate(role, q) {
+    clearTimeout(mpSearchTimer);
+    mpSearchTimer = setTimeout(async () => {
+        const box = document.getElementById('cand-mp-' + role);
+        if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = list.filter(p => p.registeredName).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="assignMPRole('\${role}','\${p.discord}')">تعيين</button>
+                    </div>
+                </div>\`).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+    }, 350);
+}
+async function assignMPRole(role, discordId) {
+    try { await api('/api/senior/mp/assign', { method: 'POST', body: JSON.stringify({ role, discordId }) }); toast('تم التعيين'); loadSectors(); }
+    catch (e) { toast(e.message); }
+}
+async function removeMPRole(role) {
+    if (!confirm('متأكد تبي تزيله من هذا المنصب؟')) return;
+    try { await api('/api/senior/mp/remove', { method: 'POST', body: JSON.stringify({ role }) }); toast('تم'); loadSectors(); }
+    catch (e) { toast(e.message); }
 }
 function openSectorPicker(sectorKey, role) {
     ['commander', 'deputy', 'personnelOfficer', 'attendanceOfficer'].forEach(r => {
@@ -4198,11 +4805,7 @@ function sectorAssignUnit(discord) {
         .then(() => { toast('تم التعيين'); loadSectorMembers(); }).catch(e => toast(e.message));
 }
 function sectorAddNote(discord) {
-    const text = prompt('اكتب الملاحظة:');
-    if (text === null) return;
-    if (!text.trim()) return toast('اكتب الملاحظة');
-    api('/api/sector/personnel/' + discord + '/note', { method: 'POST', body: JSON.stringify({ text }) })
-        .then(() => toast('تمت الإضافة')).catch(e => toast(e.message));
+    openNoteForm(discord, '/api/sector/personnel/', 'loadSectorMembers()');
 }
 async function loadSectorViolations() {
     const box = document.getElementById('sector-content');
@@ -4365,11 +4968,7 @@ function poPromotionRequest(discord, direction) {
         .then(() => toast('✅ تم إرسال الطلب لقيادة القطاع')).catch(e => toast(e.message));
 }
 function poAddNote(discord) {
-    const text = prompt('اكتب الملاحظة:');
-    if (text === null) return;
-    if (!text.trim()) return toast('اكتب الملاحظة');
-    api('/api/personnel-officer/personnel/' + discord + '/note', { method: 'POST', body: JSON.stringify({ text }) })
-        .then(() => toast('تمت الإضافة')).catch(e => toast(e.message));
+    openNoteForm(discord, '/api/personnel-officer/personnel/', 'loadPoMembers()');
 }
 async function loadPoViolations() {
     const box = document.getElementById('po-content');
@@ -4413,6 +5012,382 @@ function poReject(id) {
     if (!reason.trim()) return toast('لازم تكتب سبب');
     api('/api/personnel-officer/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
         .then(() => { toast('تم الرفض'); loadPoViolations(); }).catch(e => toast(e.message));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// لوحة الشرطة العسكرية — قائد/نائب (3 صفحات: العساكر، التقارير، لوق القطاعات)
+// ══════════════════════════════════════════════════════════════════════════
+let mpTab = 'members';
+function renderMPPanel() {
+    if (!ME.mpInfo && !ME.isSeniorAdmin) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>🚔 لوحة الشرطة العسكرية \${ME.mpInfo ? ('(' + (ME.mpInfo.role === 'commander' ? 'قائد' : 'نائب') + ')') : '(كبار المسؤولين)'}</h2>
+            <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
+        </div>
+        <div class="tabs">
+            <div class="tab active" onclick="mpTabSwitch('members', this)">👤 العساكر</div>
+            <div class="tab" onclick="mpTabSwitch('requests', this)">📣 طلبات الاستدعاء</div>
+            <div class="tab" onclick="mpTabSwitch('reports', this)">📄 التقارير</div>
+            <div class="tab" onclick="mpTabSwitch('log', this)">📜 لوق القطاعات</div>
+            <div class="tab" onclick="mpTabSwitch('po', this)">👮 مسؤول الأفراد</div>
+        </div>
+        <div id="mp-content"></div>\`;
+    mpTabSwitch('members');
+}
+function mpTabSwitch(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    mpTab = name;
+    if (name === 'members') loadMPMembers();
+    if (name === 'requests') loadMPSummonRequests();
+    if (name === 'reports') loadMPReports();
+    if (name === 'log') loadMPSectorLog();
+    if (name === 'po') loadMPPOBox();
+}
+async function loadMPMembers() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/members'); }
+    catch (e) { if (mpTab !== 'members') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'members') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد عساكر مسجلين بعد</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                    \${p.summon && p.summon.status === 'approved' ? \`<div style="color:#f59e0b;font-size:12px;margin-top:3px;">📣 عليه استدعاء نشط — \${p.summon.timeLabel || ''}\${p.summon.enteredAt ? ' (دخل الاستدعاء)' : ''}</div>\` : ''}
+                    \${p.summon && p.summon.status === 'pending' ? '<div style="color:#fbbf24;font-size:12px;margin-top:3px;">⏳ طلب استدعاء بانتظار قبولك</div>' : ''}
+                </div>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📝 ملاحظة</button>
+                    \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📣 استدعاء</button>\` : ''}
+                    \${p.summon && p.summon.status === 'approved' ? \`<button class="btn sm danger" onclick="mpStopSummon('\${p.discord}')">إيقاف الاستدعاء</button>\` : ''}
+                </div>
+            </div>
+        </div>\`).join('');
+}
+function mpStopSummon(discord) {
+    api('/api/mp/personnel/' + discord + '/summon/stop', { method: 'POST' })
+        .then(() => { toast('تم إيقاف الاستدعاء'); loadMPMembers(); }).catch(e => toast(e.message));
+}
+async function loadMPSummonRequests() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/summon-requests'); }
+    catch (e) { if (mpTab !== 'requests') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'requests') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات استدعاء معلّقة</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.rank}</span>
+                    <div style="color:var(--gold-soft);margin-top:4px;">🕒 \${p.summon.timeLabel}</div>
+                </div>
+                <div class="row" style="gap:8px;">
+                    <button class="btn sm" onclick="mpSummonReqDecide('\${p.discord}','approve')">قبول</button>
+                    <button class="btn danger sm" onclick="mpSummonReqDecide('\${p.discord}','reject')">رفض</button>
+                </div>
+            </div>
+        </div>\`).join('');
+}
+function mpSummonReqDecide(discord, action) {
+    api('/api/mp/summon-requests/' + discord + '/' + action, { method: 'POST' })
+        .then(() => { toast(action === 'approve' ? '✅ تم قبول الاستدعاء' : 'تم رفض الطلب'); loadMPSummonRequests(); })
+        .catch(e => toast(e.message));
+}
+async function loadMPReports() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/reports/pending'); }
+    catch (e) { if (mpTab !== 'reports') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'reports') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تقارير معلّقة</div>'; return; }
+    box.innerHTML = data.list.map(r => \`
+        <div class="card">
+            <b>\${r.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${r.reporterRank})</span>
+            <div style="margin-top:6px;color:var(--gold-soft);">وش سوى بالاستلام:</div>
+            <div style="font-size:13px;margin-top:2px;">\${r.dutyReport}</div>
+            \${r.notesIssued && r.notesIssued.length ? \`<div style="margin-top:8px;color:var(--gold-soft);">الملاحظات/التحذيرات المسجّلة (\${r.notesIssued.length}):</div>\` + r.notesIssued.map(n => \`<div style="font-size:12px;color:var(--muted);margin-top:3px;">• \${n.name || n.tag} (\${n.kind === 'warning' ? 'تحذير' : 'ملاحظة'}) — \${n.reason}</div>\`).join('') : ''}
+            <div class="row" style="gap:8px;margin-top:10px;">
+                <button class="btn sm" onclick="mpReportDecide('\${r._id}','approve')">قبول التقرير</button>
+                <button class="btn danger sm" onclick="mpReportDecide('\${r._id}','reject')">رفض</button>
+            </div>
+        </div>\`).join('');
+}
+function mpReportDecide(id, action) {
+    if (action === 'reject') {
+        const reason = prompt('اكتب سبب الرفض:');
+        if (reason === null) return;
+        if (!reason.trim()) return toast('لازم تكتب سبب');
+        api('/api/mp/reports/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+            .then(() => { toast('تم الرفض'); loadMPReports(); }).catch(e => toast(e.message));
+        return;
+    }
+    api('/api/mp/reports/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('✅ تم قبول التقرير'); loadMPReports(); }).catch(e => toast(e.message));
+}
+async function loadMPSectorLog() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/sector-log'); }
+    catch (e) { if (mpTab !== 'log') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'log') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد أحداث بعد</div>'; return; }
+    box.innerHTML = data.list.map(l => \`
+        <div class="card" style="padding:10px 14px;">
+            <div style="font-size:13px;"><b>\${l.action}</b> — \${l.actorTag || '-'}</div>
+            \${l.discordTag ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">على: \${l.discordTag}</div>\` : ''}
+            \${l.details ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">\${l.details}</div>\` : ''}
+            <div style="font-size:11px;color:var(--muted);margin-top:4px;">\${new Date(l.createdAt).toLocaleString('ar')}</div>
+        </div>\`).join('');
+}
+// صندوق تعيين/إزالة مسؤول أفراد الشرطة العسكرية داخل لوحة القيادة نفسها
+async function loadMPPOBox() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = \`<div class="card"><h3>👮 مسؤول أفراد الشرطة العسكرية</h3><div id="mp-po-current">جارِ التحميل...</div><input id="mp-po-search" placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="searchMPPOCandidate(this.value)"><div id="mp-po-cands"></div></div>\`;
+    try {
+        const { mpLeadership } = await api('/api/senior/mp/leadership').catch(() => ({ mpLeadership: null }));
+        const cur = mpLeadership || {};
+        document.getElementById('mp-po-current').innerHTML = \`الحالي: <b style="color:\${cur.personnelOfficerName ? '#4ade80' : 'var(--muted)'};">\${cur.personnelOfficerName || 'غير معيّن'}</b> \${cur.personnelOfficerName ? '<button class="btn danger sm" onclick="mpRemovePO()">إزالة</button>' : ''}\`;
+    } catch (e) { document.getElementById('mp-po-current').innerHTML = '—'; }
+}
+let mpPoSearchTimer = null;
+function searchMPPOCandidate(q) {
+    clearTimeout(mpPoSearchTimer);
+    mpPoSearchTimer = setTimeout(async () => {
+        const box = document.getElementById('mp-po-cands');
+        if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            const { list } = await api('/api/mp/members');
+            const filtered = list.filter(p => p.registeredName && p.registeredName.includes(q));
+            if (filtered.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = filtered.slice(0, 15).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="mpAssignPO('\${p.discord}')">تعيين</button>
+                    </div>
+                </div>\`).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+    }, 350);
+}
+function mpAssignPO(discordId) {
+    api('/api/mp/personnel-officer/assign', { method: 'POST', body: JSON.stringify({ discordId }) })
+        .then(() => { toast('تم التعيين'); loadMPPOBox(); }).catch(e => toast(e.message));
+}
+function mpRemovePO() {
+    if (!confirm('متأكد تبي تزيله من منصب مسؤول الأفراد؟')) return;
+    api('/api/mp/personnel-officer/remove', { method: 'POST' })
+        .then(() => { toast('تم'); loadMPPOBox(); }).catch(e => toast(e.message));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// لوحة مسؤول أفراد الشرطة العسكرية — نطاقه: أعضاء الشرطة العسكرية (ما عدا القائد والنائب)
+// ══════════════════════════════════════════════════════════════════════════
+let mpPoTab = 'members';
+function renderMPPOPanel() {
+    if (!ME.mpPersonnelOfficer && !ME.isSeniorAdmin) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>👮 مسؤول أفراد الشرطة العسكرية</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="card" style="color:var(--muted);font-size:13px;">صلاحيتك تشمل أعضاء الشرطة العسكرية ما عدا القائد والنائب.</div>
+        <div class="tabs">
+            <div class="tab active" onclick="mpPoTabSwitch('members', this)">الأعضاء</div>
+            <div class="tab" onclick="mpPoTabSwitch('reports', this)">التقارير</div>
+        </div>
+        <div id="mp-po-content"></div>\`;
+    mpPoTabSwitch('members');
+}
+function mpPoTabSwitch(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    mpPoTab = name;
+    if (name === 'members') loadMPPOMembers();
+    if (name === 'reports') loadMPPOReports();
+}
+async function loadMPPOMembers() {
+    const box = document.getElementById('mp-po-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/po/members'); }
+    catch (e) { if (mpPoTab !== 'members') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpPoTab !== 'members') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد أعضاء حالياً</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div><b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span></div>
+                <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/po/personnel/','loadMPPOMembers()')">📝 ملاحظة</button>
+            </div>
+        </div>\`).join('');
+}
+async function loadMPPOReports() {
+    const box = document.getElementById('mp-po-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/po/reports/pending'); }
+    catch (e) { if (mpPoTab !== 'reports') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpPoTab !== 'reports') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تقارير معلّقة</div>'; return; }
+    box.innerHTML = data.list.map(r => \`
+        <div class="card">
+            <b>\${r.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${r.reporterRank})</span>
+            <div style="margin-top:6px;color:var(--gold-soft);">وش سوى بالاستلام:</div>
+            <div style="font-size:13px;margin-top:2px;">\${r.dutyReport}</div>
+            <div class="row" style="gap:8px;margin-top:10px;">
+                <button class="btn sm" onclick="mpPoReportDecide('\${r._id}','approve')">قبول التقرير</button>
+                <button class="btn danger sm" onclick="mpPoReportDecide('\${r._id}','reject')">رفض</button>
+            </div>
+        </div>\`).join('');
+}
+function mpPoReportDecide(id, action) {
+    if (action === 'reject') {
+        const reason = prompt('اكتب سبب الرفض:');
+        if (reason === null) return;
+        if (!reason.trim()) return toast('لازم تكتب سبب');
+        api('/api/mp/po/reports/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+            .then(() => { toast('تم الرفض'); loadMPPOReports(); }).catch(e => toast(e.message));
+        return;
+    }
+    api('/api/mp/po/reports/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('✅ تم قبول التقرير'); loadMPPOReports(); }).catch(e => toast(e.message));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// بوابة عضو الشرطة العسكرية العادي — العساكر (ملاحظة + طلب استدعاء) + تسجيل تقرير
+// ══════════════════════════════════════════════════════════════════════════
+let mpMemberTab = 'members';
+function renderMPMemberPanel() {
+    if (!ME.isMilitaryPolice) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>🚔 الشرطة العسكرية</h2>
+            <div class="row" style="gap:8px;">
+                <button class="btn sm" onclick="openMPReportForm()">+ تسجيل تقرير جديد</button>
+                <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
+            </div>
+        </div>
+        <div id="mp-member-content"></div>\`;
+    loadMPMemberMembers();
+}
+async function loadMPMemberMembers() {
+    const box = document.getElementById('mp-member-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/members'); }
+    catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد عساكر مسجلين بعد</div>'; return; }
+    box.innerHTML = data.list.map(p => \`
+        <div class="card">
+            <div class="row">
+                <div>
+                    <b>\${p.registeredName || p.discordTag}</b> <span style="color:var(--muted);font-size:12px;">\${p.unit || ''} • \${p.rank}</span>
+                    \${p.summon && p.summon.status === 'approved' ? '<div style="color:#f59e0b;font-size:12px;margin-top:3px;">📣 عليه استدعاء نشط</div>' : ''}
+                    \${p.summon && p.summon.status === 'pending' ? '<div style="color:#fbbf24;font-size:12px;margin-top:3px;">⏳ في طلب استدعاء بانتظار القيادة</div>' : ''}
+                </div>
+                <div class="row" style="gap:6px;">
+                    <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📝 ملاحظة</button>
+                    \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMemberMembers()')">📣 طلب استدعاء</button>\` : ''}
+                </div>
+            </div>
+        </div>\`).join('');
+}
+// ── فورم تسجيل تقرير الشرطة العسكرية ──
+let mpReportNotes = [];
+function openMPReportForm() {
+    mpReportNotes = [];
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>📝 تسجيل تقرير شرطة عسكرية</h2><button class="btn gray sm" onclick="renderMPMemberPanel()">رجوع</button></div>
+        <div class="card">
+            <label>وش سويت بالاستلام؟</label>
+            <textarea id="mpr-duty" placeholder="اكتب وش سويت خلال الاستلام..."></textarea>
+        </div>
+        <div class="card">
+            <div class="row"><h3>العساكر اللي عطيتهم ملاحظة/تحذير خلال الشفت</h3><button class="btn sm gray" onclick="addMPReportNoteRow()">+ إضافة</button></div>
+            <div id="mpr-notes-list"></div>
+        </div>
+        <div class="card"><button class="btn" onclick="submitMPReport()">إرسال التقرير</button></div>\`;
+}
+function addMPReportNoteRow() {
+    const i = mpReportNotes.length;
+    mpReportNotes.push({ discord: '', tag: '', name: '', kind: 'note', reason: '' });
+    renderMPReportNotesList();
+}
+function renderMPReportNotesList() {
+    const box = document.getElementById('mpr-notes-list');
+    if (!box) return;
+    box.innerHTML = mpReportNotes.map((n, i) => \`
+        <div class="card" style="margin-top:8px;padding:10px 14px;">
+            <div class="row" style="gap:6px;">
+                <input placeholder="اسم/آيدي العسكري" value="\${n.name}" oninput="mpReportNotes[\${i}].name=this.value" style="flex:2;">
+                <select onchange="mpReportNotes[\${i}].kind=this.value" style="flex:1;">
+                    <option value="note" \${n.kind === 'note' ? 'selected' : ''}>ملاحظة</option>
+                    <option value="warning" \${n.kind === 'warning' ? 'selected' : ''}>تحذير</option>
+                </select>
+                <button class="btn danger sm" onclick="removeMPReportNoteRow(\${i})">حذف</button>
+            </div>
+            <textarea placeholder="السبب" oninput="mpReportNotes[\${i}].reason=this.value" style="margin-top:6px;">\${n.reason}</textarea>
+        </div>\`).join('');
+}
+function removeMPReportNoteRow(i) {
+    mpReportNotes.splice(i, 1);
+    renderMPReportNotesList();
+}
+async function submitMPReport() {
+    const dutyReport = document.getElementById('mpr-duty').value;
+    if (!dutyReport || !dutyReport.trim()) return toast('اكتب وش سويت بالاستلام');
+    try {
+        await api('/api/mp/reports/submit', { method: 'POST', body: JSON.stringify({ dutyReport, notesIssued: mpReportNotes }) });
+        toast('✅ تم إرسال التقرير للمراجعة');
+        renderMPMemberPanel();
+    } catch (e) { toast(e.message); }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// بوابة "لديك استدعاء" — تظهر فور تسجيل الدخول لو عليه استدعاء نشط
+// ══════════════════════════════════════════════════════════════════════════
+function checkSummonGate() {
+    if (!ME || !ME.summon || ME.summon.status !== 'approved') return false;
+    const box = document.getElementById('app');
+    const locked = ME.summon.unlockAt && new Date(ME.summon.unlockAt).getTime() > Date.now();
+    if (ME.summon.enteredAt) return false; // دخل الاستدعاء مسبقاً — يكمل استخدام الموقع عادي
+    box.innerHTML = \`
+        <div class="card center" style="margin-top:60px;border-color:#f59e0b;">
+            <h2 style="color:#f59e0b;">📣 لديك استدعاء</h2>
+            <p style="color:var(--muted);margin-top:8px;">استدعاء من الشرطة العسكرية — \${ME.summon.timeLabel || 'الآن'}</p>
+            \${locked
+                ? \`<button class="btn gray" style="margin-top:16px;" onclick="toast('الروم بيفتح الساعة \${ME.summon.timeLabel}')">🔒 دخول الاستدعاء</button>\`
+                : \`<button class="btn" style="margin-top:16px;" onclick="enterSummon()">🚪 دخول الاستدعاء</button>\`}
+        </div>\`;
+    document.getElementById('nav-links').innerHTML = '';
+    document.getElementById('mobile-menu').innerHTML = '';
+    return true;
+}
+async function enterSummon() {
+    try {
+        const r = await api('/api/summon/enter', { method: 'POST' });
+        window.open(r.url, '_blank');
+        toast('✅ تفضل ادخل الروم');
+        ME.summon.enteredAt = new Date().toISOString();
+        init();
+    } catch (e) {
+        if (e.message && e.message.includes('بيفتح')) toast(e.message);
+        else toast(e.message);
+    }
 }
 
 async function loadPersonnel() {
@@ -4481,10 +5456,7 @@ async function deletePersonnel(discordId, displayName) {
     } catch (e) { toast(e.message); }
 }
 function addNote(discordId) {
-    const text = prompt('اكتب الملاحظة:');
-    if (!text || !text.trim()) return;
-    api('/api/senior/personnel/' + discordId + '/note', { method: 'POST', body: JSON.stringify({ text }) })
-        .then(() => toast('تمت الإضافة')).catch(e => toast(e.message));
+    openNoteForm(discordId, '/api/senior/personnel/', 'searchPersonnel()');
 }
 function toggleBlock(discordId, blocked) {
     api('/api/senior/personnel/' + discordId + '/block', { method: 'POST', body: JSON.stringify({ blocked }) })
@@ -4696,6 +5668,7 @@ async function loadNotesPage() {
                 <div>
                     <b>\${n.personnelName}</b>
                     <div style="margin-top:4px;">\${n.text}</div>
+                    \${n.image ? \`<img src="\${n.image}" style="max-width:220px;border-radius:8px;margin-top:6px;display:block;cursor:pointer;" onclick="setPhotoPageImage('\${n.image}');openPhotoPage();">\` : ''}
                     <div style="color:var(--muted);font-size:12px;margin-top:4px;">أضافها: \${n.addedByTag || n.addedBy || '-'} • \${new Date(n.createdAt).toLocaleString('ar')}</div>
                 </div>
                 <button class="btn danger sm" onclick="deleteNote('\${n.discord}', '\${n.noteId}')">🗑️ حذف</button>
