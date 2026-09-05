@@ -3529,7 +3529,9 @@ function buildNav() {
     const items = [
         { label: '🏠 الرئيسية', fn: 'renderDashboard()' },
     ];
-    if (ME.isAntiDrugs && !ME.isSeniorAdmin) {
+    if (ME.isMilitaryPolice && !ME.isSeniorAdmin) {
+        items.push({ label: '📝 تسجيل تقرير (شرطة عسكرية)', fn: "openMPReportForm('renderDashboard()')" });
+    } else if (ME.isAntiDrugs && !ME.isSeniorAdmin) {
         items.push({ label: '📝 تسجيل تقرير', fn: 'renderNewReport()' });
     } else {
         items.push({ label: '📝 تسجيل مخالفة', fn: 'renderNewViolation()' });
@@ -3540,7 +3542,7 @@ function buildNav() {
         { label: '🪪 بطاقتي', fn: 'renderCard()' },
     );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
-    if (ME.mpInfo || ME.isSeniorAdmin) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
+    if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) items.push({ label: '🎖️ لوحة قيادة القطاع', fn: 'renderSectorPanel()' });
@@ -3553,7 +3555,7 @@ function buildNav() {
 function renderFabs() {
     const fabs = [];
     if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
-    if (ME.mpInfo || ME.isSeniorAdmin) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
+    if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) fabs.push({ label: '🚔 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
     else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
     if (ME.sectorInfo) fabs.push({ label: '🎖️ لوحة القيادة', fn: 'renderSectorPanel()' });
@@ -5067,9 +5069,9 @@ function poReject(id) {
 // ══════════════════════════════════════════════════════════════════════════
 let mpTab = 'members';
 function renderMPPanel() {
-    if (!ME.mpInfo && !ME.isSeniorAdmin) return renderDashboard();
+    if (!ME.mpInfo) return renderDashboard();
     document.getElementById('app').innerHTML = \`
-        <div class="card row"><h2>🚔 لوحة الشرطة العسكرية \${ME.mpInfo ? ('(' + (ME.mpInfo.role === 'commander' ? 'قائد' : 'نائب') + ')') : '(كبار المسؤولين)'}</h2>
+        <div class="card row"><h2>🚔 لوحة الشرطة العسكرية \${ME.mpInfo ? (' (' + (ME.mpInfo.role === 'commander' ? 'قائد' : 'نائب') + ')') : ''}</h2>
             <div class="row" style="gap:8px;">
                 <button class="btn sm" onclick="openMPReportForm('renderMPPanel()')">+ تسجيل تقرير جديد</button>
                 <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
