@@ -5069,26 +5069,34 @@ let mpLeaderListCache = [];
 async function loadMPMembers() {
     const box = document.getElementById('mp-content');
     if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    box.innerHTML = \`<div class="card"><input id="mp-leader-search" placeholder="بحث بالاسم / اليونت / الرتبة" onkeyup="if(event.key==='Enter') filterMPLeaderMembers();"><button class="btn sm" onclick="filterMPLeaderMembers()">بحث</button></div><div id="mp-leader-results"><div class="card">جارِ التحميل...</div></div>\`;
     let data;
     try { data = await api('/api/mp/members'); }
-    catch (e) { if (mpTab !== 'members') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    catch (e) {
+        if (mpTab !== 'members') return;
+        document.getElementById('mp-leader-results').innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`;
+        return;
+    }
     if (mpTab !== 'members') return;
     mpLeaderListCache = data.list;
     renderMPLeaderMembersList(mpLeaderListCache);
 }
-function filterMPLeaderMembers(q) {
-    q = (q || '').trim();
+function filterMPLeaderMembers() {
+    const input = document.getElementById('mp-leader-search');
+    const q = input ? input.value.trim() : '';
     if (!q) return renderMPLeaderMembersList(mpLeaderListCache);
-    const filtered = mpLeaderListCache.filter(p => (p.registeredName || p.discordTag || '').includes(q) || (p.unit || '').includes(q));
+    const filtered = mpLeaderListCache.filter(p =>
+        (p.registeredName || p.discordTag || '').includes(q) ||
+        (p.unit || '').includes(q) ||
+        (p.rank || '').includes(q)
+    );
     renderMPLeaderMembersList(filtered);
 }
 function renderMPLeaderMembersList(list) {
-    const box = document.getElementById('mp-content');
+    const box = document.getElementById('mp-leader-results');
     if (!box) return;
-    const searchBar = '<div class="card"><input id="mp-leader-search" placeholder="🔍 ابحث بالاسم..." value="' + (document.getElementById('mp-leader-search') ? document.getElementById('mp-leader-search').value : '') + '" oninput="filterMPLeaderMembers(this.value)"></div>';
-    if (list.length === 0) { box.innerHTML = searchBar + '<div class="card center" style="color:var(--muted);">لا يوجد نتائج</div>'; return; }
-    box.innerHTML = searchBar + list.map(p => \`
+    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد نتائج</div>'; return; }
+    box.innerHTML = list.map(p => \`
         <div class="card">
             <div class="row">
                 <div>
@@ -5316,24 +5324,28 @@ function renderMPMemberPanel() {
                 <button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button>
             </div>
         </div>
-        <div class="card"><input id="mp-member-search" placeholder="🔍 ابحث بالاسم..." oninput="filterMPMemberList(this.value)"></div>
-        <div id="mp-member-content"></div>\`;
+        <div class="card"><input id="mp-member-search" placeholder="بحث بالاسم / اليونت / الرتبة" onkeyup="if(event.key==='Enter') filterMPMemberList();"><button class="btn sm" onclick="filterMPMemberList()">بحث</button></div>
+        <div id="mp-member-content"><div class="card">جارِ التحميل...</div></div>\`;
     loadMPMemberMembers();
 }
 async function loadMPMemberMembers() {
     const box = document.getElementById('mp-member-content');
     if (!box) return;
-    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
     let data;
     try { data = await api('/api/mp/members'); }
     catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
     mpMemberListCache = data.list;
     renderMPMemberList(mpMemberListCache);
 }
-function filterMPMemberList(q) {
-    q = (q || '').trim();
+function filterMPMemberList() {
+    const input = document.getElementById('mp-member-search');
+    const q = input ? input.value.trim() : '';
     if (!q) return renderMPMemberList(mpMemberListCache);
-    const filtered = mpMemberListCache.filter(p => (p.registeredName || p.discordTag || '').includes(q) || (p.unit || '').includes(q));
+    const filtered = mpMemberListCache.filter(p =>
+        (p.registeredName || p.discordTag || '').includes(q) ||
+        (p.unit || '').includes(q) ||
+        (p.rank || '').includes(q)
+    );
     renderMPMemberList(filtered);
 }
 function renderMPMemberList(list) {
