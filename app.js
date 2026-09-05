@@ -491,9 +491,9 @@ function computeSummonUnlockAt(mode, hour, minute, ampm) {
     if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
     return d;
 }
-// هل هذا الشخص محظور عليه استخدام الموقع مؤقتاً بسبب استدعاء نشط لم يدخل له بعد؟
+// هل هذا الشخص محظور عليه استخدام الموقع مؤقتاً بسبب استدعاء نشط؟ يبقى محظور حتى تنهي قيادة الشرطة العسكرية الاستدعاء (مو مجرد دخول الروم)
 function isSummonBlocking(p) {
-    return !!(p && p.summon && p.summon.status === "approved" && !p.summon.enteredAt);
+    return !!(p && p.summon && p.summon.status === "approved");
 }
 
 function sectorRoleId(sectorKey) {
@@ -2988,10 +2988,15 @@ app.get("/api/mp/reports/pending", ensureMPLeader, async (req, res) => {
     const list = await MPReport.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200);
     res.json({ list });
 });
+// كل التقارير بجميع حالاتها (معلّقة/مقبولة/مرفوضة) — قائد ونائب الشرطة العسكرية يشوفون تقارير بعض حتى لو انقبلت من قبل
+app.get("/api/mp/reports/all", ensureMPLeader, async (req, res) => {
+    const list = await MPReport.find({}).sort({ createdAt: -1 }).limit(300);
+    res.json({ list });
+});
 app.post("/api/mp/reports/:id/approve", ensureMPLeader, async (req, res) => {
     const r = await MPReport.findById(req.params.id);
-    if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
-    r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    if (!r || r.status === "approved") return res.status(404).json({ error: "غير موجود أو مقبول أصلاً" });
+    r.status = "approved"; r.rejectReason = null; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
     await r.save();
     await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $inc: { points: CONFIG.MP_REPORT_POINTS_APPROVE } });
     await checkAutoPromotion(r.reporterDiscord);
@@ -3007,6 +3012,13 @@ app.post("/api/mp/reports/:id/reject", ensureMPLeader, async (req, res) => {
     await r.save();
     await Personnel.findOneAndUpdate({ discord: r.reporterDiscord }, { $push: { warnings: { kind: "notice", reason: "تم رفض تقريرك — انتبه المرة الجاية. السبب: " + reason.trim(), issuedBy: req.user.id, issuedByTag: req.user.username } } });
     await logEvent({ action: "رفض تقرير شرطة عسكرية", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: reason.trim() });
+    res.json({ ok: true });
+});
+// حذف تقرير نهائياً — قائد ونائب الشرطة العسكرية فقط
+app.delete("/api/mp/reports/:id", ensureMPLeader, async (req, res) => {
+    const r = await MPReport.findByIdAndDelete(req.params.id);
+    if (!r) return res.status(404).json({ error: "غير موجود" });
+    await logEvent({ action: "حذف تقرير شرطة عسكرية نهائياً", discordId: r.reporterDiscord, discordTag: r.reporterTag, actorId: req.user.id, actorTag: req.user.username + " (قيادة الشرطة العسكرية)", details: r.dutyReport ? r.dutyReport.slice(0, 100) : "-" });
     res.json({ ok: true });
 });
 
@@ -5237,14 +5249,14 @@ function renderMPLeaderMembersList(list) {
                     <button class="btn sm gray" onclick="openNoteForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📝 ملاحظة</button>
                     <button class="btn sm" style="background:#7f1d1d;color:#fff;" onclick="openWarnForm('\${p.discord}','/api/mp/personnel/')">⚠️ تحذير</button>
                     \${(!p.summon || p.summon.status === 'none') ? \`<button class="btn sm" onclick="openSummonForm('\${p.discord}','/api/mp/personnel/','loadMPMembers()')">📣 استدعاء</button>\` : ''}
-                    \${p.summon && p.summon.status === 'approved' ? \`<button class="btn sm danger" onclick="mpStopSummon('\${p.discord}')">إيقاف الاستدعاء</button>\` : ''}
+                    \${p.summon && p.summon.status === 'approved' ? \`<button class="btn sm danger" onclick="mpStopSummon('\${p.discord}')">✅ إنهاء الاستدعاء</button>\` : ''}
                 </div>
             </div>
         </div>\`).join('');
 }
 function mpStopSummon(discord) {
     api('/api/mp/personnel/' + discord + '/summon/stop', { method: 'POST' })
-        .then(() => { toast('تم إيقاف الاستدعاء'); loadMPMembers(); }).catch(e => toast(e.message));
+        .then(() => { toast('✅ تم إنهاء الاستدعاء'); loadMPMembers(); }).catch(e => toast(e.message));
 }
 function renderMPFileSearch() {
     const box = document.getElementById('mp-content');
@@ -5321,10 +5333,27 @@ function mpSummonReqDecide(discord, action) {
         .then(() => { toast(action === 'approve' ? '✅ تم قبول الاستدعاء' : 'تم رفض الطلب'); loadMPSummonRequests(); })
         .catch(e => toast(e.message));
 }
-function renderMPReportCard(r, decideFn) {
+function renderMPReportCard(r, decideFn, isLeaderView) {
+    const statusBadge = r.status === 'approved' ? '<span style="color:#4ade80;font-size:12px;">✅ مقبول</span>'
+        : r.status === 'rejected' ? '<span style="color:#f87171;font-size:12px;">❌ مرفوض</span>'
+        : '<span style="color:#fbbf24;font-size:12px;">⏳ معلّق</span>';
+    let actions = '';
+    if (r.status === 'pending') {
+        actions = \`
+            <button class="btn sm" onclick="\${decideFn}('\${r._id}','approve')">قبول التقرير</button>
+            <button class="btn danger sm" onclick="\${decideFn}('\${r._id}','reject')">رفض</button>\`;
+    } else if (isLeaderView && r.status === 'approved') {
+        actions = \`<button class="btn danger sm" onclick="mpDeleteReport('\${r._id}')">🗑️ حذف نهائي</button>\`;
+    } else if (isLeaderView && r.status === 'rejected') {
+        actions = \`
+            <button class="btn sm" onclick="\${decideFn}('\${r._id}','approve')">قبول مباشر</button>
+            <button class="btn danger sm" onclick="mpDeleteReport('\${r._id}')">🗑️ حذف نهائي</button>\`;
+        if (r.rejectReason) actions = \`<div style="color:var(--muted);font-size:12px;margin-bottom:8px;">سبب الرفض: \${r.rejectReason}</div>\` + actions;
+    }
     return \`
         <div class="card">
-            <b>\${r.reporterName}</b> <span style="color:var(--muted);font-size:12px;">(\${r.reporterRank})</span>
+            <div class="row"><b>\${r.reporterName}</b> \${statusBadge}</div>
+            <span style="color:var(--muted);font-size:12px;">(\${r.reporterRank})</span>
             <div style="margin-top:6px;color:var(--gold-soft);">1) وش سوى بالاستلام:</div>
             <div style="font-size:13px;margin-top:2px;">\${r.dutyReport}</div>
             <div style="margin-top:8px;color:var(--gold-soft);">2) عدد الجولات/الدوريات: <span style="color:#fff;">\${r.patrolsCount || 0}</span></div>
@@ -5332,10 +5361,7 @@ function renderMPReportCard(r, decideFn) {
             \${r.incidents ? \`<div style="margin-top:8px;color:var(--gold-soft);">4) مخالفات/حالات مشبوهة:</div><div style="font-size:13px;margin-top:2px;">\${r.incidents}</div>\` : ''}
             \${r.notesIssued && r.notesIssued.length ? \`<div style="margin-top:8px;color:var(--gold-soft);">5) الملاحظات/التحذيرات المسجّلة (\${r.notesIssued.length}):</div>\` + r.notesIssued.map(n => \`<div style="font-size:12px;color:var(--muted);margin-top:3px;">• \${n.name || n.tag} (\${n.kind === 'warning' ? 'تحذير' : 'ملاحظة'}) — \${n.reason}</div>\`).join('') : ''}
             \${r.generalNotes ? \`<div style="margin-top:8px;color:var(--gold-soft);">6) ملاحظات عامة:</div><div style="font-size:13px;margin-top:2px;">\${r.generalNotes}</div>\` : ''}
-            <div class="row" style="gap:8px;margin-top:10px;">
-                <button class="btn sm" onclick="\${decideFn}('\${r._id}','approve')">قبول التقرير</button>
-                <button class="btn danger sm" onclick="\${decideFn}('\${r._id}','reject')">رفض</button>
-            </div>
+            <div class="row" style="gap:8px;margin-top:10px;">\${actions}</div>
         </div>\`;
 }
 async function loadMPReports() {
@@ -5343,11 +5369,16 @@ async function loadMPReports() {
     if (!box) return;
     box.innerHTML = '<div class="card">جارِ التحميل...</div>';
     let data;
-    try { data = await api('/api/mp/reports/pending'); }
+    try { data = await api('/api/mp/reports/all'); }
     catch (e) { if (mpTab !== 'reports') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
     if (mpTab !== 'reports') return;
-    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تقارير معلّقة</div>'; return; }
-    box.innerHTML = data.list.map(r => renderMPReportCard(r, 'mpReportDecide')).join('');
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تقارير بعد</div>'; return; }
+    box.innerHTML = data.list.map(r => renderMPReportCard(r, 'mpReportDecide', true)).join('');
+}
+function mpDeleteReport(id) {
+    if (!confirm('متأكد تبي تحذف هذا التقرير نهائياً؟ ما يرجع بعدها.')) return;
+    api('/api/mp/reports/' + id, { method: 'DELETE' })
+        .then(() => { toast('🗑️ تم الحذف نهائياً'); loadMPReports(); }).catch(e => toast(e.message));
 }
 function mpReportDecide(id, action) {
     if (action === 'reject') {
@@ -5555,7 +5586,7 @@ function openMPReportForm(returnFn) {
             <textarea id="mpr-duty" placeholder="اكتب وش سويت خلال الاستلام..."></textarea>
         </div>
         <div class="card">
-            <label>2) كم عدد الدوريات اللي شاركت في الاستلام؟</label>
+            <label>2) كم عدد الجولات/الدوريات اللي سويتها خلال الشفت؟</label>
             <input type="number" id="mpr-patrols" min="0" placeholder="0">
         </div>
         <div class="card">
@@ -5626,15 +5657,27 @@ function checkSummonGate() {
     if (!ME || !ME.summon || ME.summon.status !== 'approved') return false;
     const box = document.getElementById('app');
     const locked = ME.summon.unlockAt && new Date(ME.summon.unlockAt).getTime() > Date.now();
-    if (ME.summon.enteredAt) return false; // دخل الاستدعاء مسبقاً — يكمل استخدام الموقع عادي
-    box.innerHTML = \`
-        <div class="card center" style="margin-top:60px;border-color:#f59e0b;">
-            <h2 style="color:#f59e0b;">📣 لديك استدعاء</h2>
-            <p style="color:var(--muted);margin-top:8px;">استدعاء من الشرطة العسكرية — \${ME.summon.timeLabel || 'الآن'}</p>
-            \${locked
-                ? \`<button class="btn gray" style="margin-top:16px;" onclick="toast('الروم بيفتح الساعة \${ME.summon.timeLabel}')">🔒 دخول الاستدعاء</button>\`
-                : \`<button class="btn" style="margin-top:16px;" onclick="enterSummon()">🚪 دخول الاستدعاء</button>\`}
-        </div>\`;
+    if (ME.summon.enteredAt) {
+        // دخل الروم فعلاً، لكن يبقى ممنوع من استخدام الموقع لين قيادة الشرطة العسكرية تنهي الاستدعاء
+        box.innerHTML = \`
+            <div class="card center" style="margin-top:60px;border-color:#f59e0b;">
+                <h2 style="color:#f59e0b;">⏳ بانتظار إنهاء الاستدعاء</h2>
+                <p style="color:var(--muted);margin-top:8px;">دخلت الاستدعاء — ما تقدر تستخدم الموقع لين تنهي قيادة الشرطة العسكرية الاستدعاء.</p>
+                <div class="row" style="gap:8px;margin-top:16px;justify-content:center;">
+                    <button class="btn gray sm" onclick="window.open('${CONFIG.MP_SUMMON_VOICE_URL}','_blank')">🚪 فتح الروم مرة ثانية</button>
+                    <button class="btn sm" onclick="init()">🔄 تحديث</button>
+                </div>
+            </div>\`;
+    } else {
+        box.innerHTML = \`
+            <div class="card center" style="margin-top:60px;border-color:#f59e0b;">
+                <h2 style="color:#f59e0b;">📣 لديك استدعاء</h2>
+                <p style="color:var(--muted);margin-top:8px;">استدعاء من الشرطة العسكرية — \${ME.summon.timeLabel || 'الآن'}</p>
+                \${locked
+                    ? \`<button class="btn gray" style="margin-top:16px;" onclick="toast('الروم بيفتح الساعة \${ME.summon.timeLabel}')">🔒 دخول الاستدعاء</button>\`
+                    : \`<button class="btn" style="margin-top:16px;" onclick="enterSummon()">🚪 دخول الاستدعاء</button>\`}
+            </div>\`;
+    }
     document.getElementById('nav-links').innerHTML = '';
     document.getElementById('mobile-menu').innerHTML = '';
     return true;
@@ -5645,10 +5688,9 @@ async function enterSummon() {
         window.open(r.url, '_blank');
         toast('✅ تفضل ادخل الروم');
         ME.summon.enteredAt = new Date().toISOString();
-        init();
+        checkSummonGate();
     } catch (e) {
-        if (e.message && e.message.includes('بيفتح')) toast(e.message);
-        else toast(e.message);
+        toast(e.message);
     }
 }
 
