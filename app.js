@@ -604,7 +604,7 @@ async function sendSummonDM(discordId, timeLabel) {
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setLabel("🚪 دخول الاستدعاء").setStyle(ButtonStyle.Link).setURL(CONFIG.MP_SUMMON_VOICE_URL),
         );
-        await user.send({ embeds: [embed], components: [row] });
+        await user.send({ content: `<@${discordId}>`, embeds: [embed], components: [row] });
     } catch (e) {
         console.error("❌ فشل إرسال رسالة الاستدعاء الخاصة:", e.message);
     }
@@ -2802,6 +2802,13 @@ app.get("/api/mp/members", ensureMPMember, async (req, res) => {
     const list = await Personnel.find({ registeredName: { $ne: null } }, { notes: 0 });
     list.sort((a, b) => rankIndex(b.rank) - rankIndex(a.rank));
     res.json({ list });
+});
+
+// عرض ملف عسكري كامل لأي عسكري مسجل بالموقع — لقائد ونائب الشرطة العسكرية (نفس صلاحية قادة القطاعات)
+app.get("/api/mp/personnel/:discord", ensureMPLeader, async (req, res) => {
+    const p = await Personnel.findOne({ discord: req.params.discord });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    res.json({ personnel: p });
 });
 
 // ── ملاحظة على أي عسكري (فورم: سبب + صورة إجبارية) ──
@@ -5070,6 +5077,7 @@ function renderMPPanel() {
         </div>
         <div class="tabs">
             <div class="tab active" onclick="mpTabSwitch('members', this)">👤 العساكر</div>
+            <div class="tab" onclick="mpTabSwitch('file', this)">📇 عرض ملف عسكري</div>
             <div class="tab" onclick="mpTabSwitch('requests', this)">📣 طلبات الاستدعاء</div>
             <div class="tab" onclick="mpTabSwitch('reports', this)">📄 التقارير</div>
             <div class="tab" onclick="mpTabSwitch('log', this)">📜 لوق القطاعات</div>
@@ -5083,6 +5091,7 @@ function mpTabSwitch(name, el) {
     if (el) el.classList.add('active');
     mpTab = name;
     if (name === 'members') loadMPMembers();
+    if (name === 'file') renderMPFileSearch();
     if (name === 'requests') loadMPSummonRequests();
     if (name === 'reports') loadMPReports();
     if (name === 'log') loadMPSectorLog();
@@ -5138,6 +5147,53 @@ function renderMPLeaderMembersList(list) {
 function mpStopSummon(discord) {
     api('/api/mp/personnel/' + discord + '/summon/stop', { method: 'POST' })
         .then(() => { toast('تم إيقاف الاستدعاء'); loadMPMembers(); }).catch(e => toast(e.message));
+}
+function renderMPFileSearch() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = \`
+        <div class="card">
+            <input id="mp-file-search" placeholder="🔍 ابحث عن اسم العسكري..." oninput="filterMPFileSearch()">
+            <div id="mp-file-results"></div>
+        </div>
+        <div id="mp-file-view"></div>\`;
+    if (mpLeaderListCache.length === 0) {
+        api('/api/mp/members').then(d => { mpLeaderListCache = d.list; }).catch(() => {});
+    }
+}
+function filterMPFileSearch() {
+    const q = document.getElementById('mp-file-search').value.trim().toLowerCase();
+    const box = document.getElementById('mp-file-results');
+    if (!q) { box.innerHTML = ''; return; }
+    const matches = mpLeaderListCache.filter(p => (p.registeredName || '').toLowerCase().includes(q) || (p.discordTag || '').toLowerCase().includes(q));
+    box.innerHTML = matches.map(p => \`
+        <div class="card" style="padding:8px 12px;margin-top:6px;">
+            <div class="row">
+                <span>\${p.registeredName || p.discordTag} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'})</span></span>
+                <button class="btn sm" onclick="viewMPFile('\${p.discord}')">عرض الملف</button>
+            </div>
+        </div>\`).join('') || '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>';
+}
+async function viewMPFile(discord) {
+    const box = document.getElementById('mp-file-view');
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try {
+        const { personnel: p } = await api('/api/mp/personnel/' + discord);
+        box.innerHTML = \`
+            <div class="id-card" style="margin-top:16px;">
+                <div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">\${p.registeredName || p.discordTag}</div>
+                <div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري كامل</div>
+                <table>
+                    <tr><td>اليونت</td><td>\${p.unit || '-'}</td></tr>
+                    <tr><td>الرتبة</td><td>\${p.rank}</td></tr>
+                    <tr><td>النقاط</td><td>\${p.points}</td></tr>
+                    <tr><td>الحالة</td><td>\${p.isBlocked ? 'موقوف' : 'فعّال'}</td></tr>
+                    \${p.summon && p.summon.status !== 'none' ? \`<tr><td>الاستدعاء</td><td>\${p.summon.status === 'approved' ? '📣 نشط — ' + (p.summon.timeLabel || '') : '⏳ طلب معلّق'}</td></tr>\` : ''}
+                </table>
+                \${p.notes && p.notes.length ? '<div style="margin-top:10px;font-size:13px;color:var(--gold-soft);">الملاحظات:</div>' +
+                    p.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">\${n.text}\${n.image ? \`<img src="\${n.image}" style="max-width:200px;border-radius:6px;margin-top:6px;display:block;cursor:pointer;" onclick="setPhotoPageImage('\${n.image}');openPhotoPage();">\` : ''}</div>\`).join('') : ''}
+            </div>\`;
+    } catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">\${e.message}</div>\`; }
 }
 async function loadMPSummonRequests() {
     const box = document.getElementById('mp-content');
