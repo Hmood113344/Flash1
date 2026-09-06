@@ -146,7 +146,9 @@ const PersonnelSchema = new mongoose.Schema({
     rank: { type: String, default: "جندي" },
     points: { type: Number, default: 0 },
     notes: [{
-        text: String, image: { type: String, default: null }, addedBy: String, addedByTag: String,
+        text: String, image: { type: String, default: null }, // image: احتياطي فقط لو فشل رفع الصورة لديسكورد
+        imageChannelId: { type: String, default: null }, imageMessageId: { type: String, default: null },
+        addedBy: String, addedByTag: String,
         createdAt: { type: Date, default: Date.now }
     }],
     // ── استدعاء الشرطة العسكرية ──
@@ -302,11 +304,15 @@ const LeaveRequestSchema = new mongoose.Schema({
     sectorLabel: String,
     reason: String,
     days: { type: Number, required: true },
-    status: { type: String, default: "pending" }, // pending | approved | rejected
+    status: { type: String, default: "pending" }, // pending | approved | rejected | completed
     rejectReason: { type: String, default: null },
     reviewedBy: String,
     reviewedByTag: String,
     reviewedAt: Date,
+    startDate: { type: Date, default: null }, // تاريخ بداية الإجازة (وقت الموافقة)
+    endDate: { type: Date, default: null },   // تاريخ الانتهاء المتوقع (startDate + days)
+    endedAt: { type: Date, default: null },   // وقت الإنهاء الفعلي (تلقائي أو يدوي)
+    endedByTag: { type: String, default: null }, // "تلقائي (انتهت المدة)" أو "تلقائي (دخول للموقع)" أو اسم من أنهاها يدوياً
     createdAt: { type: Date, default: Date.now },
 });
 LeaveRequestSchema.index({ discord: 1, createdAt: -1 });
@@ -368,6 +374,7 @@ const SettingsSchema = new mongoose.Schema({
         personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
     },
     violationsChannelId: String,
+    notesChannelId: String, // قناة رفع صور الملاحظات (نفس فكرة قناة المخالفات)
     // عقوبات التحذير الثالث — قابلة للإضافة/التعديل/الحذف من لوحة كبار المسؤولين (صفحة عقوبات التحذيرات)
     warningPenalties: { type: Array, default: [] },
     // نظام البصمة/التحضير
@@ -429,6 +436,22 @@ async function rankProgress(p, settings) {
     const threshold = isMax ? 0 : await getThreshold(p.rank, settings);
     const remaining = isMax ? 0 : Math.max(0, threshold - p.points);
     return { currentRank: p.rank, nextRank, threshold, remaining };
+}
+
+// ينهي أي إجازة "approved" نشطة على هذا الشخص — يصير إما لأن المدة خلصت، أو لأنه استخدم الموقع أثناء الإجازة (يعني رجع)
+async function autoEndActiveLeave(discordId) {
+    const leave = await LeaveRequest.findOne({ discord: discordId, status: "approved" });
+    if (!leave) return;
+    const now = new Date();
+    const expired = leave.endDate && leave.endDate <= now;
+    leave.status = "completed";
+    leave.endedAt = now;
+    leave.endedByTag = expired ? "تلقائي (انتهت المدة)" : "تلقائي (دخول للموقع أثناء الإجازة)";
+    await leave.save();
+    await logEvent({
+        action: "إنهاء إجازة تلقائي", discordId: leave.discord, discordTag: leave.discordTag,
+        actorId: "system", actorTag: "النظام", details: leave.endedByTag,
+    });
 }
 
 // ── منطق قادة ونواب القطاعات ────────────────────────────────────────────
@@ -739,7 +762,57 @@ async function postViolationToChannel(v, rawPhoto) {
     }
 }
 
-// تحديث رسالة المخالفة بالقناة بعد قبول/رفض (سواء من البوت أو من الموقع)
+// ── نظام صور الملاحظات (نفس فكرة صور المخالفات: ترفع كمرفق برسالة بقناة ديسكورد، مو بقاعدة البيانات) ──
+function buildNoteEmbed(personnelName, personnelDiscord, text, addedByTag) {
+    return new EmbedBuilder()
+        .setTitle("📝 ملاحظة جديدة")
+        .setColor(0xfacc15)
+        .addFields(
+            { name: "العسكري", value: personnelName || personnelDiscord, inline: true },
+            { name: "بواسطة", value: addedByTag || "-", inline: true },
+            { name: "النص", value: text || "-", inline: false },
+        )
+        .setTimestamp();
+}
+// يرفع صورة الملاحظة لقناة الملاحظات ويرجع مرجع الرسالة، أو null لو تعذر (والمتصل يحتفظ بالصورة كاحتياط بقاعدة البيانات)
+async function postNoteToChannel(personnelDiscord, personnelName, text, addedByTag, rawImage) {
+    const settings = await getSettings();
+    if (!botReady || !settings.notesChannelId || !rawImage) return null;
+    try {
+        const channel = await client.channels.fetch(settings.notesChannelId);
+        const embed = buildNoteEmbed(personnelName, personnelDiscord, text, addedByTag);
+        const files = [];
+        if (rawImage.startsWith("data:image")) {
+            const base64Data = rawImage.split(",")[1];
+            const buffer = Buffer.from(base64Data, "base64");
+            const ext = rawImage.includes("image/png") ? "png" : "jpg";
+            files.push(new AttachmentBuilder(buffer, { name: `note_${Date.now()}.${ext}` }));
+        }
+        const msg = await channel.send({ embeds: [embed], files });
+        return { channelId: msg.channelId, messageId: msg.id };
+    } catch (e) {
+        console.error("❌ فشل إرسال الملاحظة للقناة:", e.message);
+        return null;
+    }
+}
+// يضيف ملاحظة لعسكري، يرفع صورتها لقناة الملاحظات إذا أمكن (وإلا يحتفظ بها بقاعدة البيانات كاحتياط)
+async function pushNoteWithImage({ discord, text, image, actorId, actorTag }) {
+    const p = await Personnel.findOne({ discord });
+    if (!p) return null;
+    p.notes.push({ text, image, addedBy: actorId, addedByTag: actorTag });
+    const note = p.notes[p.notes.length - 1];
+    await p.save();
+    const uploaded = await postNoteToChannel(p.discord, p.registeredName || p.discordTag || p.discord, text, actorTag, image);
+    if (uploaded) {
+        note.imageChannelId = uploaded.channelId;
+        note.imageMessageId = uploaded.messageId;
+        note.image = null; // ما نحتاج نخزن نسخة بقاعدة البيانات بعد ما ارتفعت لديسكورد بنجاح
+        await p.save();
+    }
+    return p;
+}
+
+
 async function syncViolationMessage(v) {
     const ref = pendingMessages.get(v._id.toString());
     if (!ref) return;
@@ -1175,6 +1248,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
     const settings = await getSettings();
     const senior = isSeniorAdmin(req.user.id);
     let isAntiDrugs = false;
+    await autoEndActiveLeave(req.user.id).catch(e => console.error("❌ فشل فحص إنهاء الإجازة التلقائي:", e.message));
 
     // كبار المسؤولين يدخلون دائماً حتى لو كان التسجيل مقفل أو الموقع بالصيانة
     if (!senior) {
@@ -1488,8 +1562,44 @@ app.get("/api/violations/:id/photo", ensureAuth, async (req, res) => {
     }
 });
 
-// ── تقارير مديرية مكافحة المخدرات ────────────────────────────────────────
-const reportLocks = new Set();
+// صورة ملاحظة معيّنة — محفوظة كمرفق برسالة بقناة الملاحظات (نفس فكرة صور المخالفات)
+app.get("/api/notes/:discord/:noteId/photo", ensureAuth, async (req, res) => {
+    try {
+        const p = await Personnel.findOne({ discord: req.params.discord }, { notes: 1 });
+        if (!p) return res.status(404).json({ error: "غير موجود" });
+        const note = p.notes.id(req.params.noteId);
+        if (!note) return res.status(404).json({ error: "الملاحظة غير موجودة" });
+        const settings = await getSettings();
+        const allowed = req.params.discord === req.user.id || isSeniorAdmin(req.user.id) || settings.adminList.includes(req.user.id)
+            || !!getSectorRole(req.user.id, settings) || !!getPersonnelOfficerSector(req.user.id, settings)
+            || !!getMPRole(req.user.id, settings) || isMPPersonnelOfficer(req.user.id, settings) || (await isMilitaryPoliceMember(req.user.id));
+        if (!allowed) return res.status(403).json({ error: "غير مصرح" });
+
+        if (note.imageChannelId && note.imageMessageId) {
+            const cacheKey = "note:" + note._id.toString();
+            const cached = photoUrlCache.get(cacheKey);
+            if (cached && (Date.now() - cached.fetchedAt) < PHOTO_CACHE_MS) {
+                return res.json({ photo: cached.url });
+            }
+            try {
+                const channel = client.channels.cache.get(note.imageChannelId) || await withTimeout(client.channels.fetch(note.imageChannelId), 10000);
+                const msg = await withTimeout(channel.messages.fetch(note.imageMessageId), 10000);
+                const att = msg.attachments.first();
+                if (att) {
+                    photoUrlCache.set(cacheKey, { url: att.url, fetchedAt: Date.now() });
+                    return res.json({ photo: att.url });
+                }
+            } catch (e) {
+                console.error("❌ فشل جلب صورة الملاحظة من ديسكورد:", e.message);
+                if (!note.image) return res.status(503).json({ error: "تعذر جلب الصورة من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+            }
+        }
+        res.json({ photo: note.image || null });
+    } catch (e) {
+        console.error("❌ فشل تحميل صورة الملاحظة:", e);
+        res.status(500).json({ error: "تعذر تحميل الصورة" });
+    }
+});
 
 app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
     if (reportLocks.has(req.user.id)) {
@@ -1598,11 +1708,7 @@ app.post("/api/senior/personnel/:discord/note", ensureSeniorAdmin, async (req, r
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
     if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
     if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await Personnel.findOneAndUpdate(
-        { discord: req.params.discord },
-        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username } } },
-        { new: true }
-    );
+    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `على ${p.registeredName || p.discord}: ${text.trim()}` });
     res.json({ ok: true, notes: p.notes });
@@ -1875,7 +1981,7 @@ app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
         for (const n of p.notes) {
             flat.push({
                 noteId: n._id, discord: p.discord, personnelName: p.registeredName || p.discordTag || p.discord,
-                text: n.text, image: n.image || null, addedBy: n.addedBy, addedByTag: n.addedByTag, createdAt: n.createdAt,
+                text: n.text, hasImage: !!(n.image || (n.imageChannelId && n.imageMessageId)), addedBy: n.addedBy, addedByTag: n.addedByTag, createdAt: n.createdAt,
             });
         }
     }
@@ -2083,6 +2189,20 @@ app.post("/api/leave/request", ensureAuth, async (req, res) => {
     const pending = await LeaveRequest.countDocuments({ discord: req.user.id, status: "pending" });
     if (pending >= 2) return res.status(400).json({ error: "عندك طلب إجازة قيد المراجعة بالفعل" });
 
+    const active = await LeaveRequest.findOne({ discord: req.user.id, status: "approved" });
+    if (active) return res.status(400).json({ error: "عندك إجازة نشطة حالياً، ما تقدر تطلب إجازة جديدة إلا بعد ما تنتهي" });
+
+    // بعد ما تنتهي إجازته (تلقائي أو يدوي)، ما يقدر يطلب إجازة جديدة إلا بعد 3 أيام من انتهائها
+    const lastCompleted = await LeaveRequest.findOne({ discord: req.user.id, status: "completed" }).sort({ endedAt: -1 });
+    if (lastCompleted && lastCompleted.endedAt) {
+        const cooldownMs = 3 * 24 * 60 * 60 * 1000;
+        const sinceEnd = Date.now() - new Date(lastCompleted.endedAt).getTime();
+        if (sinceEnd < cooldownMs) {
+            const daysLeft = Math.ceil((cooldownMs - sinceEnd) / (24 * 60 * 60 * 1000));
+            return res.status(400).json({ error: `لازم تنتظر ${daysLeft} يوم إضافي بعد انتهاء آخر إجازة قبل تقديم طلب جديد` });
+        }
+    }
+
     const sectorKey = await getMemberSectorKey(req.user.id);
     const leave = await LeaveRequest.create({
         discord: req.user.id, discordTag: req.user.username,
@@ -2103,7 +2223,7 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
     const poInfo = getPersonnelOfficerSector(req.user.id, settings);
     if (!leaderInfo && !poInfo && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "ليست لديك صلاحية" });
 
-    let query = { status: "pending" };
+    let query = { status: { $in: ["pending", "approved"] } };
     if (isSeniorAdmin(req.user.id) && !leaderInfo && !poInfo) {
         // كبار المسؤولين بدون دور قطاعي حقيقي يحتاجون تحديد قطاع
         const q = (req.query.sector || "").trim();
@@ -2125,7 +2245,7 @@ app.get("/api/leave/pending", ensureAuth, async (req, res) => {
 
 // كبار المسؤولين يشوفون كل طلبات الإجازات المعلّقة من كل القطاعات بصفحة وحدة
 app.get("/api/senior/leave/pending", ensureSeniorAdmin, async (req, res) => {
-    const list = await LeaveRequest.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200).lean();
+    const list = await LeaveRequest.find({ status: { $in: ["pending", "approved"] } }).sort({ createdAt: -1 }).limit(200).lean();
     res.json({ list });
 });
 
@@ -2158,10 +2278,34 @@ app.post("/api/leave/:id/approve", ensureAuth, async (req, res) => {
     leave.reviewedBy = req.user.id;
     leave.reviewedByTag = req.user.username + ` (${approverLabel})`;
     leave.reviewedAt = new Date();
+    leave.startDate = new Date();
+    leave.endDate = new Date(Date.now() + leave.days * 24 * 60 * 60 * 1000);
     await leave.save();
 
     await logEvent({ action: "قبول إجازة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `${leave.days} يوم (بواسطة ${approverLabel}) — الرصيد المتبقي: ${p.leaveBalance}` });
     res.json({ ok: true, leave });
+});
+
+// إنهاء إجازة نشطة يدوياً — نفس صلاحية قبول/رفض هذا الطلب
+app.post("/api/leave/:id/end", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    const leave = await LeaveRequest.findById(req.params.id);
+    if (!leave || leave.status !== "approved") return res.status(404).json({ error: "غير موجودة أو مو نشطة" });
+
+    const leaderInfo = getSectorRole(req.user.id, settings);
+    const poInfo = getPersonnelOfficerSector(req.user.id, settings);
+    let approverLabel = null;
+    if (leaderInfo && leaderInfo.sector === leave.sector) approverLabel = leaderInfo.role === "commander" ? "قائد القطاع" : "نائب القطاع";
+    else if (poInfo && poInfo.sector === leave.sector && isJuniorRank(leave.rank)) approverLabel = "مسؤول الأفراد";
+    else if (isSeniorAdmin(req.user.id)) approverLabel = "كبار المسؤولين";
+    else return res.status(403).json({ error: "ليست لديك صلاحية إنهاء هذه الإجازة" });
+
+    leave.status = "completed";
+    leave.endedAt = new Date();
+    leave.endedByTag = req.user.username + ` (${approverLabel})`;
+    await leave.save();
+    await logEvent({ action: "إنهاء إجازة", discordId: leave.discord, discordTag: leave.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `بواسطة ${approverLabel}` });
+    res.json({ ok: true });
 });
 
 app.post("/api/leave/:id/reject", ensureAuth, async (req, res) => {
@@ -2194,12 +2338,13 @@ app.get("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
 });
 
 app.post("/api/senior/settings", ensureSeniorAdmin, async (req, res) => {
-    const { isMaintenance, disableLogin, disableViolations, violationsChannelId } = req.body;
+    const { isMaintenance, disableLogin, disableViolations, violationsChannelId, notesChannelId } = req.body;
     const s = await getSettings();
     if (typeof isMaintenance === "boolean") s.isMaintenance = isMaintenance;
     if (typeof disableLogin === "boolean") s.disableLogin = disableLogin;
     if (typeof disableViolations === "boolean") s.disableViolations = disableViolations;
     if (typeof violationsChannelId === "string") s.violationsChannelId = violationsChannelId.trim() || null;
+    if (typeof notesChannelId === "string") s.notesChannelId = notesChannelId.trim() || null;
     await s.save();
     await logEvent({ action: "تعديل إعدادات الموقع", actorId: req.user.id, actorTag: req.user.username, details: JSON.stringify(req.body) });
     res.json({ ok: true });
@@ -2460,13 +2605,9 @@ app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, 
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
     if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
     if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await Personnel.findOneAndUpdate(
-        { discord: req.params.discord },
-        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username } } },
-        { new: true }
-    );
+    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})` });
     if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `على ${p.registeredName || p.discord} (بواسطة قيادة ${req.sectorInfo.sectorLabel}): ${text.trim()}` });
+    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`, details: `على ${p.registeredName || p.discord}: ${text.trim()}` });
     res.json({ ok: true, notes: p.notes });
 });
 
@@ -2655,12 +2796,9 @@ app.post("/api/personnel-officer/personnel/:discord/note", ensurePersonnelOffice
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
     if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
     if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await Personnel.findOneAndUpdate(
-        { discord: req.params.discord },
-        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username } } },
-        { new: true }
-    );
-    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `على ${p.registeredName || p.discord} (بواسطة مسؤول أفراد ${req.sectorInfo.sectorLabel}): ${text.trim()}` });
+    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})` });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, details: `على ${p.registeredName || p.discord}: ${text.trim()}` });
     res.json({ ok: true, notes: p.notes });
 });
 
@@ -2832,7 +2970,9 @@ app.get("/api/mp/members", ensureMPMember, async (req, res) => {
 app.get("/api/mp/personnel/:discord", ensureMPLeader, async (req, res) => {
     const p = await Personnel.findOne({ discord: req.params.discord });
     if (!p) return res.status(404).json({ error: "غير موجود" });
-    res.json({ personnel: p });
+    const settings = await getSettings();
+    const progress = await rankProgress(p, settings);
+    res.json({ personnel: p, progress });
 });
 
 // إصدار تحذير/إشعار لأي عسكري — لقائد ونائب الشرطة العسكرية (نفس فورم التحذير حق كبار المسؤولين وقادة القطاعات)
@@ -2883,11 +3023,7 @@ app.post("/api/mp/personnel/:discord/note", ensureMPMember, async (req, res) => 
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
     if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
     if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await Personnel.findOneAndUpdate(
-        { discord: req.params.discord },
-        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username + " (شرطة عسكرية)" } } },
-        { new: true }
-    );
+    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)" });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (شرطة عسكرية)", details: `على ${p.registeredName || p.discord}` });
     res.json({ ok: true, notes: p.notes });
@@ -3044,7 +3180,9 @@ app.delete("/api/mp/reports/:id", ensureMPLeader, async (req, res) => {
 
 // ── لوق القطاعات (كل شي يسويه القادة/النواب/مسؤولي الأفراد بكل القطاعات — بدون كبار المسؤولين) ──
 app.get("/api/mp/sector-log", ensureMPLeader, async (req, res) => {
-    const list = await Log.find({ actorTag: { $regex: /قيادة|مسؤول أفراد/ } }).sort({ createdAt: -1 }).limit(300);
+    // بعض إجراءات قادة/نواب القطاعات تحط "(قيادة ...)" أو "(مسؤول أفراد ...)" داخل actorTag، وبعضها داخل details بس — نبحث بالاثنين
+    const rx = /قيادة|مسؤول أفراد/;
+    const list = await Log.find({ $or: [{ actorTag: { $regex: rx } }, { details: { $regex: rx } }] }).sort({ createdAt: -1 }).limit(300);
     res.json({ list });
 });
 
@@ -3071,11 +3209,7 @@ app.post("/api/mp/po/personnel/:discord/note", ensureMPPersonnelOfficer, async (
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
     if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
     if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await Personnel.findOneAndUpdate(
-        { discord: req.params.discord },
-        { $push: { notes: { text: text.trim(), image, addedBy: req.user.id, addedByTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)" } } },
-        { new: true }
-    );
+    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)" });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + " (مسؤول أفراد الشرطة العسكرية)", details: `على ${p.registeredName || p.discord}` });
     res.json({ ok: true, notes: p.notes });
@@ -3245,9 +3379,9 @@ app.get("/", (req, res) => {
     .warn-ack-btn:hover { background: rgba(255,255,255,0.2); }
 
     /* ── فورم إرسال تحذير/إشعار (بديل عن prompt/confirm) ─────────────── */
-    #wf-overlay { display: none; position: fixed; inset: 0; z-index: 2500; background: rgba(0,0,0,0.75); align-items: center; justify-content: center; padding: 20px; }
+    #wf-overlay { display: none; position: fixed; inset: 0; z-index: 2500; background: rgba(0,0,0,0.75); align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
     #wf-overlay.open { display: flex; }
-    .wf-box { background: #0d1f3c; border: 1px solid var(--gold); border-radius: 14px; padding: 22px; max-width: 380px; width: 100%; text-align: center; }
+    .wf-box { background: #0d1f3c; border: 1px solid var(--gold); border-radius: 14px; padding: 22px; max-width: 380px; width: 100%; text-align: center; max-height: 85vh; overflow-y: auto; margin: auto; }
     .wf-box h3 { margin-bottom: 14px; color: var(--gold-soft); }
     .wf-choice-row { display: flex; gap: 10px; margin-top: 6px; }
     .wf-choice-row button { flex: 1; padding: 14px 8px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; border: 1px solid var(--border); background: rgba(255,255,255,0.04); color: #fff; }
@@ -3349,6 +3483,15 @@ async function viewViolationPhoto(id) {
     openPhotoPage();
     try {
         const { photo } = await api('/api/violations/' + id + '/photo');
+        if (!photo) return setPhotoPageError('لا توجد صورة');
+        setPhotoPageImage(photo);
+    } catch (e) { setPhotoPageError(e.message); }
+}
+// يجيب صورة الملاحظة عند الضغط فقط (نفس أسلوب صورة المخالفة)
+async function viewNotePhoto(discord, noteId) {
+    openPhotoPage();
+    try {
+        const { photo } = await api('/api/notes/' + discord + '/' + noteId + '/photo');
         if (!photo) return setPhotoPageError('لا توجد صورة');
         setPhotoPageImage(photo);
     } catch (e) { setPhotoPageError(e.message); }
@@ -3940,7 +4083,7 @@ function renderNotes() {
     if (!box) return;
     if (!ME.notes || ME.notes.length === 0) { box.innerHTML = ''; return; }
     box.innerHTML = '<div style="font-size:13px;color:var(--gold-soft);margin-bottom:6px;">ملاحظات عليك:</div>' +
-        ME.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-bottom:6px;font-size:13px;">\${n.text}\${n.image ? \`<img src="\${n.image}" style="max-width:180px;border-radius:6px;margin-top:6px;display:block;cursor:pointer;" onclick="setPhotoPageImage('\${n.image}');openPhotoPage();">\` : ''}</div>\`).join('');
+        ME.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-bottom:6px;font-size:13px;">\${n.text}\${(n.image || (n.imageChannelId && n.imageMessageId)) ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${ME.discordId}','\${n._id}')">📷 عرض الصورة</button>\` : ''}</div>\`).join('');
 }
 async function loadMine(silent) {
     const box = document.getElementById('mine-list');
@@ -4244,21 +4387,31 @@ async function loadSeniorLeavePage() {
     box.innerHTML = renderLeaveRequestsList(list, true);
 }
 function renderLeaveRequestsList(list, reload) {
-    if (!list.length) return '<div class="card center" style="color:var(--muted);">لا توجد طلبات إجازة معلّقة</div>';
-    return list.map(l => \`
+    if (!list.length) return '<div class="card center" style="color:var(--muted);">لا توجد طلبات إجازة</div>';
+    return list.map(l => {
+        const isActive = l.status === 'approved';
+        let actions = \`
+            <button class="btn sm" onclick="approveLeave('\${l._id}', \${reload})">قبول</button>
+            <button class="btn danger sm" onclick="rejectLeave('\${l._id}', \${reload})">رفض</button>\`;
+        let extra = '';
+        if (isActive) {
+            const daysLeft = l.endDate ? Math.max(0, Math.ceil((new Date(l.endDate) - Date.now()) / 86400000)) : '-';
+            extra = \`<div style="color:#4ade80;margin-top:4px;">⏳ نشطة — متبقي \${daysLeft} يوم</div>\`;
+            actions = \`<button class="btn danger sm" onclick="endLeave('\${l._id}', \${reload})">🏁 إنهاء الإجازة</button>\`;
+        }
+        return \`
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div>
                     <b>\${l.name}</b> <span style="color:var(--muted);font-size:12px;">(\${l.unit || '-'} • \${l.rank || '-'} • \${l.sectorLabel || '-'})</span>
                     <div style="color:var(--gold-soft);margin-top:4px;">📅 \${l.days} يوم</div>
                     <div style="color:var(--muted);font-size:13px;">\${l.reason}</div>
+                    \${extra}
                 </div>
-                <div class="row" style="gap:8px;">
-                    <button class="btn sm" onclick="approveLeave('\${l._id}', \${reload})">قبول</button>
-                    <button class="btn danger sm" onclick="rejectLeave('\${l._id}', \${reload})">رفض</button>
-                </div>
+                <div class="row" style="gap:8px;">\${actions}</div>
             </div>
-        </div>\`).join('');
+        </div>\`;
+    }).join('');
 }
 async function approveLeave(id, senior) {
     try { await api('/api/leave/' + id + '/approve', { method: 'POST' }); toast('✅ تمت الموافقة'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
@@ -4267,6 +4420,11 @@ async function approveLeave(id, senior) {
 async function rejectLeave(id, senior) {
     const reason = prompt('سبب الرفض (اختياري):') || '';
     try { await api('/api/leave/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) }); toast('تم الرفض'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
+    catch (e) { toast(e.message); }
+}
+async function endLeave(id, senior) {
+    if (!confirm('متأكد تبي تنهي هذي الإجازة الآن؟')) return;
+    try { await api('/api/leave/' + id + '/end', { method: 'POST' }); toast('✅ تم إنهاء الإجازة'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
     catch (e) { toast(e.message); }
 }
 
@@ -5030,15 +5188,13 @@ async function viewSectorFile(discord) {
         box.innerHTML = \`
             <div class="id-card" style="margin-top:16px;">
                 <div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">\${p.registeredName || p.discordTag}</div>
-                <div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري كامل</div>
+                <div class="center" style="font-size:12px;color:var(--muted);margin-bottom:10px;">ملف عسكري</div>
                 <table>
                     <tr><td>اليونت</td><td>\${p.unit || '-'}</td></tr>
                     <tr><td>الرتبة</td><td>\${p.rank}</td></tr>
-                    <tr><td>النقاط</td><td>\${p.points}</td></tr>
-                    <tr><td>الحالة</td><td>\${p.isBlocked ? 'موقوف' : 'فعّال'}</td></tr>
                 </table>
                 \${p.notes && p.notes.length ? '<div style="margin-top:10px;font-size:13px;color:var(--gold-soft);">الملاحظات:</div>' +
-                    p.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">\${n.text}</div>\`).join('') : ''}
+                    p.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">\${n.text}\${(n.image || (n.imageChannelId && n.imageMessageId)) ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${p.discord}','\${n._id}')">📷 عرض الصورة</button>\` : ''}</div>\`).join('') : ''}
             </div>\`;
     } catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">\${e.message}</div>\`; }
 }
@@ -5322,7 +5478,7 @@ async function viewMPFile(discord) {
     const box = document.getElementById('mp-file-view');
     box.innerHTML = '<div class="card">جارِ التحميل...</div>';
     try {
-        const { personnel: p } = await api('/api/mp/personnel/' + discord);
+        const { personnel: p, progress } = await api('/api/mp/personnel/' + discord);
         box.innerHTML = \`
             <div class="id-card" style="margin-top:16px;">
                 <div class="center" style="font-size:18px;font-weight:bold;color:var(--gold-soft);">\${p.registeredName || p.discordTag}</div>
@@ -5331,11 +5487,12 @@ async function viewMPFile(discord) {
                     <tr><td>اليونت</td><td>\${p.unit || '-'}</td></tr>
                     <tr><td>الرتبة</td><td>\${p.rank}</td></tr>
                     <tr><td>النقاط</td><td>\${p.points}</td></tr>
+                    <tr><td>متبقي للترقية</td><td>\${progress.nextRank ? (progress.remaining + ' نقطة (' + progress.nextRank + ')') : 'وصل لأعلى رتبة'}</td></tr>
                     <tr><td>الحالة</td><td>\${p.isBlocked ? 'موقوف' : 'فعّال'}</td></tr>
                     \${p.summon && p.summon.status !== 'none' ? \`<tr><td>الاستدعاء</td><td>\${p.summon.status === 'approved' ? '📣 نشط — ' + (p.summon.timeLabel || '') : '⏳ طلب معلّق'}</td></tr>\` : ''}
                 </table>
                 \${p.notes && p.notes.length ? '<div style="margin-top:10px;font-size:13px;color:var(--gold-soft);">الملاحظات:</div>' +
-                    p.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">\${n.text}\${n.image ? \`<img src="\${n.image}" style="max-width:200px;border-radius:6px;margin-top:6px;display:block;cursor:pointer;" onclick="setPhotoPageImage('\${n.image}');openPhotoPage();">\` : ''}</div>\`).join('') : ''}
+                    p.notes.map(n => \`<div style="background:rgba(5,15,10,0.6);padding:8px;border-radius:8px;margin-top:6px;font-size:13px;">\${n.text}\${(n.image || (n.imageChannelId && n.imageMessageId)) ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${p.discord}','\${n._id}')">📷 عرض الصورة</button>\` : ''}</div>\`).join('') : ''}
             </div>\`;
     } catch (e) { box.innerHTML = \`<div class="card" style="color:#f87171;">\${e.message}</div>\`; }
 }
@@ -6006,7 +6163,7 @@ async function loadNotesPage() {
                 <div>
                     <b>\${n.personnelName}</b>
                     <div style="margin-top:4px;">\${n.text}</div>
-                    \${n.image ? \`<img src="\${n.image}" style="max-width:220px;border-radius:8px;margin-top:6px;display:block;cursor:pointer;" onclick="setPhotoPageImage('\${n.image}');openPhotoPage();">\` : ''}
+                    \${n.hasImage ? \`<button class="btn sm gray" style="margin-top:6px;" onclick="viewNotePhoto('\${n.discord}','\${n.noteId}')">📷 عرض الصورة</button>\` : ''}
                     <div style="color:var(--muted);font-size:12px;margin-top:4px;">أضافها: \${n.addedByTag || n.addedBy || '-'} • \${new Date(n.createdAt).toLocaleString('ar')}</div>
                 </div>
                 <button class="btn danger sm" onclick="deleteNote('\${n.discord}', '\${n.noteId}')">🗑️ حذف</button>
@@ -6155,6 +6312,8 @@ async function loadSettings() {
             <div class="row" style="margin-top:10px;"><span>إغلاق تسجيل المخالفات</span><input type="checkbox" id="s-viol" \${settings.disableViolations ? 'checked' : ''}></div>
             <label style="margin-top:10px;">آيدي قناة إرسال المخالفات والتقارير بديسكورد (اختياري)</label>
             <input id="s-channel" placeholder="آيدي القناة" value="\${settings.violationsChannelId || ''}">
+            <label style="margin-top:10px;">آيدي قناة إرسال صور الملاحظات بديسكورد (اختياري)</label>
+            <input id="s-notes-channel" placeholder="آيدي القناة" value="\${settings.notesChannelId || ''}">
             <button class="btn" style="margin-top:14px;" onclick="saveSettings()">حفظ الإعدادات</button>
         </div>\`;
 }
@@ -6164,6 +6323,7 @@ async function saveSettings() {
         disableLogin: document.getElementById('s-login').checked,
         disableViolations: document.getElementById('s-viol').checked,
         violationsChannelId: document.getElementById('s-channel').value.trim(),
+        notesChannelId: document.getElementById('s-notes-channel').value.trim(),
     };
     try { await api('/api/senior/settings', { method: 'POST', body: JSON.stringify(body) }); toast('تم الحفظ'); }
     catch (e) { toast(e.message); }
