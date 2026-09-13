@@ -55,8 +55,6 @@ const CONFIG = {
          "1003511814140743825",
          "1231269832201207808",
          "1458502584481484952",
-         "1470029805507317844",
-        
     ],
 
     // الرتب العسكرية الرسمية بالترتيب من الأدنى للأعلى
@@ -1603,6 +1601,8 @@ app.get("/api/notes/:discord/:noteId/photo", ensureAuth, async (req, res) => {
     }
 });
 
+// ── تقارير مديرية مكافحة المخدرات ────────────────────────────────────────
+const reportLocks = new Set();
 app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
     if (reportLocks.has(req.user.id)) {
         return res.status(429).json({ error: "في تقرير قيد الإرسال حالياً على حسابك، انتظر لحظة." });
@@ -1701,7 +1701,7 @@ app.post("/api/admin/violations/:id/reject", ensureAnyAdmin, async (req, res) =>
 app.get("/api/senior/personnel", ensureSeniorAdmin, async (req, res) => {
     const q = (req.query.q || "").trim();
     const filter = q ? { $or: [{ registeredName: new RegExp(q, "i") }, { unit: new RegExp(q, "i") }, { discordTag: new RegExp(q, "i") }] } : {};
-    const list = await Personnel.find(filter).sort({ createdAt: -1 }).limit(100);
+    const list = await Personnel.find(filter, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(100);
     res.json({ list });
 });
 
@@ -2484,7 +2484,7 @@ app.post("/api/senior/sectors/:sector/remove", ensureSeniorAdmin, async (req, re
 app.get("/api/sector/members", ensureSectorLeader, async (req, res) => {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const list = ids.length ? await Personnel.find({ discord: { $in: ids } }).sort({ createdAt: -1 }) : [];
+    const list = ids.length ? await Personnel.find({ discord: { $in: ids } }, { "notes.image": 0 }).sort({ createdAt: -1 }) : [];
     res.json({ list, sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel });
 });
 
@@ -2605,9 +2605,8 @@ app.post("/api/sector/personnel/:discord/note", ensureSectorLeader, async (req, 
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
     const { text, image } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "اكتب الملاحظة" });
-    if (!image) return res.status(400).json({ error: "لازم ترفق صورة مع الملاحظة" });
-    if (image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
-    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})` });
+    if (image && image.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
+    const p = await pushNoteWithImage({ discord: req.params.discord, text: text.trim(), image: image || null, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})` });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     await logEvent({ action: "إضافة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`, details: `على ${p.registeredName || p.discord}: ${text.trim()}` });
     res.json({ ok: true, notes: p.notes });
@@ -2782,7 +2781,7 @@ app.get("/api/personnel-officer/members", ensurePersonnelOfficer, async (req, re
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
     const juniorRanks = CONFIG.MILITARY_RANKS.filter(isJuniorRank);
-    const list = ids.length ? await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }).sort({ createdAt: -1 }) : [];
+    const list = ids.length ? await Personnel.find({ discord: { $in: ids }, rank: { $in: juniorRanks } }, { "notes.image": 0 }).sort({ createdAt: -1 }) : [];
     res.json({ list, sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel });
 });
 
@@ -2999,7 +2998,7 @@ app.get("/api/mp/personnel/:discord/warning-info", ensureMPLeader, async (req, r
 app.get("/api/mp/force-members", ensureMPLeader, async (req, res) => {
     const ids = await getMilitaryPoliceMemberIds();
     if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء الشرطة العسكرية من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
-    const list = ids.length ? await Personnel.find({ discord: { $in: ids } }).sort({ createdAt: -1 }) : [];
+    const list = ids.length ? await Personnel.find({ discord: { $in: ids } }, { "notes.image": 0 }).sort({ createdAt: -1 }) : [];
     res.json({ list });
 });
 
@@ -3197,7 +3196,7 @@ app.get("/api/mp/po/members", ensureMPPersonnelOfficer, async (req, res) => {
     const settings = req.settings;
     const excludeIds = [settings.mpLeadership?.commanderId, settings.mpLeadership?.deputyId].filter(Boolean);
     const filtered = ids.filter(id => !excludeIds.includes(id));
-    const list = filtered.length ? await Personnel.find({ discord: { $in: filtered } }).sort({ createdAt: -1 }) : [];
+    const list = filtered.length ? await Personnel.find({ discord: { $in: filtered } }, { "notes.image": 0 }).sort({ createdAt: -1 }) : [];
     res.json({ list });
 });
 app.post("/api/mp/po/personnel/:discord/note", ensureMPPersonnelOfficer, async (req, res) => {
@@ -3612,6 +3611,48 @@ async function submitNoteForm() {
     if (!noteImageData) return toast('لازم ترفق صورة مع الملاحظة');
     try {
         await api(noteFormCtx.apiBase + noteFormCtx.discord + '/note', { method: 'POST', body: JSON.stringify({ text, image: noteImageData }) });
+        toast('✅ تمت إضافة الملاحظة');
+        closeWarnForm();
+        noteImageData = null;
+        if (noteFormCtx.reloadCall) { try { Function(noteFormCtx.reloadCall)(); } catch (e) {} }
+    } catch (e) { toast(e.message); }
+}
+
+// ── فورم ملاحظة القطاعات — يسأل "هل لديك دليل؟" أولاً، والصورة تظهر بس لو "نعم" ──
+function openSectorNoteForm(discord, apiBase, reloadCall) {
+    noteFormCtx = { discord, apiBase, reloadCall };
+    noteImageData = null;
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📝 إضافة ملاحظة</h3>
+        <p style="color:var(--muted);font-size:13px;margin-top:6px;">هل لديك دليل (صورة) على هذي الملاحظة؟</p>
+        <div class="wf-choice-row">
+            <button class="wf-warning" onclick="sectorNoteHasEvidence(true)">نعم</button>
+            <button class="wf-notice" onclick="sectorNoteHasEvidence(false)">لا</button>
+        </div>
+        <div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button></div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+function sectorNoteHasEvidence(hasEvidence) {
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>📝 إضافة ملاحظة</h3>
+        <textarea id="nf-text" placeholder="اكتب سبب الملاحظة..."></textarea>
+        \${hasEvidence ? \`
+        <label style="margin-top:8px;display:block;font-size:13px;color:var(--muted);">صورة الملاحظة (إجبارية)</label>
+        <input type="file" id="nf-image" accept="image/*" onchange="previewNoteImage()">
+        <img id="nf-preview" style="display:none;max-width:100%;border-radius:8px;margin-top:8px;">\` : ''}
+        <div class="wf-actions">
+            <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+            <button class="btn sm" onclick="submitSectorNoteForm(\${hasEvidence})">إرسال</button>
+        </div>\`;
+}
+async function submitSectorNoteForm(hasEvidence) {
+    const text = document.getElementById('nf-text').value;
+    if (!text || !text.trim()) return toast('اكتب الملاحظة');
+    if (hasEvidence && !noteImageData) return toast('لازم ترفق صورة مع الملاحظة');
+    try {
+        await api(noteFormCtx.apiBase + noteFormCtx.discord + '/note', { method: 'POST', body: JSON.stringify({ text, image: hasEvidence ? noteImageData : null }) });
         toast('✅ تمت إضافة الملاحظة');
         closeWarnForm();
         noteImageData = null;
@@ -4165,7 +4206,9 @@ async function submitViolation() {
         violationSubmitting = false;
     }
 }
+let reportBatchCount = 0; // كم تقرير أرسله بنفس الجلسة (بحد أقصى 5)
 function renderNewReport() {
+    reportBatchCount = 0;
     document.getElementById('app').innerHTML = \`
         <div class="card">
             <h2>تسجيل تقرير جديد</h2>
@@ -4289,7 +4332,21 @@ async function submitReport(category) {
             stopReason, seizedItems, securityActions, photo: reportVehiclePhoto,
             drugType, drugQuantity, concealMethod,
         }) });
-        toast('تم إرسال التقرير، بانتظار المراجعة'); renderDashboard();
+        reportBatchCount++;
+        if (reportBatchCount >= 5) {
+            toast('✅ تم إرسال التقرير (5/5) — وصلت الحد الأقصى بهذي الجلسة');
+            renderDashboard();
+            return;
+        }
+        document.getElementById('app').innerHTML = \`
+            <div class="card center">
+                <h2 style="color:#4ade80;">✅ تم إرسال التقرير (\${reportBatchCount}/5)</h2>
+                <p style="color:var(--muted);margin-top:8px;">بانتظار المراجعة. تقدر تضيف تقرير ثاني بنفس الجلسة (لحد 5 كحد أقصى).</p>
+                <div class="row" style="gap:8px;margin-top:16px;justify-content:center;">
+                    <button class="btn" onclick="renderReportForm('\${category}')">➕ إضافة تقرير آخر</button>
+                    <button class="btn gray" onclick="renderDashboard()">انتهيت</button>
+                </div>
+            </div>\`;
     } catch (e) { toast(e.message); }
 }
 function renderCard() {
@@ -5111,7 +5168,7 @@ function sectorAssignUnit(discord) {
         .then(() => { toast('تم التعيين'); loadSectorMembers(); }).catch(e => toast(e.message));
 }
 function sectorAddNote(discord) {
-    openNoteForm(discord, '/api/sector/personnel/', 'loadSectorMembers()');
+    openSectorNoteForm(discord, '/api/sector/personnel/', 'loadSectorMembers()');
 }
 async function loadSectorViolations() {
     const box = document.getElementById('sector-content');
