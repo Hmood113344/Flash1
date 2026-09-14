@@ -2906,6 +2906,18 @@ app.get("/api/high-command/promotion-requests", ensureHighCommand, async (req, r
     const list = await PromotionRequest.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200);
     res.json({ list });
 });
+// تنبيه فوري (شاشة كاملة زي نظام التحذيرات) لأي عضو بالقيادة العليا بأقدم طلب ترقية/تنزيل بانتظار المراجعة
+// يُستدعى بالبولينج — أول من يقبل/يرفض يسوي الطلب يختفي تلقائياً عند الجميع لأن حالته ما عادت "pending"
+app.get("/api/high-command/promotion-alert", ensureHighCommand, async (req, res) => {
+    const r = await PromotionRequest.findOne({ status: "pending" }).sort({ createdAt: 1 });
+    if (!r) return res.json({ alert: null });
+    res.json({ alert: {
+        id: r._id, sector: r.sector, sectorLabel: r.sectorLabel,
+        targetDiscord: r.targetDiscord, targetName: r.targetName, targetTag: r.targetTag,
+        fromRank: r.fromRank, toRank: r.toRank, direction: r.direction,
+        reason: r.reason, requestedByTag: r.requestedByTag, createdAt: r.createdAt,
+    } });
+});
 app.get("/api/high-command/promotion-requests/history", ensureHighCommand, async (req, res) => {
     const list = await PromotionRequest.find({ status: { $ne: "pending" } }).sort({ reviewedAt: -1 }).limit(200);
     res.json({ list });
@@ -3608,6 +3620,20 @@ app.get("/", (req, res) => {
     .warn-ack-btn { margin-top: 26px; background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.5); color: #fff; padding: 12px 22px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; }
     .warn-ack-btn:hover { background: rgba(255,255,255,0.2); }
 
+    /* ── تنبيه القيادة العليا بطلب ترقية/تنزيل جديد (شاشة كاملة زي نظام التحذيرات) ─── */
+    #promo-alert-overlay { display: none; position: fixed; inset: 0; z-index: 2500; background: radial-gradient(circle at center, #14532d, #052e16); color: #fff; text-align: center; flex-direction: column; align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
+    #promo-alert-overlay.open { display: flex; }
+    .promo-box { border: 2px dashed rgba(255,255,255,0.55); border-radius: 10px; padding: 26px 40px; max-width: 480px; }
+    .promo-title { font-size: 28px; font-weight: bold; color: #fff; display: flex; align-items: center; justify-content: center; gap: 10px; }
+    .promo-extra { color: #86efac; font-size: 16px; font-weight: bold; margin-top: 10px; line-height: 1.7; white-space: pre-line; }
+    .promo-reason { color: #fff; font-size: 17px; margin-top: 10px; line-height: 1.6; }
+    .promo-actions { display: flex; gap: 12px; margin-top: 26px; }
+    .promo-actions button { padding: 12px 22px; border-radius: 10px; font-family: inherit; font-size: 14px; cursor: pointer; border: 1px solid rgba(255,255,255,0.5); color: #fff; }
+    .promo-approve-btn { background: rgba(34,197,94,0.35); }
+    .promo-approve-btn:hover { background: rgba(34,197,94,0.55); }
+    .promo-reject-btn { background: rgba(248,113,113,0.25); }
+    .promo-reject-btn:hover { background: rgba(248,113,113,0.45); }
+
     /* ── فورم إرسال تحذير/إشعار (بديل عن prompt/confirm) ─────────────── */
     #wf-overlay { display: none; position: fixed; inset: 0; z-index: 2500; background: rgba(0,0,0,0.75); align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
     #wf-overlay.open { display: flex; }
@@ -3635,6 +3661,18 @@ app.get("/", (req, res) => {
     <div class="row" id="warn-notereview-actions" style="display:none;gap:10px;margin-top:10px;">
         <button class="btn danger sm" onclick="noteReviewDelete()">🗑️ حذف الملاحظة</button>
         <button class="btn sm" onclick="noteReviewExtend()">⏳ تمديد 5 أيام</button>
+    </div>
+</div>
+<div id="promo-alert-overlay">
+    <div class="promo-box">
+        <div class="promo-title"><span>🎖️</span><span>ترقية عسكرية</span><span>🎖️</span></div>
+        <hr class="warn-line">
+        <div class="promo-extra" id="promo-alert-extra"></div>
+        <div class="promo-reason" id="promo-alert-reason"></div>
+    </div>
+    <div class="promo-actions">
+        <button class="promo-approve-btn" onclick="promoAlertApprove()">✅ قبول</button>
+        <button class="promo-reject-btn" onclick="promoAlertReject()">❌ رفض</button>
     </div>
 </div>
 </head>
@@ -4036,6 +4074,51 @@ async function ackCurrentWarning() {
     } catch (e) { toast(e.message); }
     btn.disabled = false;
 }
+// ── تنبيه القيادة العليا بطلب ترقية/تنزيل جديد (شاشة كاملة، تُفتح تلقائياً بالبولينج) ──
+let currentPromoAlertId = null;
+async function checkPromotionAlert() {
+    if (!ME || !ME.isHighCommand) return;
+    if (document.getElementById('promo-alert-overlay').classList.contains('open')) return;
+    try {
+        const { alert } = await api('/api/high-command/promotion-alert');
+        if (alert) showPromotionAlert(alert);
+    } catch (e) {}
+}
+function showPromotionAlert(a) {
+    currentPromoAlertId = a.id;
+    const dirLabel = a.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل';
+    document.getElementById('promo-alert-extra').textContent =
+        dirLabel + ': ' + (a.targetName || a.targetTag) + '\\n' + a.fromRank + ' ← ' + a.toRank +
+        '\\nالقطاع: ' + a.sectorLabel + '\\nمقدّم الطلب: ' + (a.requestedByTag || '-');
+    document.getElementById('promo-alert-reason').textContent = 'السبب: ' + (a.reason || '-');
+    document.getElementById('promo-alert-overlay').classList.add('open');
+}
+function closePromotionAlert() {
+    document.getElementById('promo-alert-overlay').classList.remove('open');
+    currentPromoAlertId = null;
+    if (typeof hcTab !== 'undefined' && hcTab === 'pending' && document.getElementById('hc-content')) loadHCPending();
+    checkPromotionAlert();
+}
+async function promoAlertApprove() {
+    if (!currentPromoAlertId) return;
+    if (!confirm('متأكد تبي تقبل هذا الطلب؟')) return;
+    try {
+        await api('/api/high-command/promotion-requests/' + currentPromoAlertId + '/approve', { method: 'POST' });
+        toast('✅ تمت الموافقة');
+        closePromotionAlert();
+    } catch (e) { toast(e.message); }
+}
+async function promoAlertReject() {
+    if (!currentPromoAlertId) return;
+    const reason = prompt('اكتب سبب الرفض:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب سبب الرفض');
+    try {
+        await api('/api/high-command/promotion-requests/' + currentPromoAlertId + '/reject', { method: 'POST', body: JSON.stringify({ reason }) });
+        toast('❌ تم الرفض');
+        closePromotionAlert();
+    } catch (e) { toast(e.message); }
+}
 async function refreshMe() {
     try { ME = await api('/api/me'); } catch (e) { /* تجاهل */ }
 }
@@ -4051,6 +4134,7 @@ async function init() {
     if (att.status !== 'in') { renderFingerprint('checkin'); return; }
     renderDashboard();
     checkPendingWarning();
+    checkPromotionAlert();
     startPolling();
 }
 function buildNav() {
@@ -4202,6 +4286,7 @@ async function pollTick() {
         if (document.getElementById('pending-box')) loadPending();
         if (currentAdminTab === 'log') loadLog(true);
         checkPendingWarning();
+        checkPromotionAlert();
     } catch (e) {}
 }
 // لو صار عليه حظر/صيانة وهو شغّال، نفضل نتابعه بهدوء، وأول ما يرجع الوضع طبيعي نحدّث الصفحة تلقائياً
