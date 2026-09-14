@@ -1706,16 +1706,9 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
         if (p.isBlocked) return res.status(403).json({ error: "أنت موقوف عن تسجيل تقارير جديدة" });
         if (isSummonBlocking(p)) return res.status(403).json({ error: "🚨 عليك استدعاء نشط من الشرطة العسكرية، لازم تدخل الاستدعاء أولاً قبل أي إجراء بالموقع" });
 
-        // يمنع تسجيل تقرير جديد إذا وصل عدد المخالفات/التقارير المعلّقة له للحد الأقصى
-        const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
-        if (pendingCount >= CONFIG.MAX_PENDING_ITEMS) {
-            return res.status(429).json({ error: `عندك ${CONFIG.MAX_PENDING_ITEMS} مخالفات/تقارير معلّقة بانتظار المراجعة، لازم الإدارة تقبل أو ترفض وحدة منها قبل تسجيل تقرير جديد.` });
-        }
-
         const {
             category, suspectName, arrestLocation, vehicle,
-            stopReason, seizedItems, securityActions, photo,
-            drugType, drugQuantity, concealMethod,
+            stopReason, securityActions, photo, items,
         } = req.body;
 
         if (!category || !["جنائي", "مخدرات"].includes(category)) {
@@ -1725,33 +1718,46 @@ app.post("/api/reports/submit", ensureAntiDrugsRole, async (req, res) => {
         if (!vehicle) return res.status(400).json({ error: "اختر المركبة" });
         if (!stopReason) return res.status(400).json({ error: "أكمل تفاصيل العملية الميدانية" });
         if (!photo) return res.status(400).json({ error: "لازم ترفق صورة المركبة" });
-        if (photo && photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
+        if (photo.length > CONFIG.MAX_PHOTO_MB * 1024 * 1024 * 1.4) {
             return res.status(400).json({ error: `الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB` });
         }
-        if (category === "مخدرات") {
-            if (!drugType || !drugQuantity || !concealMethod) {
-                return res.status(400).json({ error: "أكمل نوع المخدر وكميته وطريقة إخفائه" });
+        if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "أضف مخالفة واحدة على الأقل" });
+        if (items.length > 5) return res.status(400).json({ error: "الحد الأقصى 5 مخالفات لكل تقرير" });
+        for (const it of items) {
+            if (category === "مخدرات") {
+                if (!it.drugType || !it.drugQuantity || !it.concealMethod) return res.status(400).json({ error: "أكمل نوع المخدر وكميته وطريقة إخفائه لكل مخالفة" });
+            } else {
+                if (!it.seizedItems) return res.status(400).json({ error: "اكتب المضبوطات لكل مخالفة" });
             }
-        } else {
-            if (!seizedItems) return res.status(400).json({ error: "اكتب المضبوطات" });
         }
+
+        // يمنع تسجيل تقارير جديدة لو رح توصل المعلّقة للحد الأقصى
+        const pendingCount = await Violation.countDocuments({ reporterDiscord: req.user.id, status: "pending" });
+        if (pendingCount + items.length > CONFIG.MAX_PENDING_ITEMS) {
+            return res.status(429).json({ error: `عندك ${pendingCount} مخالفة/تقرير معلّق حالياً، وهذا التقرير فيه ${items.length} — بيتجاوز الحد الأقصى (${CONFIG.MAX_PENDING_ITEMS}). لازم الإدارة تراجع بعضها أولاً.` });
+        }
+
         const cleanActions = Array.isArray(securityActions) ? securityActions.map(a => String(a).trim()).filter(Boolean) : [];
         const vehicleDoc = await Vehicle.findOne({ name: vehicle });
 
-        const v = await Violation.create({
-            reporterDiscord: req.user.id, reporterTag: req.user.username,
-            reporterName: p.registeredName, reporterUnit: p.unit,
-            kind: "report", reportCategory: category,
-            suspectName, arrestLocation, vehicle, vehiclePhoto: vehicleDoc?.photo || null,
-            stopReason, securityActions: cleanActions,
-            seizedItems: category === "جنائي" ? seizedItems : null,
-            drugType: category === "مخدرات" ? drugType : null,
-            drugQuantity: category === "مخدرات" ? drugQuantity : null,
-            concealMethod: category === "مخدرات" ? concealMethod : null,
-            plateNumber: generatePlate(), status: "pending",
-        });
-        await postViolationToChannel(v, photo);
-        res.json({ ok: true, report: v });
+        const created = [];
+        for (const it of items) {
+            const v = await Violation.create({
+                reporterDiscord: req.user.id, reporterTag: req.user.username,
+                reporterName: p.registeredName, reporterUnit: p.unit,
+                kind: "report", reportCategory: category,
+                suspectName, arrestLocation, vehicle, vehiclePhoto: vehicleDoc?.photo || null,
+                stopReason, securityActions: cleanActions,
+                seizedItems: category === "جنائي" ? it.seizedItems : null,
+                drugType: category === "مخدرات" ? it.drugType : null,
+                drugQuantity: category === "مخدرات" ? it.drugQuantity : null,
+                concealMethod: category === "مخدرات" ? it.concealMethod : null,
+                plateNumber: generatePlate(), status: "pending",
+            });
+            await postViolationToChannel(v, photo);
+            created.push(v);
+        }
+        res.json({ ok: true, count: created.length, reports: created });
     } finally {
         reportLocks.delete(req.user.id);
     }
@@ -4464,9 +4470,7 @@ async function submitViolation() {
         violationSubmitting = false;
     }
 }
-let reportBatchCount = 0; // كم تقرير أرسله بنفس الجلسة (بحد أقصى 5)
 function renderNewReport() {
-    reportBatchCount = 0;
     document.getElementById('app').innerHTML = \`
         <div class="card">
             <h2>تسجيل تقرير جديد</h2>
@@ -4480,9 +4484,11 @@ function renderNewReport() {
             </div>
         </div>\`;
 }
+let reportItemCount = 0;
 async function renderReportForm(category) {
     const meta = await api('/api/violations/meta');
     reportMeta = meta; reportSelectedVehicle = null; reportVehiclePhoto = null;
+    reportItemCount = 0;
     const isDrugs = category === 'مخدرات';
     document.getElementById('app').innerHTML = \`
         <div class="card">
@@ -4500,18 +4506,9 @@ async function renderReportForm(category) {
             <h3 style="margin-top:16px;">تفاصيل العملية الميدانية</h3>
             <label>سبب الاستيقاف</label>
             <input id="rp-stop-reason" placeholder="سبب الاستيقاف">
-            \${isDrugs ? \`
-            <label>نوع المخدر المضبوط</label>
-            <input id="rp-drug-type" placeholder="مثال: حشيش، شبو، حبوب مخدرة">
-            <label>الكمية المضبوطة</label>
-            <input id="rp-drug-qty" placeholder="مثال: 3 كيلو / 50 حبة">
-            <label>طريقة إخفاء المخدر</label>
-            <input id="rp-conceal" placeholder="مثال: مخبأ داخل صندوق السيارة">
-            \` : \`
-            <label>المضبوطات</label>
-            <textarea id="rp-seized" placeholder="المضبوطات" rows="3"></textarea>
-            \`}
-            <label>الإجراءات الأمنية المتخذة</label>
+            <div class="row" style="margin-top:16px;"><h3>المخالفات على هذا المتهم (بحد أقصى 5)</h3><button type="button" class="btn sm gray" onclick="addReportItem('\${category}')">+ إضافة مخالفة</button></div>
+            <div id="rp-items-box"></div>
+            <label style="margin-top:12px;">الإجراءات الأمنية المتخذة</label>
             <div id="rp-actions-box">
                 <div class="row rp-action-row" style="gap:6px;flex-wrap:nowrap;">
                     <input class="rp-action" placeholder="- إجراء أمني" style="flex:1;">
@@ -4528,6 +4525,44 @@ async function renderReportForm(category) {
             </div>
         </div>\`;
     if (meta.vehicles.length) pickReportVehicle(0);
+    addReportItem(category); // مخالفة أولى إجبارية
+}
+function addReportItem(category) {
+    const box = document.getElementById('rp-items-box');
+    if (box.querySelectorAll('.rp-item-block').length >= 5) return toast('الحد الأقصى 5 مخالفات بنفس التقرير');
+    reportItemCount++;
+    const i = reportItemCount;
+    const isDrugs = category === 'مخدرات';
+    const div = document.createElement('div');
+    div.className = 'card rp-item-block';
+    div.id = 'rp-item-' + i;
+    div.style.cssText = 'margin-top:8px;padding:12px;';
+    div.innerHTML = \`
+        <div class="row"><b>مخالفة #<span class="rp-item-num">\${box.children.length + 1}</span></b><button type="button" class="btn danger sm" onclick="removeReportItem(\${i})">حذف</button></div>
+        \${isDrugs ? \`
+        <label>نوع المخدر المضبوط</label>
+        <input class="rp-item-drug-type" placeholder="مثال: حشيش، شبو، حبوب مخدرة">
+        <label>الكمية المضبوطة</label>
+        <input class="rp-item-drug-qty" placeholder="مثال: 3 كيلو / 50 حبة">
+        <label>طريقة إخفاء المخدر</label>
+        <input class="rp-item-conceal" placeholder="مثال: مخبأ داخل صندوق السيارة">
+        \` : \`
+        <label>المضبوطات</label>
+        <textarea class="rp-item-seized" placeholder="المضبوطات" rows="2"></textarea>
+        \`}\`;
+    box.appendChild(div);
+    renumberReportItems();
+}
+function removeReportItem(i) {
+    const box = document.getElementById('rp-items-box');
+    if (box.querySelectorAll('.rp-item-block').length <= 1) return toast('لازم تبقى مخالفة واحدة على الأقل');
+    document.getElementById('rp-item-' + i).remove();
+    renumberReportItems();
+}
+function renumberReportItems() {
+    document.querySelectorAll('#rp-items-box .rp-item-block').forEach((el, idx) => {
+        el.querySelector('.rp-item-num').textContent = idx + 1;
+    });
 }
 function pickReportVehicle(i) {
     reportSelectedVehicle = reportMeta.vehicles[i].name;
@@ -4574,37 +4609,29 @@ async function submitReport(category) {
     if (!stopReason) return toast('أكمل تفاصيل العملية الميدانية');
     if (!reportVehiclePhoto) return toast('لازم ترفق صورة المركبة');
 
-    let seizedItems = null, drugType = null, drugQuantity = null, concealMethod = null;
-    if (isDrugs) {
-        drugType = document.getElementById('rp-drug-type').value.trim();
-        drugQuantity = document.getElementById('rp-drug-qty').value.trim();
-        concealMethod = document.getElementById('rp-conceal').value.trim();
-        if (!drugType || !drugQuantity || !concealMethod) return toast('أكمل نوع المخدر وكميته وطريقة إخفائه');
-    } else {
-        seizedItems = document.getElementById('rp-seized').value.trim();
-        if (!seizedItems) return toast('اكتب المضبوطات');
+    const blocks = Array.from(document.querySelectorAll('#rp-items-box .rp-item-block'));
+    if (!blocks.length) return toast('أضف مخالفة واحدة على الأقل');
+    const items = [];
+    for (const b of blocks) {
+        if (isDrugs) {
+            const drugType = b.querySelector('.rp-item-drug-type').value.trim();
+            const drugQuantity = b.querySelector('.rp-item-drug-qty').value.trim();
+            const concealMethod = b.querySelector('.rp-item-conceal').value.trim();
+            if (!drugType || !drugQuantity || !concealMethod) return toast('أكمل كل حقول كل مخالفة (نوع المخدر، الكمية، طريقة الإخفاء)');
+            items.push({ drugType, drugQuantity, concealMethod });
+        } else {
+            const seizedItems = b.querySelector('.rp-item-seized').value.trim();
+            if (!seizedItems) return toast('اكتب المضبوطات لكل مخالفة');
+            items.push({ seizedItems });
+        }
     }
     try {
-        await api('/api/reports/submit', { method: 'POST', body: JSON.stringify({
+        const r = await api('/api/reports/submit', { method: 'POST', body: JSON.stringify({
             category, suspectName, arrestLocation, vehicle: reportSelectedVehicle,
-            stopReason, seizedItems, securityActions, photo: reportVehiclePhoto,
-            drugType, drugQuantity, concealMethod,
+            stopReason, securityActions, photo: reportVehiclePhoto, items,
         }) });
-        reportBatchCount++;
-        if (reportBatchCount >= 5) {
-            toast('✅ تم إرسال التقرير (5/5) — وصلت الحد الأقصى بهذي الجلسة');
-            renderDashboard();
-            return;
-        }
-        document.getElementById('app').innerHTML = \`
-            <div class="card center">
-                <h2 style="color:#4ade80;">✅ تم إرسال التقرير (\${reportBatchCount}/5)</h2>
-                <p style="color:var(--muted);margin-top:8px;">بانتظار المراجعة. تقدر تضيف تقرير ثاني بنفس الجلسة (لحد 5 كحد أقصى).</p>
-                <div class="row" style="gap:8px;margin-top:16px;justify-content:center;">
-                    <button class="btn" onclick="renderReportForm('\${category}')">➕ إضافة تقرير آخر</button>
-                    <button class="btn gray" onclick="renderDashboard()">انتهيت</button>
-                </div>
-            </div>\`;
+        toast(\`✅ تم إرسال \${r.count} مخالفة على \${suspectName}، بانتظار المراجعة\`);
+        renderDashboard();
     } catch (e) { toast(e.message); }
 }
 function renderCard() {
