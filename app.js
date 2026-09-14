@@ -1513,7 +1513,7 @@ app.get("/api/violations/meta", ensureAuth, async (req, res) => {
     res.json({ types: CONFIG.VIOLATION_TYPES, vehicles: vehicles.map(v => ({ name: v.name, photo: v.photo })) });
 });
 
-const VIOLATION_COOLDOWN_MS = 30 * 1000;
+const VIOLATION_COOLDOWN_MS = 5 * 1000;
 const violationLocks = new Set(); // يمنع إرسال مخالفتين بنفس اللحظة من نفس الحساب
 
 app.post("/api/violations/submit", ensureAuth, async (req, res) => {
@@ -3593,6 +3593,18 @@ app.get("/", (req, res) => {
     .vcard { border: 2px solid var(--border); border-radius: 10px; padding: 6px; text-align: center; cursor: pointer; font-size: 11px; background: rgba(255,255,255,0.03); }
     .vcard.sel { border-color: var(--gold); background: rgba(59,130,246,0.12); }
     .vcard img { width: 100%; height: 54px; object-fit: cover; border-radius: 6px; margin-bottom: 4px; }
+
+
+    /* ── فورم اختيار نوع/أنواع المخالفة (بدل القائمة المنسدلة) ─────────────── */
+    #vtype-overlay { display: none; position: fixed; inset: 0; z-index: 2600; background: rgba(0,0,0,0.75); align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
+    #vtype-overlay.open { display: flex; }
+    .vtype-box { background: #0d1f3c; border: 1px solid var(--gold); border-radius: 14px; padding: 22px; max-width: 460px; width: 100%; max-height: 85vh; overflow-y: auto; margin: auto; }
+    .vtype-box h3 { margin-bottom: 14px; color: var(--gold-soft); text-align: center; }
+    .vtype-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+    .vtype-opt { border: 2px solid var(--border); border-radius: 10px; padding: 10px 14px; font-size: 13px; cursor: pointer; background: rgba(255,255,255,0.04); color: #fff; }
+    .vtype-opt.sel { border-color: #22c55e; background: rgba(34,197,94,0.28); color: #4ade80; font-weight: bold; }
+    .vtype-actions { display: flex; gap: 8px; margin-top: 18px; }
+    .vtype-actions button { flex: 1; }
     .login-screen { text-align: center; padding: 4rem 2rem; }
     .login-screen h1 { font-size: 3rem; color: #3b82f6; text-shadow: 0 0 20px rgba(59,130,246,0.5); margin-bottom: 10px; }
     footer { text-align: center; padding: 1.5rem; margin-top: 2rem; border-top: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--muted); font-size: 0.9rem; }
@@ -3675,6 +3687,16 @@ app.get("/", (req, res) => {
         <button class="promo-reject-btn" onclick="promoAlertReject()">❌ رفض</button>
     </div>
 </div>
+<div id="vtype-overlay">
+    <div class="vtype-box">
+        <h3>اختر نوع/أنواع المخالفة</h3>
+        <div class="vtype-grid" id="vtype-grid"></div>
+        <div class="vtype-actions">
+            <button class="btn gray" onclick="closeVTypeOverlay()">إلغاء</button>
+            <button class="btn" onclick="confirmVTypeSelection()">✅ تم</button>
+        </div>
+    </div>
+</div>
 </head>
 <body>
 <div id="warn-banner">⚠️ تنبيه: هذا الموقع مخصص للمحاكاة واللعب فقط، ولا يمت للواقع بصلة.</div>
@@ -3710,11 +3732,38 @@ let pollTimer = null;
 let blockedPollTimer = null;
 let attHeartbeatTimer = null;
 
+// يمسك آخر زر ضُغط فعليًا (يشتغل حتى على سفاري آيفون اللي ما يعطي focus للأزرار تلقائيًا عند اللمس)
+let __lastClickedBtn = null;
+document.addEventListener('click', function (e) {
+    const b = e.target.closest('button');
+    if (b) __lastClickedBtn = b;
+}, true);
+
+// كل الأزرار اللي تستدعي api() توقف فورًا (تعتيم + تعطيل) لحظة الضغط وترجع بعد الرد —
+// يمنع إحساس "تعليق" الزر ويمنع إرسال نفس الطلب مرتين لو ضغط المستخدم أكثر من مرة
 async function api(url, opts) {
-    const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || 'خطأ');
-    return data;
+    const btn = __lastClickedBtn;
+    if (btn) {
+        if (btn.dataset.busy === '1') throw new Error('لحظة، طلبك السابق لسا قيد التنفيذ');
+        btn.dataset.busy = '1';
+        btn.dataset.prevOpacity = btn.style.opacity || '';
+        btn.disabled = true;
+        btn.style.opacity = '0.55';
+        btn.style.cursor = 'wait';
+    }
+    try {
+        const r = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...opts });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || 'خطأ');
+        return data;
+    } finally {
+        if (btn) {
+            btn.dataset.busy = '0';
+            btn.disabled = false;
+            btn.style.opacity = btn.dataset.prevOpacity || '';
+            btn.style.cursor = '';
+        }
+    }
 }
 function toast(msg) {
     const t = document.getElementById('toast');
@@ -4496,14 +4545,18 @@ async function loadMine(silent) {
         if (box) box.innerHTML = \`<p style="color:#f87171;">تعذر تحميل مخالفاتي، حاول تحدّث الصفحة. (\${e.message})</p>\`;
     }
 }
+let vtypeSelected = [];
 async function renderNewViolation() {
     const meta = await api('/api/violations/meta');
-    META = meta; selectedVehicle = null; photoBase64 = null;
+    META = meta; selectedVehicle = null; photoBase64 = null; vtypeSelected = [];
     document.getElementById('app').innerHTML = \`
         <div class="card">
             <h2>تسجيل مخالفة جديدة</h2>
             <label>نوع المخالفة</label>
-            <select id="v-type">\${meta.types.map(t => \`<option>\${t}</option>\`).join('')}</select>
+            <div class="row" style="gap:10px;align-items:center;margin-bottom:12px;">
+                <button class="btn sm" type="button" onclick="openVTypeOverlay()">➕ اختيار نوع المخالفة</button>
+                <span id="vtype-summary" style="color:var(--muted);font-size:13px;">لم يتم اختيار أي نوع بعد</span>
+            </div>
             <label>المركبة</label>
             \${meta.vehicles.length ? \`<div class="vgrid" id="v-grid">\${meta.vehicles.map((v,i) => \`
                 <div class="vcard" id="vcard-\${i}" onclick="pickVehicle(\${i})">
@@ -4519,6 +4572,31 @@ async function renderNewViolation() {
             </div>
         </div>\`;
     if (meta.vehicles.length) pickVehicle(0);
+}
+// ── فورم اختيار نوع/أنواع المخالفة (بطاقات تتلوّن أخضر عند التحديد، تدعم اختيار أكثر من نوع) ──
+function openVTypeOverlay() {
+    const grid = document.getElementById('vtype-grid');
+    grid.innerHTML = META.types.map(function (t, i) {
+        const cls = vtypeSelected.indexOf(t) > -1 ? 'vtype-opt sel' : 'vtype-opt';
+        return '<div class="' + cls + '" id="vtype-opt-' + i + '" onclick="toggleVType(' + i + ')">' + t + '</div>';
+    }).join('');
+    document.getElementById('vtype-overlay').classList.add('open');
+}
+function toggleVType(i) {
+    const t = META.types[i];
+    const idx = vtypeSelected.indexOf(t);
+    const el = document.getElementById('vtype-opt-' + i);
+    if (idx > -1) { vtypeSelected.splice(idx, 1); el.classList.remove('sel'); }
+    else { vtypeSelected.push(t); el.classList.add('sel'); }
+}
+function closeVTypeOverlay() {
+    document.getElementById('vtype-overlay').classList.remove('open');
+}
+function confirmVTypeSelection() {
+    if (!vtypeSelected.length) { toast('اختر نوع مخالفة واحد على الأقل'); return; }
+    document.getElementById('vtype-summary').textContent = vtypeSelected.join('، ');
+    document.getElementById('vtype-summary').style.color = '#4ade80';
+    closeVTypeOverlay();
 }
 function pickVehicle(i) {
     selectedVehicle = META.vehicles[i].name;
@@ -4540,7 +4618,8 @@ function previewPhoto() {
 let violationSubmitting = false;
 async function submitViolation() {
     if (violationSubmitting) return; // يمنع الدبل-كليك من إرسال الطلب مرتين
-    const violationType = document.getElementById('v-type').value;
+    if (!vtypeSelected.length) return toast('اختر نوع مخالفة واحد على الأقل');
+    const violationType = vtypeSelected.join('، ');
     if (!selectedVehicle) return toast('اختر المركبة');
     if (!photoBase64) return toast('لازم ترفق صورة المخالفة');
     const btn = document.getElementById('v-submit-btn');
