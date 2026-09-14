@@ -148,6 +148,8 @@ const PersonnelSchema = new mongoose.Schema({
     notes: [{
         text: String, image: { type: String, default: null }, // image: احتياطي فقط لو فشل رفع الصورة لديسكورد
         imageChannelId: { type: String, default: null }, imageMessageId: { type: String, default: null },
+        reviewDeadline: { type: Date, default: null }, // استحقاق مراجعة (5 أيام من الإضافة أو آخر تمديد)
+        reviewNotified: { type: Boolean, default: false },
         addedBy: String, addedByTag: String,
         createdAt: { type: Date, default: Date.now }
     }],
@@ -163,7 +165,7 @@ const PersonnelSchema = new mongoose.Schema({
     },
     // تحذيرات/إشعارات صادرة له — تظهر بوجهه كشاشة كاملة لين يتعاهد عليها
     warnings: [{
-        kind: { type: String, enum: ["warning", "notice"], default: "warning" }, // تحذير | إشعار
+        kind: { type: String, enum: ["warning", "notice", "note-review"], default: "warning" }, // تحذير | إشعار | مراجعة ملاحظة قديمة
         reason: String,
         issuedBy: String, issuedByTag: String,
         acknowledged: { type: Boolean, default: false },
@@ -173,6 +175,12 @@ const PersonnelSchema = new mongoose.Schema({
         pointsDeducted: { type: Number, default: 0 },      // نقاط الخصم عند التحذير الثاني
         penaltyType: { type: String, default: null },      // معرّف العقوبة عند التحذير الثالث فأكثر
         penaltyLabel: { type: String, default: null },     // اسم العقوبة المطبقة (للعرض)
+        // ── مراجعة ملاحظة قديمة (تُملأ فقط لو kind === "note-review") ──
+        noteReviewTargetDiscord: { type: String, default: null },
+        noteReviewTargetName: { type: String, default: null },
+        noteReviewNoteId: { type: String, default: null },
+        noteReviewText: { type: String, default: null },
+        noteReviewSectorLabel: { type: String, default: null },
         createdAt: { type: Date, default: Date.now }
     }],
     isBlocked: { type: Boolean, default: false },
@@ -230,6 +238,7 @@ const PromotionRequestSchema = new mongoose.Schema({
     fromRank: String,
     toRank: String,
     direction: { type: String, enum: ["up", "down"] },
+    reason: { type: String, default: null }, // سبب الترقية/التنزيل
     requestedBy: String,
     requestedByTag: String,
     status: { type: String, default: "pending" }, // pending | approved | rejected
@@ -373,6 +382,8 @@ const SettingsSchema = new mongoose.Schema({
         deputyId: { type: String, default: null }, deputyName: { type: String, default: null },
         personnelOfficerId: { type: String, default: null }, personnelOfficerName: { type: String, default: null },
     },
+    // القيادة العليا — مجموعة يعيّنها كبار المسؤولين، وظيفتها الوحيدة مراجعة طلبات الترقية/التنزيل
+    highCommand: { type: [{ id: String, name: String }], default: [] },
     violationsChannelId: String,
     notesChannelId: String, // قناة رفع صور الملاحظات (نفس فكرة قناة المخالفات)
     // عقوبات التحذير الثالث — قابلة للإضافة/التعديل/الحذف من لوحة كبار المسؤولين (صفحة عقوبات التحذيرات)
@@ -436,6 +447,41 @@ async function rankProgress(p, settings) {
     const threshold = isMax ? 0 : await getThreshold(p.rank, settings);
     const remaining = isMax ? 0 : Math.max(0, threshold - p.points);
     return { currentRank: p.rank, nextRank, threshold, remaining };
+}
+
+// ينبّه قائد/نائب القطاع لو أي ملاحظة على أحد أفراد قطاعهم وصل عمرها 5 أيام بدون إجراء
+const agingNoteCheckThrottle = new Map(); // sectorKey -> آخر وقت فحص
+const AGING_CHECK_COOLDOWN_MS = 60 * 60 * 1000; // ساعة — نتجنب فحص كل ضغطة صفحة
+async function checkAgingNotesForSector(sectorKey, sectorLabel, settings) {
+    const sl = (settings.sectorLeadership || {})[sectorKey] || {};
+    const notifyIds = [sl.commanderId, sl.deputyId].filter(Boolean);
+    if (!notifyIds.length) return;
+    const ids = await getSectorMemberIds(sectorKey);
+    if (!ids || !ids.length) return;
+    const now = new Date();
+    const people = await Personnel.find({ discord: { $in: ids }, "notes.0": { $exists: true } });
+    for (const p of people) {
+        let changed = false;
+        for (const n of p.notes) {
+            if (!n.reviewNotified && n.reviewDeadline && n.reviewDeadline <= now) {
+                n.reviewNotified = true;
+                changed = true;
+                for (const targetId of notifyIds) {
+                    await Personnel.findOneAndUpdate({ discord: targetId }, { $push: { warnings: {
+                        kind: "note-review",
+                        reason: `📋 وصلت ملاحظة على ${p.registeredName || p.discordTag} إلى 5 أيام بدون إجراء.`,
+                        noteReviewTargetDiscord: p.discord,
+                        noteReviewTargetName: p.registeredName || p.discordTag,
+                        noteReviewNoteId: n._id.toString(),
+                        noteReviewText: n.text,
+                        noteReviewSectorLabel: sectorLabel,
+                        issuedBy: "system", issuedByTag: "النظام",
+                    } } });
+                }
+            }
+        }
+        if (changed) await p.save();
+    }
 }
 
 // ينهي أي إجازة "approved" نشطة على هذا الشخص — يصير إما لأن المدة خلصت، أو لأنه استخدم الموقع أثناء الإجازة (يعني رجع)
@@ -502,6 +548,10 @@ function getMPRole(userId, settings) {
 function isMPPersonnelOfficer(userId, settings) {
     const sl = settings.mpLeadership || {};
     return !!(sl.personnelOfficerId && sl.personnelOfficerId === userId);
+}
+// القيادة العليا — مجموعة يعيّنها كبار المسؤولين لمراجعة طلبات الترقية/التنزيل بكل القطاعات
+function isHighCommand(userId, settings) {
+    return !!(settings.highCommand || []).find(m => m.id === userId);
 }
 // يحسب وقت فتح الروم فعلياً: "الآن" = فوراً، "وقت محدد" = اليوم بذاك الوقت (أو بكرة لو الوقت فات اليوم)
 function computeSummonUnlockAt(mode, hour, minute, ampm) {
@@ -799,7 +849,7 @@ async function postNoteToChannel(personnelDiscord, personnelName, text, addedByT
 async function pushNoteWithImage({ discord, text, image, actorId, actorTag }) {
     const p = await Personnel.findOne({ discord });
     if (!p) return null;
-    p.notes.push({ text, image, addedBy: actorId, addedByTag: actorTag });
+    p.notes.push({ text, image, addedBy: actorId, addedByTag: actorTag, reviewDeadline: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000) });
     const note = p.notes[p.notes.length - 1];
     await p.save();
     const uploaded = await postNoteToChannel(p.discord, p.registeredName || p.discordTag || p.discord, text, actorTag, image);
@@ -1233,6 +1283,14 @@ async function ensureMPMember(req, res, next) {
     next();
 }
 
+// يسمح لأعضاء القيادة العليا (أو كبار المسؤولين) بمراجعة طلبات الترقية/التنزيل
+async function ensureHighCommand(req, res, next) {
+    if (!req.isAuthenticated()) return res.status(401).json({ error: "غير مسجّل دخول" });
+    const settings = await getSettings();
+    if (isHighCommand(req.user.id, settings) || isSeniorAdmin(req.user.id)) { req.settings = settings; return next(); }
+    return res.status(403).json({ error: "هذا القسم للقيادة العليا فقط" });
+}
+
 // يتأكد أن الفرد المطلوب من أعضاء قطاع مسؤول الأفراد، وبرتبة رئيس رقباء فما دون (نطاق صلاحيته)
 async function ensureJuniorInMySector(req, res, discordId) {
     const ids = await getSectorMemberIds(req.sectorInfo.sector);
@@ -1294,6 +1352,13 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         sectorInfo.personnelOfficerName = sec.personnelOfficerName || null;
         sectorInfo.attendanceOfficerId = sec.attendanceOfficerId || null;
         sectorInfo.attendanceOfficerName = sec.attendanceOfficerName || null;
+        if (sectorInfo.role === "commander" || sectorInfo.role === "deputy") {
+            const lastCheck = agingNoteCheckThrottle.get(sectorInfo.sector);
+            if (!lastCheck || Date.now() - lastCheck > AGING_CHECK_COOLDOWN_MS) {
+                agingNoteCheckThrottle.set(sectorInfo.sector, Date.now());
+                checkAgingNotesForSector(sectorInfo.sector, sectorInfo.sectorLabel, settings).catch(e => console.error("❌ فشل فحص الملاحظات القديمة:", e.message));
+            }
+        }
     }
     const personnelOfficerInfo = getPersonnelOfficerSector(req.user.id, settings);
     const attendanceOfficerInfo = getAttendanceOfficerSector(req.user.id, settings);
@@ -1333,6 +1398,7 @@ app.get("/api/me", ensureAuth, async (req, res) => {
         mpInfo,
         mpPersonnelOfficer,
         isMilitaryPolice,
+        isHighCommand: isHighCommand(req.user.id, settings),
         summon,
         summonLocked: isSummonBlocking(p),
         maintenance: settings.isMaintenance,
@@ -1599,6 +1665,30 @@ app.get("/api/notes/:discord/:noteId/photo", ensureAuth, async (req, res) => {
         console.error("❌ فشل تحميل صورة الملاحظة:", e);
         res.status(500).json({ error: "تعذر تحميل الصورة" });
     }
+});
+
+// حذف ملاحظة نهائياً — لقادة/نواب القطاعات أو كبار المسؤولين (يُستخدم من إشعار مراجعة الملاحظات القديمة)
+app.delete("/api/notes/:discord/:noteId", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    if (!getSectorRole(req.user.id, settings) && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const p = await Personnel.findOneAndUpdate({ discord: req.params.discord }, { $pull: { notes: { _id: req.params.noteId } } }, { new: true });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    await logEvent({ action: "حذف ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: "حذف من مراجعة الملاحظات القديمة" });
+    res.json({ ok: true });
+});
+// تمديد مهلة مراجعة الملاحظة 5 أيام إضافية
+app.post("/api/notes/:discord/:noteId/extend-review", ensureAuth, async (req, res) => {
+    const settings = await getSettings();
+    if (!getSectorRole(req.user.id, settings) && !isSeniorAdmin(req.user.id)) return res.status(403).json({ error: "غير مصرح" });
+    const p = await Personnel.findOne({ discord: req.params.discord });
+    if (!p) return res.status(404).json({ error: "غير موجود" });
+    const note = p.notes.id(req.params.noteId);
+    if (!note) return res.status(404).json({ error: "الملاحظة غير موجودة" });
+    note.reviewDeadline = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
+    note.reviewNotified = false;
+    await p.save();
+    await logEvent({ action: "تمديد مراجعة ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: "تمديد 5 أيام" });
+    res.json({ ok: true });
 });
 
 // ── تقارير مديرية مكافحة المخدرات ────────────────────────────────────────
@@ -1952,6 +2042,11 @@ app.get("/api/warnings/pending", async (req, res) => {
         warningNumber: pending.warningNumber || null,
         pointsDeducted: pending.pointsDeducted || 0,
         penaltyLabel: pending.penaltyLabel || null,
+        noteReviewTargetDiscord: pending.noteReviewTargetDiscord || null,
+        noteReviewTargetName: pending.noteReviewTargetName || null,
+        noteReviewNoteId: pending.noteReviewNoteId || null,
+        noteReviewText: pending.noteReviewText || null,
+        noteReviewSectorLabel: pending.noteReviewSectorLabel || null,
     } });
 });
 
@@ -1991,15 +2086,70 @@ app.get("/api/senior/notes", ensureSeniorAdmin, async (req, res) => {
     res.json({ list: flat });
 });
 
+// ── حذف ملاحظات قطاع كامل (بالجملة أو باستثناء محدد) — كبار المسؤولين فقط ──
+app.get("/api/senior/notes/by-sector/:sector", ensureSeniorAdmin, async (req, res) => {
+    const sector = req.params.sector;
+    if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
+    const ids = await getSectorMemberIds(sector);
+    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+    if (!ids.length) return res.json({ list: [] });
+    const people = await Personnel.find({ discord: { $in: ids }, "notes.0": { $exists: true } }, { discord: 1, discordTag: 1, registeredName: 1, notes: 1 });
+    const flat = [];
+    for (const p of people) {
+        for (const n of p.notes) {
+            flat.push({
+                noteId: n._id, discord: p.discord, personnelName: p.registeredName || p.discordTag || p.discord,
+                text: n.text, addedByTag: n.addedByTag, createdAt: n.createdAt,
+            });
+        }
+    }
+    flat.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json({ list: flat, sectorLabel: CONFIG.SECTORS[sector] });
+});
+app.post("/api/senior/notes/by-sector/:sector/delete-all", ensureSeniorAdmin, async (req, res) => {
+    const sector = req.params.sector;
+    if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
+    const ids = await getSectorMemberIds(sector);
+    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+    if (!ids.length) return res.json({ ok: true, count: 0 });
+    const result = await Personnel.updateMany({ discord: { $in: ids } }, { $set: { notes: [] } });
+    await logEvent({ action: "حذف كل ملاحظات القطاع", actorId: req.user.id, actorTag: req.user.username, details: `${CONFIG.SECTORS[sector]} — ${result.modifiedCount} عسكري` });
+    res.json({ ok: true, count: result.modifiedCount });
+});
+app.post("/api/senior/notes/by-sector/:sector/delete-except", ensureSeniorAdmin, async (req, res) => {
+    const sector = req.params.sector;
+    if (!CONFIG.SECTORS[sector]) return res.status(400).json({ error: "قطاع غير معروف" });
+    const { keepNoteIds } = req.body; // الملاحظات المستثناة (تبقى)
+    const keep = Array.isArray(keepNoteIds) ? keepNoteIds : [];
+    const ids = await getSectorMemberIds(sector);
+    if (ids === null) return res.status(503).json({ error: "تعذر جلب أعضاء القطاع من ديسكورد حالياً، حاول مرة ثانية بعد شوي" });
+    if (!ids.length) return res.json({ ok: true, count: 0 });
+    const people = await Personnel.find({ discord: { $in: ids }, "notes.0": { $exists: true } });
+    let count = 0;
+    for (const p of people) {
+        const before = p.notes.length;
+        p.notes = p.notes.filter(n => keep.includes(n._id.toString()));
+        count += before - p.notes.length;
+        if (before !== p.notes.length) await p.save();
+    }
+    await logEvent({ action: "حذف ملاحظات القطاع باستثناء", actorId: req.user.id, actorTag: req.user.username, details: `${CONFIG.SECTORS[sector]} — حذف ${count}، استثناء ${keep.length}` });
+    res.json({ ok: true, count });
+});
+
 app.delete("/api/senior/personnel/:discord/note/:noteId", ensureSeniorAdmin, async (req, res) => {
-    const p = await Personnel.findOneAndUpdate(
-        { discord: req.params.discord },
-        { $pull: { notes: { _id: req.params.noteId } } },
-        { new: true }
-    );
-    if (!p) return res.status(404).json({ error: "غير موجود" });
-    await logEvent({ action: "حذف ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `من ${p.registeredName || p.discord}` });
-    res.json({ ok: true });
+    try {
+        const p = await Personnel.findOneAndUpdate(
+            { discord: req.params.discord },
+            { $pull: { notes: { _id: req.params.noteId } } },
+            { new: true }
+        );
+        if (!p) return res.status(404).json({ error: "غير موجود" });
+        await logEvent({ action: "حذف ملاحظة", discordId: p.discord, discordTag: p.discordTag, actorId: req.user.id, actorTag: req.user.username, details: `من ${p.registeredName || p.discord}` });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error("❌ فشل حذف ملاحظة:", e.message, "| discord:", req.params.discord, "| noteId:", req.params.noteId);
+        res.status(400).json({ error: "تعذر حذف هذي الملاحظة (معرّف غير صالح)، جرب تحذفها من صفحة حذف ملاحظات القطاعات بدلاً منها" });
+    }
 });
 
 app.post("/api/senior/personnel/:discord/block", ensureSeniorAdmin, async (req, res) => {
@@ -2544,27 +2694,34 @@ app.get("/api/sector/personnel/:discord", ensureSectorLeader, async (req, res) =
 });
 
 // ترقية أو تنزيل عضو من القطاع رتبة واحدة
+// طلب ترقية/تنزيل من قائد/نائب القطاع — ما ينفّذ مباشرة، يروح كطلب معلّق للقيادة العليا (لازم سبب)
 app.post("/api/sector/personnel/:discord/rank", ensureSectorLeader, async (req, res) => {
     if (!(await ensureInMySector(req, res, req.params.discord))) return;
-    const { direction } = req.body; // 'up' | 'down'
+    const { direction, reason } = req.body; // 'up' | 'down'
     if (!["up", "down"].includes(direction)) return res.status(400).json({ error: "حدد الاتجاه" });
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الترقية/التنزيل" });
     const p = await Personnel.findOne({ discord: req.params.discord });
     if (!p) return res.status(404).json({ error: "غير موجود" });
     const idx = rankIndex(p.rank);
     const newIdx = direction === "up" ? idx + 1 : idx - 1;
     if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
-    const settings = await getSettings();
     const newRank = CONFIG.MILITARY_RANKS[newIdx];
-    const oldRank = p.rank;
-    p.rank = newRank;
-    p.points = direction === "up" ? await pointsForReachingRank(newRank, settings) : 0;
-    await p.save();
-    await logEvent({
-        action: direction === "up" ? "ترقية عسكري" : "تنزيل عسكري", discordId: p.discord, discordTag: p.discordTag,
-        actorId: req.user.id, actorTag: req.user.username,
-        details: `${oldRank} ← ${newRank} (بواسطة قيادة ${req.sectorInfo.sectorLabel})`,
+    const existing = await PromotionRequest.findOne({ targetDiscord: p.discord, status: "pending" });
+    if (existing) return res.status(400).json({ error: "يوجد طلب معلّق لهذا الفرد مسبقاً، انتظر رد القيادة العليا" });
+    const roleLabel = req.sectorInfo.role === "commander" ? "قائد" : "نائب";
+    const doc = await PromotionRequest.create({
+        sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel,
+        targetDiscord: p.discord, targetTag: p.discordTag, targetName: p.registeredName,
+        fromRank: p.rank, toRank: newRank, direction, reason: reason.trim(),
+        requestedBy: req.user.id, requestedByTag: req.user.username + ` (${roleLabel} ${req.sectorInfo.sectorLabel})`,
+        status: "pending",
     });
-    res.json({ ok: true, personnel: p });
+    await logEvent({
+        action: direction === "up" ? "طلب ترقية" : "طلب تنزيل", discordId: p.discord, discordTag: p.discordTag,
+        actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`,
+        details: `${p.rank} ← ${newRank} — السبب: ${reason.trim()} — بانتظار القيادة العليا`,
+    });
+    res.json({ ok: true, request: doc });
 });
 
 // تعيين يونت لعضو القطاع (نفس صلاحية كبار المسؤولين على نفس الحقل)
@@ -2729,17 +2886,26 @@ app.get("/api/sector/attendance", ensureAttendanceViewer, async (req, res) => {
     res.json({ list, sectorLabel: req.sectorInfo.sectorLabel });
 });
 
-// ── طلبات ترقية/تنزيل الأفراد (يراجعها قائد/نائب القطاع — أي وحد منهم يكفي للموافقة) ──
-// هذي الطلبات مصدرها "مسؤول الأفراد" — هو يقترح، وقيادة القطاع توافق أو ترفض
+// ── طلبات ترقية/تنزيل قطاعه (سجل حالة بس — المراجعة الفعلية صارت عند القيادة العليا) ──
 app.get("/api/sector/promotion-requests", ensureSectorLeader, async (req, res) => {
     const list = await PromotionRequest.find({ sector: req.sectorInfo.sector }).sort({ createdAt: -1 }).limit(100);
     res.json({ list });
 });
 
-app.post("/api/sector/promotion-requests/:id/approve", ensureSectorLeader, async (req, res) => {
+// ══════════════════════════════════════════════════════════════════════════
+// 4.4.1) القيادة العليا — تراجع كل طلبات الترقية/التنزيل من كل القطاعات
+// ══════════════════════════════════════════════════════════════════════════
+app.get("/api/high-command/promotion-requests", ensureHighCommand, async (req, res) => {
+    const list = await PromotionRequest.find({ status: "pending" }).sort({ createdAt: -1 }).limit(200);
+    res.json({ list });
+});
+app.get("/api/high-command/promotion-requests/history", ensureHighCommand, async (req, res) => {
+    const list = await PromotionRequest.find({ status: { $ne: "pending" } }).sort({ reviewedAt: -1 }).limit(200);
+    res.json({ list });
+});
+app.post("/api/high-command/promotion-requests/:id/approve", ensureHighCommand, async (req, res) => {
     const r = await PromotionRequest.findById(req.params.id);
     if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
-    if (r.sector !== req.sectorInfo.sector) return res.status(403).json({ error: "هذا الطلب مو من قطاعك" });
     const p = await Personnel.findOne({ discord: r.targetDiscord });
     if (!p) return res.status(404).json({ error: "الفرد غير موجود" });
     const settings = await getSettings();
@@ -2747,30 +2913,85 @@ app.post("/api/sector/promotion-requests/:id/approve", ensureSectorLeader, async
     p.rank = r.toRank;
     p.points = r.direction === "up" ? await pointsForReachingRank(r.toRank, settings) : 0;
     await p.save();
-    r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    r.status = "approved"; r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username + " (القيادة العليا)"; r.reviewedAt = new Date();
     await r.save();
+
+    const verb = r.direction === "up" ? "ترقيتك" : "تنزيلك";
+    await Personnel.findOneAndUpdate({ discord: r.targetDiscord }, { $push: { warnings: {
+        kind: "notice", reason: `🎖️ تمت ${verb} من ${oldRank} إلى ${r.toRank} — بموافقة القيادة العليا.`,
+        issuedBy: req.user.id, issuedByTag: req.user.username,
+    } } });
+    if (r.requestedBy) {
+        await Personnel.findOneAndUpdate({ discord: r.requestedBy }, { $push: { warnings: {
+            kind: "notice", reason: `✅ انقبل طلبك بـ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag} من ${oldRank} إلى ${r.toRank} من القيادة العليا.`,
+            issuedBy: req.user.id, issuedByTag: req.user.username,
+        } } });
+    }
+    // لو الطلب من مسؤول أفراد (مو قائد/نائب)، لازم قائد القطاع يعرف كمان
+    const sl = (settings.sectorLeadership || {})[r.sector];
+    if (sl && sl.commanderId && sl.commanderId !== r.requestedBy) {
+        await Personnel.findOneAndUpdate({ discord: sl.commanderId }, { $push: { warnings: {
+            kind: "notice", reason: `🎖️ تمت ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag} من ${oldRank} إلى ${r.toRank} بأمر القيادة العليا.`,
+            issuedBy: req.user.id, issuedByTag: req.user.username,
+        } } });
+    }
     await logEvent({
         action: r.direction === "up" ? "ترقية عسكري" : "تنزيل عسكري", discordId: p.discord, discordTag: p.discordTag,
-        actorId: req.user.id, actorTag: req.user.username,
-        details: `${oldRank} ← ${r.toRank} (موافقة على طلب مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
+        actorId: req.user.id, actorTag: req.user.username + " (القيادة العليا)",
+        details: `${oldRank} ← ${r.toRank} — السبب: ${r.reason || "-"}`,
     });
     res.json({ ok: true, personnel: p });
 });
-
-app.post("/api/sector/promotion-requests/:id/reject", ensureSectorLeader, async (req, res) => {
+app.post("/api/high-command/promotion-requests/:id/reject", ensureHighCommand, async (req, res) => {
     const { reason } = req.body;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الرفض" });
     const r = await PromotionRequest.findById(req.params.id);
     if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
-    if (r.sector !== req.sectorInfo.sector) return res.status(403).json({ error: "هذا الطلب مو من قطاعك" });
-    r.status = "rejected"; r.rejectReason = (reason || "").trim() || null;
-    r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+    r.status = "rejected"; r.rejectReason = reason.trim(); r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username + " (القيادة العليا)"; r.reviewedAt = new Date();
     await r.save();
-    await logEvent({
-        action: "رفض طلب ترقية/تنزيل", discordId: r.targetDiscord, discordTag: r.targetTag,
-        actorId: req.user.id, actorTag: req.user.username,
-        details: `${r.fromRank} ← ${r.toRank} (طلب مسؤول أفراد ${req.sectorInfo.sectorLabel})${reason ? " — السبب: " + reason.trim() : ""}`,
-    });
+    const verb = r.direction === "up" ? "ترقيتك" : "تنزيلك";
+    await Personnel.findOneAndUpdate({ discord: r.targetDiscord }, { $push: { warnings: {
+        kind: "notice", reason: `تم رفض طلب ${verb} من القيادة العليا. السبب: ${reason.trim()}`,
+        issuedBy: req.user.id, issuedByTag: req.user.username,
+    } } });
+    if (r.requestedBy) {
+        await Personnel.findOneAndUpdate({ discord: r.requestedBy }, { $push: { warnings: {
+            kind: "notice", reason: `❌ انرفض طلبك بـ${r.direction === "up" ? "ترقية" : "تنزيل"} ${r.targetName || r.targetTag} من القيادة العليا. السبب: ${reason.trim()}`,
+            issuedBy: req.user.id, issuedByTag: req.user.username,
+        } } });
+    }
+    await logEvent({ action: "رفض طلب ترقية/تنزيل", discordId: r.targetDiscord, discordTag: r.targetTag, actorId: req.user.id, actorTag: req.user.username + " (القيادة العليا)", details: `${r.fromRank} ← ${r.toRank} — السبب: ${reason.trim()}` });
     res.json({ ok: true });
+});
+
+// إدارة أعضاء القيادة العليا — كبار المسؤولين فقط
+app.get("/api/senior/high-command", ensureSeniorAdmin, async (req, res) => {
+    const settings = await getSettings();
+    res.json({ list: settings.highCommand || [] });
+});
+app.post("/api/senior/high-command/add", ensureSeniorAdmin, async (req, res) => {
+    const { discordId } = req.body;
+    if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حدد الشخص" });
+    const person = await Personnel.findOne({ discord: discordId.trim() });
+    if (!person || !person.registeredName) return res.status(400).json({ error: "لازم يكون هذا الشخص مسجل بالموقع" });
+    const settings = await getSettings();
+    if (!settings.highCommand) settings.highCommand = [];
+    if (settings.highCommand.some(m => m.id === person.discord)) return res.status(400).json({ error: "موجود بالقيادة العليا بالفعل" });
+    settings.highCommand.push({ id: person.discord, name: person.registeredName || person.discordTag });
+    settings.markModified("highCommand");
+    await settings.save();
+    await logEvent({ action: "إضافة عضو للقيادة العليا", discordId: person.discord, discordTag: person.discordTag, actorId: req.user.id, actorTag: req.user.username, details: person.registeredName });
+    res.json({ ok: true, list: settings.highCommand });
+});
+app.post("/api/senior/high-command/remove", ensureSeniorAdmin, async (req, res) => {
+    const { discordId } = req.body;
+    const settings = await getSettings();
+    const removed = (settings.highCommand || []).find(m => m.id === discordId);
+    settings.highCommand = (settings.highCommand || []).filter(m => m.id !== discordId);
+    settings.markModified("highCommand");
+    await settings.save();
+    await logEvent({ action: "إزالة عضو من القيادة العليا", actorId: req.user.id, actorTag: req.user.username, details: removed?.name || discordId });
+    res.json({ ok: true, list: settings.highCommand });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -2826,23 +3047,24 @@ app.post("/api/personnel-officer/personnel/:discord/warn", ensurePersonnelOffice
 app.post("/api/personnel-officer/personnel/:discord/promotion-request", ensurePersonnelOfficer, async (req, res) => {
     const p = await ensureJuniorInMySector(req, res, req.params.discord);
     if (!p) return;
-    const { direction } = req.body;
+    const { direction, reason } = req.body;
     if (!["up", "down"].includes(direction)) return res.status(400).json({ error: "حدد الاتجاه" });
+    if (!reason || !reason.trim()) return res.status(400).json({ error: "اكتب سبب الترقية/التنزيل" });
     const idx = rankIndex(p.rank);
     const newIdx = direction === "up" ? idx + 1 : idx - 1;
     if (newIdx < 0 || newIdx >= CONFIG.MILITARY_RANKS.length) return res.status(400).json({ error: "لا توجد رتبة أعلى/أدنى" });
     const existing = await PromotionRequest.findOne({ targetDiscord: p.discord, status: "pending" });
-    if (existing) return res.status(400).json({ error: "يوجد طلب معلّق لهذا الفرد مسبقاً، انتظر رد القيادة" });
+    if (existing) return res.status(400).json({ error: "يوجد طلب معلّق لهذا الفرد مسبقاً، انتظر رد القيادة العليا" });
     const doc = await PromotionRequest.create({
         sector: req.sectorInfo.sector, sectorLabel: req.sectorInfo.sectorLabel,
         targetDiscord: p.discord, targetTag: p.discordTag, targetName: p.registeredName,
-        fromRank: p.rank, toRank: CONFIG.MILITARY_RANKS[newIdx], direction,
-        requestedBy: req.user.id, requestedByTag: req.user.username, status: "pending",
+        fromRank: p.rank, toRank: CONFIG.MILITARY_RANKS[newIdx], direction, reason: reason.trim(),
+        requestedBy: req.user.id, requestedByTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`, status: "pending",
     });
     await logEvent({
         action: direction === "up" ? "طلب ترقية" : "طلب تنزيل", discordId: p.discord, discordTag: p.discordTag,
-        actorId: req.user.id, actorTag: req.user.username,
-        details: `${p.rank} ← ${CONFIG.MILITARY_RANKS[newIdx]} (طلب من مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
+        actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
+        details: `${p.rank} ← ${CONFIG.MILITARY_RANKS[newIdx]} — السبب: ${reason.trim()} — بانتظار القيادة العليا`,
     });
     res.json({ ok: true, request: doc });
 });
@@ -3403,6 +3625,10 @@ app.get("/", (req, res) => {
         <div class="warn-reason" id="warn-reason-text"></div>
     </div>
     <button class="warn-ack-btn" id="warn-ack-btn" onclick="ackCurrentWarning()">🤝 اتعاهد وأقر بعدم تكرار ذلك</button>
+    <div class="row" id="warn-notereview-actions" style="display:none;gap:10px;margin-top:10px;">
+        <button class="btn danger sm" onclick="noteReviewDelete()">🗑️ حذف الملاحظة</button>
+        <button class="btn sm" onclick="noteReviewExtend()">⏳ تمديد 5 أيام</button>
+    </div>
 </div>
 </head>
 <body>
@@ -3748,18 +3974,48 @@ async function checkPendingWarning() {
 }
 function showWarningOverlay(w) {
     currentWarningId = w.id;
+    currentNoteReview = w.kind === 'note-review' ? {
+        discord: w.noteReviewTargetDiscord, noteId: w.noteReviewNoteId,
+    } : null;
     const overlay = document.getElementById('warn-overlay');
     overlay.classList.remove('k-warning', 'k-notice');
     overlay.classList.add(w.kind === 'warning' ? 'k-warning' : 'k-notice');
     const numLabel = { 1: 'تحذير أول', 2: 'تحذير ثاني', 3: 'تحذير ثالث' };
-    document.getElementById('warn-title-text').textContent = w.kind === 'warning' ? (numLabel[w.warningNumber] || 'تحذير') : 'إشعار';
+    document.getElementById('warn-title-text').textContent = w.kind === 'warning' ? (numLabel[w.warningNumber] || 'تحذير') : w.kind === 'note-review' ? '📋 مراجعة ملاحظة' : 'إشعار';
     let extra = '';
     if (w.kind === 'warning' && (w.warningNumber === 1 || w.warningNumber === 2) && w.pointsDeducted) extra = w.penaltyLabel || ('تم خصم ' + w.pointsDeducted + ' نقطة من رصيدك');
     if (w.kind === 'warning' && w.warningNumber >= 3 && w.penaltyLabel) extra = 'العقوبة المطبقة: ' + w.penaltyLabel;
+    if (w.kind === 'note-review') extra = (w.noteReviewSectorLabel || '') + (w.noteReviewTargetName ? ' — ' + w.noteReviewTargetName : '');
     document.getElementById('warn-extra-text').textContent = extra;
-    document.getElementById('warn-reason-text').textContent = w.reason;
+    document.getElementById('warn-reason-text').textContent = w.kind === 'note-review' ? (w.noteReviewText || w.reason) : w.reason;
+    document.getElementById('warn-ack-btn').style.display = w.kind === 'note-review' ? 'none' : '';
     document.getElementById('warn-ack-btn').textContent = w.kind === 'warning' ? '🤝 اتعاهد وأقر بعدم تكرار ذلك' : '✅ تم الاطلاع';
+    document.getElementById('warn-notereview-actions').style.display = w.kind === 'note-review' ? 'flex' : 'none';
     overlay.classList.add('open');
+}
+let currentNoteReview = null;
+async function noteReviewDelete() {
+    if (!currentNoteReview || !currentWarningId) return;
+    if (!confirm('متأكد تبي تحذف هذي الملاحظة نهائياً؟')) return;
+    try {
+        await api('/api/notes/' + currentNoteReview.discord + '/' + currentNoteReview.noteId, { method: 'DELETE' });
+        await api('/api/warnings/' + currentWarningId + '/ack', { method: 'POST' });
+        toast('🗑️ تم حذف الملاحظة');
+        document.getElementById('warn-overlay').classList.remove('open');
+        currentWarningId = null; currentNoteReview = null;
+        checkPendingWarning();
+    } catch (e) { toast(e.message); }
+}
+async function noteReviewExtend() {
+    if (!currentNoteReview || !currentWarningId) return;
+    try {
+        await api('/api/notes/' + currentNoteReview.discord + '/' + currentNoteReview.noteId + '/extend-review', { method: 'POST' });
+        await api('/api/warnings/' + currentWarningId + '/ack', { method: 'POST' });
+        toast('⏳ تم تمديد المراجعة 5 أيام');
+        document.getElementById('warn-overlay').classList.remove('open');
+        currentWarningId = null; currentNoteReview = null;
+        checkPendingWarning();
+    } catch (e) { toast(e.message); }
 }
 async function ackCurrentWarning() {
     if (!currentWarningId) return;
@@ -3810,6 +4066,7 @@ function buildNav() {
         { label: '🪪 بطاقتي', fn: 'renderCard()' },
     );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
+    if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
     else if (ME.isMilitaryPolice) items.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
@@ -3823,6 +4080,7 @@ function buildNav() {
 function renderFabs() {
     const fabs = [];
     if (ME.isSeniorAdmin) fabs.push({ label: '🛡️ لوحة كبار المسؤولين', fn: 'renderAdmin()' });
+    if (ME.isHighCommand) fabs.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.mpInfo) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) fabs.push({ label: '🚔 أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
     else if (ME.isMilitaryPolice) fabs.push({ label: '🚔 الشرطة العسكرية', fn: 'renderMPMemberPanel()' });
@@ -4768,7 +5026,60 @@ function renderSectorsBox() {
             <div style="color:var(--muted);font-size:12px;margin-top:2px;">مسؤول أفراد الشرطة العسكرية يعيّنه القائد أو النائب من داخل لوحة الشرطة العسكرية نفسها.</div>
             <div id="picker-mp-commander"></div>
             <div id="picker-mp-deputy"></div>
+        </div>
+        <div class="card">
+            <h3>⭐ القيادة العليا</h3>
+            <div style="color:var(--muted);font-size:12px;margin-bottom:8px;">تراجع كل طلبات الترقية والتنزيل من كل القطاعات — تقدر تضيف أكثر من شخص.</div>
+            <input placeholder="🔍 ابحث عن اسم الشخص المسجل بالموقع..." oninput="searchHCCandidate(this.value)">
+            <div id="hc-cand-results"></div>
+            <div id="hc-members-list" style="margin-top:10px;">جارِ التحميل...</div>
         </div>\`;
+    loadHighCommandList();
+}
+async function loadHighCommandList() {
+    const box = document.getElementById('hc-members-list');
+    if (!box) return;
+    try {
+        const { list } = await api('/api/senior/high-command');
+        if (!list.length) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا يوجد أعضاء بالقيادة العليا بعد</p>'; return; }
+        box.innerHTML = list.map(m => \`
+            <div class="card" style="padding:8px 12px;margin-top:6px;">
+                <div class="row">
+                    <span>\${m.name}</span>
+                    <button class="btn danger sm" onclick="removeHCMember('\${m.id}')">إزالة</button>
+                </div>
+            </div>\`).join('');
+    } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+}
+let hcSearchTimer = null;
+function searchHCCandidate(q) {
+    clearTimeout(hcSearchTimer);
+    hcSearchTimer = setTimeout(async () => {
+        const box = document.getElementById('hc-cand-results');
+        if (!box) return;
+        if (!q || !q.trim()) { box.innerHTML = ''; return; }
+        box.innerHTML = 'جارِ البحث...';
+        try {
+            const { list } = await api('/api/senior/personnel?q=' + encodeURIComponent(q));
+            if (list.length === 0) { box.innerHTML = '<p style="color:var(--muted);font-size:13px;">لا نتائج</p>'; return; }
+            box.innerHTML = list.filter(p => p.registeredName).map(p => \`
+                <div class="card" style="padding:8px 12px;margin-top:6px;">
+                    <div class="row">
+                        <span>\${p.registeredName} <span style="color:var(--muted);font-size:12px;">(\${p.unit || '-'} • \${p.rank})</span></span>
+                        <button class="btn sm" onclick="addHCMember('\${p.discord}')">إضافة</button>
+                    </div>
+                </div>\`).join('');
+        } catch (e) { box.innerHTML = '<p style="color:#f87171;font-size:13px;">' + e.message + '</p>'; }
+    }, 350);
+}
+async function addHCMember(discordId) {
+    try { await api('/api/senior/high-command/add', { method: 'POST', body: JSON.stringify({ discordId }) }); toast('تمت الإضافة'); document.getElementById('hc-cand-results').innerHTML = ''; loadHighCommandList(); }
+    catch (e) { toast(e.message); }
+}
+async function removeHCMember(discordId) {
+    if (!confirm('متأكد تبي تزيله من القيادة العليا؟')) return;
+    try { await api('/api/senior/high-command/remove', { method: 'POST', body: JSON.stringify({ discordId }) }); toast('تم'); loadHighCommandList(); }
+    catch (e) { toast(e.message); }
 }
 function openMPPicker(role) {
     ['commander', 'deputy'].forEach(r => {
@@ -4870,6 +5181,78 @@ async function removeSectorRole(sectorKey, role) {
 // ── لوحة قيادة القطاع (لقادة/نواب القطاعات) ──────────────────────────────
 let sectorPanelTab = 'members';
 let sectorMembersCache = [];
+// ══════════════════════════════════════════════════════════════════════════
+// القيادة العليا — مراجعة طلبات الترقية/التنزيل من كل القطاعات
+// ══════════════════════════════════════════════════════════════════════════
+let hcTab = 'pending';
+function renderHighCommandPanel() {
+    if (!ME.isHighCommand) return renderDashboard();
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>⭐ القيادة العليا</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع للوحتي</button></div>
+        <div class="tabs">
+            <div class="tab active" onclick="hcTabSwitch('pending', this)">⏳ الطلبات المعلّقة</div>
+            <div class="tab" onclick="hcTabSwitch('history', this)">📜 السجل</div>
+        </div>
+        <div id="hc-content"></div>\`;
+    hcTabSwitch('pending');
+}
+function hcTabSwitch(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    if (el) el.classList.add('active');
+    hcTab = name;
+    if (name === 'pending') loadHCPending();
+    if (name === 'history') loadHCHistory();
+}
+function hcCard(r, withActions) {
+    return \`
+        <div class="card">
+            <b>\${r.targetName || r.targetTag}</b>
+            <div style="color:var(--gold-soft);margin-top:4px;">\${r.direction === 'up' ? '⬆️ ترقية' : '⬇️ تنزيل'}: \${r.fromRank} ← \${r.toRank}</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:2px;">القطاع: \${r.sectorLabel} • مقدّم الطلب: \${r.requestedByTag || r.requestedBy}</div>
+            \${r.reason ? \`<div style="font-size:13px;margin-top:6px;">السبب: \${r.reason}</div>\` : ''}
+            \${!withActions ? \`<div style="margin-top:6px;"><span class="badge \${r.status}">\${r.status === 'approved' ? 'مقبول' : 'مرفوض'}</span>\${r.rejectReason ? ' — ' + r.rejectReason : ''}</div>\` : ''}
+            \${withActions ? \`
+            <div class="row" style="gap:8px;margin-top:10px;">
+                <button class="btn sm" onclick="hcDecide('\${r._id}','approve')">قبول</button>
+                <button class="btn danger sm" onclick="hcDecide('\${r._id}','reject')">رفض</button>
+            </div>\` : ''}
+        </div>\`;
+}
+async function loadHCPending() {
+    const box = document.getElementById('hc-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/high-command/promotion-requests'); }
+    catch (e) { if (hcTab !== 'pending') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (hcTab !== 'pending') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات معلّقة</div>'; return; }
+    box.innerHTML = data.list.map(r => hcCard(r, true)).join('');
+}
+function hcDecide(id, action) {
+    if (action === 'reject') {
+        const reason = prompt('اكتب سبب الرفض:');
+        if (reason === null) return;
+        if (!reason.trim()) return toast('لازم تكتب سبب');
+        api('/api/high-command/promotion-requests/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
+            .then(() => { toast('تم الرفض'); loadHCPending(); }).catch(e => toast(e.message));
+        return;
+    }
+    api('/api/high-command/promotion-requests/' + id + '/approve', { method: 'POST' })
+        .then(() => { toast('✅ تمت الموافقة'); loadHCPending(); }).catch(e => toast(e.message));
+}
+async function loadHCHistory() {
+    const box = document.getElementById('hc-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/high-command/promotion-requests/history'); }
+    catch (e) { if (hcTab !== 'history') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (hcTab !== 'history') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا يوجد سجل بعد</div>'; return; }
+    box.innerHTML = data.list.map(r => hcCard(r, false)).join('');
+}
+
 function renderSectorPanel() {
     if (!ME.sectorInfo) return renderDashboard();
     document.getElementById('app').innerHTML = \`
@@ -5093,33 +5476,16 @@ async function loadPromotionRequests() {
     }
     if (sectorPanelTab !== 'promotions') return;
     const list = data.list || [];
-    const note = \`<div class="card" style="color:var(--muted);font-size:13px;">📩 هذي طلبات ترقية وتنزيل جاتك من مسؤول الأفراد بقطاعك — هو يقترح، وأنت أو النائب توافقون أو ترفضون. الموافقة تطبّق الترقية/التنزيل فعلياً على الفرد.</div>\`;
+    const note = \`<div class="card" style="color:var(--muted);font-size:13px;">📩 طلبات الترقية والتنزيل (منك أو من مسؤول الأفراد) تراجعها القيادة العليا — هذي بس متابعة لحالتها.</div>\`;
     if (list.length === 0) { box.innerHTML = note + '<div class="card center" style="color:var(--muted);">لا توجد طلبات حالياً</div>'; return; }
     box.innerHTML = note + list.map(r => \`
         <div class="card">
-            <div class="row" style="align-items:flex-start;">
-                <div>
-                    <b>\${r.targetName || r.targetTag}</b>
-                    <div style="color:var(--gold-soft);margin-top:4px;">\${r.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل'}: \${r.fromRank} ← \${r.toRank}</div>
-                    <div style="color:var(--muted);font-size:12px;margin-top:2px;">من مسؤول الأفراد: \${r.requestedByTag || r.requestedBy}</div>
-                    <div style="margin-top:4px;"><span class="badge \${r.status}">\${r.status === 'pending' ? 'قيد المراجعة' : r.status === 'approved' ? 'تمت الموافقة' : 'مرفوض'}</span>\${r.status === 'rejected' && r.rejectReason ? \` — \${r.rejectReason}\` : ''}</div>
-                </div>
-                \${r.status === 'pending' ? \`
-                <div class="row" style="gap:8px;">
-                    <button class="btn sm" onclick="promoRequestApprove('\${r._id}')">قبول</button>
-                    <button class="btn danger sm" onclick="promoRequestReject('\${r._id}')">رفض</button>
-                </div>\` : ''}
-            </div>
+            <b>\${r.targetName || r.targetTag}</b>
+            <div style="color:var(--gold-soft);margin-top:4px;">\${r.direction === 'up' ? '⬆️ طلب ترقية' : '⬇️ طلب تنزيل'}: \${r.fromRank} ← \${r.toRank}</div>
+            \${r.reason ? \`<div style="color:var(--muted);font-size:12px;margin-top:2px;">السبب: \${r.reason}</div>\` : ''}
+            <div style="color:var(--muted);font-size:12px;margin-top:2px;">مقدّم الطلب: \${r.requestedByTag || r.requestedBy}</div>
+            <div style="margin-top:4px;"><span class="badge \${r.status}">\${r.status === 'pending' ? 'قيد المراجعة (القيادة العليا)' : r.status === 'approved' ? 'تمت الموافقة' : 'مرفوض'}</span>\${r.status === 'rejected' && r.rejectReason ? \` — \${r.rejectReason}\` : ''}</div>
         </div>\`).join('');
-}
-function promoRequestApprove(id) {
-    api('/api/sector/promotion-requests/' + id + '/approve', { method: 'POST' })
-        .then(() => { toast('تمت الموافقة'); loadPromotionRequests(); }).catch(e => toast(e.message));
-}
-function promoRequestReject(id) {
-    const reason = prompt('سبب الرفض (اختياري):') || '';
-    api('/api/sector/promotion-requests/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
-        .then(() => { toast('تم الرفض'); loadPromotionRequests(); }).catch(e => toast(e.message));
 }
 async function loadSectorMembers() {
     const box = document.getElementById('sector-content');
@@ -5154,9 +5520,12 @@ async function loadSectorMembers() {
         </div>\`).join('');
 }
 async function sectorPromote(discord, direction) {
+    const reason = prompt(direction === 'up' ? 'اكتب سبب الترقية:' : 'اكتب سبب التنزيل:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب السبب');
     try {
-        await api('/api/sector/personnel/' + discord + '/rank', { method: 'POST', body: JSON.stringify({ direction }) });
-        toast(direction === 'up' ? 'تمت الترقية' : 'تم التنزيل');
+        await api('/api/sector/personnel/' + discord + '/rank', { method: 'POST', body: JSON.stringify({ direction, reason }) });
+        toast('📩 تم إرسال الطلب للقيادة العليا للمراجعة');
         loadSectorMembers();
     } catch (e) { toast(e.message); }
 }
@@ -5324,9 +5693,11 @@ async function editMemberPoints(discord, currentPoints) {
     } catch (e) { toast(e.message); }
 }
 function poPromotionRequest(discord, direction) {
-    if (!confirm(direction === 'up' ? 'تبي ترسل طلب ترقية لهذا الفرد؟ الطلب بيروح لقائد أو نائب القطاع للموافقة، مو تنفيذ مباشر.' : 'تبي ترسل طلب تنزيل لهذا الفرد؟ الطلب بيروح لقائد أو نائب القطاع للموافقة، مو تنفيذ مباشر.')) return;
-    api('/api/personnel-officer/personnel/' + discord + '/promotion-request', { method: 'POST', body: JSON.stringify({ direction }) })
-        .then(() => toast('✅ تم إرسال الطلب لقيادة القطاع')).catch(e => toast(e.message));
+    const reason = prompt(direction === 'up' ? 'اكتب سبب الترقية:' : 'اكتب سبب التنزيل:');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب السبب');
+    api('/api/personnel-officer/personnel/' + discord + '/promotion-request', { method: 'POST', body: JSON.stringify({ direction, reason }) })
+        .then(() => toast('📩 تم إرسال الطلب للقيادة العليا للمراجعة')).catch(e => toast(e.message));
 }
 function poAddNote(discord) {
     openNoteForm(discord, '/api/personnel-officer/personnel/', 'loadPoMembers()');
@@ -6215,8 +6586,17 @@ async function loadNotesPage() {
         return;
     }
     if (currentAdminTab !== 'notes') return;
-    if (list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد ملاحظات مسجلة</div>'; return; }
-    box.innerHTML = list.map(n => \`
+    const sectorButtons = \`
+        <div class="card">
+            <div style="font-size:13px;color:var(--muted);margin-bottom:8px;">حذف ملاحظات قطاع كامل:</div>
+            <div class="row" style="gap:8px;flex-wrap:wrap;">
+                <button class="btn sm danger" onclick="openSectorNotesDelete('patrol')">🗑️ ملاحظات الدوريات</button>
+                <button class="btn sm danger" onclick="openSectorNotesDelete('roadSecurity')">🗑️ ملاحظات أمن الطرق</button>
+                <button class="btn sm danger" onclick="openSectorNotesDelete('antiDrugs')">🗑️ ملاحظات المكافحة</button>
+            </div>
+        </div>\`;
+    if (list.length === 0) { box.innerHTML = sectorButtons + '<div class="card center" style="color:var(--muted);">لا توجد ملاحظات مسجلة</div>'; return; }
+    box.innerHTML = sectorButtons + list.map(n => \`
         <div class="card">
             <div class="row" style="align-items:flex-start;">
                 <div>
@@ -6228,6 +6608,73 @@ async function loadNotesPage() {
                 <button class="btn danger sm" onclick="deleteNote('\${n.discord}', '\${n.noteId}')">🗑️ حذف</button>
             </div>
         </div>\`).join('');
+}
+function openSectorNotesDelete(sector) {
+    const box = document.getElementById('wf-box');
+    box.innerHTML = \`
+        <h3>🗑️ حذف ملاحظات القطاع</h3>
+        <p style="color:var(--muted);font-size:13px;margin-top:6px;">تبي تحذف الجميع، أو تستثني بعضها؟</p>
+        <div class="wf-choice-row">
+            <button class="wf-warning" onclick="sectorNotesDeleteAll('\${sector}')">حذف الجميع</button>
+            <button class="wf-notice" onclick="sectorNotesDeleteExcept('\${sector}')">باستثناء</button>
+        </div>
+        <div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button></div>\`;
+    document.getElementById('wf-overlay').classList.add('open');
+}
+async function sectorNotesDeleteAll(sector) {
+    if (!confirm('متأكد؟ بتحذف كل ملاحظات هذا القطاع نهائياً بدون استثناء.')) return;
+    try {
+        const { count } = await api('/api/senior/notes/by-sector/' + sector + '/delete-all', { method: 'POST' });
+        toast('🗑️ تم حذف ملاحظات ' + count + ' عسكري');
+        closeWarnForm();
+        loadNotesPage();
+    } catch (e) { toast(e.message); }
+}
+let sectorNotesDeleteCtx = null;
+async function sectorNotesDeleteExcept(sector) {
+    const box = document.getElementById('wf-box');
+    box.innerHTML = '<h3>جارِ التحميل...</h3>';
+    try {
+        const { list, sectorLabel } = await api('/api/senior/notes/by-sector/' + sector);
+        sectorNotesDeleteCtx = { sector, keepIds: new Set() };
+        if (list.length === 0) {
+            box.innerHTML = \`<h3>لا توجد ملاحظات بقطاع \${sectorLabel}</h3><div class="wf-actions"><button class="btn gray sm" onclick="closeWarnForm()">إغلاق</button></div>\`;
+            return;
+        }
+        box.innerHTML = \`
+            <h3>استثناء ملاحظات (\${sectorLabel})</h3>
+            <p style="color:var(--muted);font-size:13px;margin:6px 0;">علّم الملاحظات اللي تبي تستثنيها (تبقى)، والباقي بينحذف.</p>
+            <div style="max-height:50vh;overflow-y:auto;text-align:right;">
+                \${list.map(n => \`
+                <label style="display:block;background:rgba(255,255,255,0.05);padding:8px;border-radius:8px;margin-bottom:6px;font-size:13px;">
+                    <input type="checkbox" onchange="toggleKeepNote('\${n.noteId}', this.checked)" style="width:auto;margin-left:6px;">
+                    <b>\${n.personnelName}</b>: \${n.text}
+                    <div style="color:var(--muted);font-size:11px;">بواسطة: \${n.addedByTag || '-'}</div>
+                </label>\`).join('')}
+            </div>
+            <div class="wf-actions">
+                <button class="btn gray sm" onclick="closeWarnForm()">إلغاء</button>
+                <button class="btn danger sm" onclick="submitSectorNotesDeleteExcept()">تنفيذ الحذف</button>
+            </div>\`;
+    } catch (e) { toast(e.message); closeWarnForm(); }
+}
+function toggleKeepNote(noteId, checked) {
+    if (!sectorNotesDeleteCtx) return;
+    if (checked) sectorNotesDeleteCtx.keepIds.add(noteId);
+    else sectorNotesDeleteCtx.keepIds.delete(noteId);
+}
+async function submitSectorNotesDeleteExcept() {
+    if (!sectorNotesDeleteCtx) return;
+    if (!confirm('متأكد؟ كل الملاحظات اللي ما علّمتها بتنحذف نهائياً.')) return;
+    try {
+        const { count } = await api('/api/senior/notes/by-sector/' + sectorNotesDeleteCtx.sector + '/delete-except', {
+            method: 'POST', body: JSON.stringify({ keepNoteIds: Array.from(sectorNotesDeleteCtx.keepIds) }),
+        });
+        toast('🗑️ تم حذف ' + count + ' ملاحظة');
+        sectorNotesDeleteCtx = null;
+        closeWarnForm();
+        loadNotesPage();
+    } catch (e) { toast(e.message); }
 }
 async function deleteNote(discord, noteId) {
     if (!confirm('متأكد تبي تحذف هذي الملاحظة؟')) return;
