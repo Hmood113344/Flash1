@@ -38,6 +38,8 @@ const CONFIG = {
     MONGO_URI: process.env.MONGO_URI || "",
 
     SITE_NAME: "فلاش",
+    // رابط الموقع (يُستخرج من رابط الكولباك تلقائياً، أو يُحدَّد يدوياً عبر SITE_URL بمتغيرات البيئة)
+    SITE_URL: process.env.SITE_URL || (process.env.DISCORD_CALLBACK_URL ? process.env.DISCORD_CALLBACK_URL.replace(/\/auth\/discord\/callback.*$/, "") : "https://flash1-gtsp.onrender.com"),
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7700,
 
@@ -776,6 +778,40 @@ function buildViolationButtons(id, disabled = false) {
     );
 }
 
+// إشعار كل أعضاء القيادة العليا برسالة خاصة (DM) بديسكورد فور تقديم طلب ترقية/تنزيل جديد،
+// مع زر رابط مباشر لفتح الموقع (Link Button ما يحتاج تفاعل من البوت، ديسكورد يفتح الرابط مباشرة)
+async function notifyHighCommandOfPromotion(doc) {
+    if (!botReady) return;
+    const settings = await getSettings();
+    const members = settings.highCommand || [];
+    if (!members.length) return;
+    const embed = new EmbedBuilder()
+        .setTitle("🎖️ يوجد تقرير ترقية عسكرية")
+        .setColor(0xf59e0b)
+        .addFields(
+            { name: "الفرد", value: doc.targetName || doc.targetTag, inline: true },
+            { name: "القطاع", value: doc.sectorLabel, inline: true },
+            { name: "الاتجاه", value: doc.direction === "up" ? "⬆️ ترقية" : "⬇️ تنزيل", inline: true },
+            { name: "من رتبة", value: doc.fromRank, inline: true },
+            { name: "إلى رتبة", value: doc.toRank, inline: true },
+            { name: "مقدّم الطلب", value: doc.requestedByTag || "-", inline: false },
+            { name: "السبب", value: doc.reason || "-", inline: false },
+        )
+        .setFooter({ text: `ID: ${doc._id}` })
+        .setTimestamp(doc.createdAt || new Date());
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel("🔵 اضغط هنا لدخول فلاش").setStyle(ButtonStyle.Link).setURL(CONFIG.SITE_URL),
+    );
+    for (const m of members) {
+        try {
+            const user = await client.users.fetch(m.id);
+            await user.send({ embeds: [embed], components: [row] });
+        } catch (e) {
+            console.error("❌ فشل إرسال إشعار الترقية لعضو القيادة العليا:", m.id, e.message);
+        }
+    }
+}
+
 // إرسال المخالفة تلقائياً لقناة المخالفات فور تسجيلها من الموقع
 // يرفع صورة المخالفة كمرفق برسالة القناة، ويحفظ مرجع الرسالة بدل ما يخزن الصورة نفسها بقاعدة البيانات.
 // إذا تعذر الرفع لأي سبب (البوت متوقف، القناة محذوفة...) نحفظ الصورة احتياطياً بقاعدة البيانات عشان ما تضيع.
@@ -1077,6 +1113,49 @@ client.once("ready", async () => {
     botReady = true;
     await registerCommands();
 });
+
+// ── قفل/فتح تسجيل الحضور بالبصمة تلقائياً بتوقيت مكة المكرمة (Asia/Riyadh) ──
+// لو محد من كبار المسؤولين قفل تسجيل الحضور يدوياً، يقفل تلقائياً الساعة 12:30 الليل،
+// ويرجع يفتح تلقائياً الساعة 12 الظهر بنفس اليوم — بدون أي تدخل يدوي، ويسجّل بلوق النظام
+function getMeccaTimeParts() {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: "Asia/Riyadh", hour: "2-digit", minute: "2-digit", hour12: false,
+        year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(new Date());
+    const get = (t) => parts.find(p => p.type === t).value;
+    return { hour: parseInt(get("hour"), 10), minute: parseInt(get("minute"), 10), dateKey: `${get("year")}-${get("month")}-${get("day")}` };
+}
+let lastAutoLockDateKey = null;
+let lastAutoUnlockDateKey = null;
+setInterval(async () => {
+    try {
+        const { hour, minute, dateKey } = getMeccaTimeParts();
+        // القفل التلقائي: 12:30 الليل بالضبط (00:30) — مرة وحدة باليوم بس
+        if (hour === 0 && minute === 30 && lastAutoLockDateKey !== dateKey) {
+            lastAutoLockDateKey = dateKey;
+            const settings = await getSettings();
+            if (!settings.lockAttendance) {
+                settings.lockAttendance = true;
+                await settings.save();
+                await logEvent({ action: "قفل تسجيل الحضور تلقائياً", actorId: "system", actorTag: "النظام (جدولة تلقائية)", details: "الساعة 12:30 الليل بتوقيت مكة المكرمة" });
+                console.log("🔒 تم قفل تسجيل الحضور تلقائياً (12:30 الليل بتوقيت مكة)");
+            }
+        }
+        // الفتح التلقائي: 12 الظهر بالضبط بنفس اليوم — مرة وحدة باليوم بس
+        if (hour === 12 && minute === 0 && lastAutoUnlockDateKey !== dateKey) {
+            lastAutoUnlockDateKey = dateKey;
+            const settings = await getSettings();
+            if (settings.lockAttendance) {
+                settings.lockAttendance = false;
+                await settings.save();
+                await logEvent({ action: "فتح تسجيل الحضور تلقائياً", actorId: "system", actorTag: "النظام (جدولة تلقائية)", details: "الساعة 12 الظهر بتوقيت مكة المكرمة" });
+                console.log("🔓 تم فتح تسجيل الحضور تلقائياً (12 الظهر بتوقيت مكة)");
+            }
+        }
+    } catch (e) {
+        console.error("❌ خطأ بجدولة قفل/فتح البصمة التلقائي:", e.message);
+    }
+}, 30 * 1000);
 
 if (CONFIG.BOT_TOKEN) {
     client.login(CONFIG.BOT_TOKEN).catch(e => console.log("❌ فشل تسجيل دخول البوت:", e.message));
@@ -2728,6 +2807,7 @@ app.post("/api/sector/personnel/:discord/rank", ensureSectorLeader, async (req, 
         actorId: req.user.id, actorTag: req.user.username + ` (قيادة ${req.sectorInfo.sectorLabel})`,
         details: `${p.rank} ← ${newRank} — السبب: ${reason.trim()} — بانتظار القيادة العليا`,
     });
+    notifyHighCommandOfPromotion(doc).catch(() => {});
     res.json({ ok: true, request: doc });
 });
 
@@ -3085,6 +3165,7 @@ app.post("/api/personnel-officer/personnel/:discord/promotion-request", ensurePe
         actorId: req.user.id, actorTag: req.user.username + ` (مسؤول أفراد ${req.sectorInfo.sectorLabel})`,
         details: `${p.rank} ← ${CONFIG.MILITARY_RANKS[newIdx]} — السبب: ${reason.trim()} — بانتظار القيادة العليا`,
     });
+    notifyHighCommandOfPromotion(doc).catch(() => {});
     res.json({ ok: true, request: doc });
 });
 
@@ -3425,6 +3506,12 @@ app.get("/api/mp/sector-log", ensureMPLeader, async (req, res) => {
     // بعض إجراءات قادة/نواب القطاعات تحط "(قيادة ...)" أو "(مسؤول أفراد ...)" داخل actorTag، وبعضها داخل details بس — نبحث بالاثنين
     const rx = /قيادة|مسؤول أفراد/;
     const list = await Log.find({ $or: [{ actorTag: { $regex: rx } }, { details: { $regex: rx } }] }).sort({ createdAt: -1 }).limit(300);
+    res.json({ list });
+});
+// سجل كامل لكل طلبات الترقية/التنزيل (معلّقة ومقبولة ومرفوضة) — علم دائم لقيادة الشرطة العسكرية:
+// مين قدّم الطلب ومتى، وأي قيادي عليا وافق/رفض ومتى، وكل التفاصيل — بدون أي تعديل، عرض فقط
+app.get("/api/mp/promotion-log", ensureMPLeader, async (req, res) => {
+    const list = await PromotionRequest.find({}).sort({ createdAt: -1 }).limit(300);
     res.json({ list });
 });
 
@@ -5959,6 +6046,7 @@ function renderMPPanel() {
             <div class="tab" onclick="mpTabSwitch('requests', this)">📣 طلبات الاستدعاء</div>
             <div class="tab" onclick="mpTabSwitch('reports', this)">📄 التقارير</div>
             <div class="tab" onclick="mpTabSwitch('log', this)">📜 لوق القطاعات</div>
+            <div class="tab" onclick="mpTabSwitch('promo', this)">🎖️ سجل الترقيات</div>
             <div class="tab" onclick="mpTabSwitch('po', this)">👮 مسؤول الأفراد</div>
         </div>
         <div id="mp-content"></div>\`;
@@ -6016,6 +6104,7 @@ function mpTabSwitch(name, el) {
     if (name === 'requests') loadMPSummonRequests();
     if (name === 'reports') loadMPReports();
     if (name === 'log') loadMPSectorLog();
+    if (name === 'promo') loadMPPromotionLog();
     if (name === 'po') loadMPPOBox();
 }
 let mpLeaderListCache = [];
@@ -6221,6 +6310,31 @@ async function loadMPSectorLog() {
             \${l.details ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">\${l.details}</div>\` : ''}
             <div style="font-size:11px;color:var(--muted);margin-top:4px;">\${new Date(l.createdAt).toLocaleString('ar')}</div>
         </div>\`).join('');
+}
+// سجل كامل ودائم لكل طلبات الترقية/التنزيل — لعلم قيادة الشرطة العسكرية: مين قدّم ومتى، ومين وافق/رفض ومتى
+async function loadMPPromotionLog() {
+    const box = document.getElementById('mp-content');
+    if (!box) return;
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    let data;
+    try { data = await api('/api/mp/promotion-log'); }
+    catch (e) { if (mpTab !== 'promo') return; box.innerHTML = \`<div class="card" style="color:#f87171;">تعذر التحميل. (\${e.message})</div>\`; return; }
+    if (mpTab !== 'promo') return;
+    if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات ترقية/تنزيل بعد</div>'; return; }
+    box.innerHTML = data.list.map(r => {
+        const statusLabel = r.status === 'pending' ? '⏳ قيد المراجعة' : r.status === 'approved' ? '✅ مقبولة' : '❌ مرفوضة';
+        const statusColor = r.status === 'pending' ? '#fbbf24' : r.status === 'approved' ? '#4ade80' : '#f87171';
+        return \`
+        <div class="card" style="padding:10px 14px;">
+            <div style="font-size:13px;"><b>\${r.direction === 'up' ? '⬆️ ترقية' : '⬇️ تنزيل'}: \${r.targetName || r.targetTag}</b> — \${r.fromRank} ← \${r.toRank}</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:2px;">القطاع: \${r.sectorLabel} — قدّمه: \${r.requestedByTag || '-'}</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:2px;">وقت التقديم: \${new Date(r.createdAt).toLocaleString('ar')}</div>
+            \${r.reason ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">السبب: \${r.reason}</div>\` : ''}
+            <div style="font-size:12px;margin-top:4px;color:\${statusColor};font-weight:bold;">\${statusLabel}</div>
+            \${r.status !== 'pending' ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">راجعه: \${r.reviewedByTag || '-'} — \${r.reviewedAt ? new Date(r.reviewedAt).toLocaleString('ar') : '-'}</div>\` : ''}
+            \${r.status === 'rejected' && r.rejectReason ? \`<div style="font-size:12px;color:var(--muted);margin-top:2px;">سبب الرفض: \${r.rejectReason}</div>\` : ''}
+        </div>\`;
+    }).join('');
 }
 // صندوق تعيين/إزالة مسؤول أفراد الشرطة العسكرية داخل لوحة القيادة نفسها
 async function loadMPPOBox() {
