@@ -3640,6 +3640,15 @@ app.get("/", (req, res) => {
     #fm-ok { background: linear-gradient(135deg, var(--gold), var(--green)); color: #fff; }
     #fm-cancel { background: rgba(255,255,255,0.08); color: var(--text); }
     #fm-ok:active, #fm-cancel:active { transform: scale(0.97); }
+    .cs-wrap { position: relative; margin-bottom: 10px; }
+    .cs-trigger { width: 100%; text-align: right; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px 12px; font-size: 14px; font-family: inherit; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+    .cs-trigger::after { content: '˅'; color: var(--muted); margin-inline-start: 8px; }
+    .cs-menu { display: none; position: absolute; top: calc(100% + 4px); right: 0; left: 0; z-index: 200; max-height: 260px; overflow-y: auto; background: linear-gradient(160deg, #0d1f3c, #0a1628); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 12px 30px rgba(0,0,0,0.5); }
+    .cs-menu.open { display: block; }
+    .cs-option { padding: 10px 14px; font-size: 14px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+    .cs-option:hover { background: rgba(59,130,246,0.15); }
+    .cs-option.selected { color: var(--gold-soft); font-weight: bold; }
+    .cs-check { color: var(--gold-soft); }
     .logo { font-size: 1.3rem; font-weight: 900; background: linear-gradient(90deg, #3b82f6, #60a5fa, #93c5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; letter-spacing: 2px; }
     .nav-links { display: flex; gap: 0.3rem; list-style: none; flex-wrap: wrap; }
     .nav-links button { background: transparent; border: 1px solid transparent; color: #94a3b8; padding: 0.4rem 0.8rem; border-radius: 8px; cursor: pointer; font-family: inherit; font-size: 0.85rem; transition: all 0.2s; }
@@ -3907,6 +3916,34 @@ function promptModal(msg, defaultValue) {
 function confirmModal(msg) {
     return _fmOpen(msg, { isPrompt: false, okText: 'متأكد' });
 }
+// قائمة اختيار مخصصة (بديل عن <select> الأصلي بالمتصفح/الجوال) — بنفس تصميم الموقع
+function csToggle(baseId) {
+    const menu = document.getElementById(baseId + '-menu');
+    if (!menu) return;
+    const willOpen = !menu.classList.contains('open');
+    document.querySelectorAll('.cs-menu.open').forEach(m => m.classList.remove('open'));
+    if (willOpen) menu.classList.add('open');
+}
+function csPick(baseId, value) {
+    const hidden = document.getElementById(baseId);
+    const trigger = document.getElementById(baseId + '-trigger');
+    const menu = document.getElementById(baseId + '-menu');
+    if (hidden) hidden.value = value;
+    if (trigger) trigger.textContent = value;
+    if (menu) {
+        menu.querySelectorAll('.cs-option').forEach(o => {
+            const isSel = o.dataset.val === value;
+            o.classList.toggle('selected', isSel);
+            const existingCheck = o.querySelector('.cs-check');
+            if (isSel && !existingCheck) o.insertAdjacentHTML('beforeend', ' <span class="cs-check">✓</span>');
+            if (!isSel && existingCheck) existingCheck.remove();
+        });
+        menu.classList.remove('open');
+    }
+}
+document.addEventListener('click', (e) => {
+    if (!e.target.closest('.cs-wrap')) document.querySelectorAll('.cs-menu.open').forEach(m => m.classList.remove('open'));
+});
 // صفحة عرض الصورة بملء الشاشة (نفس أسلوب ديسكورد) — تفتح كصفحة ثانية فوق الموقع بدل نافذة منبثقة صغيرة
 function openPhotoPage() {
     const loading = document.getElementById('photo-page-loading');
@@ -6703,7 +6740,11 @@ async function searchPersonnel() {
                 <label>الاسم</label><input id="pe-name-\${i}" value="\${p.registeredName || ''}">
                 <label>اليونت</label><input id="pe-unit-\${i}" value="\${p.unit || ''}">
                 <label>الرتبة العسكرية</label>
-                <select id="pe-rank-\${i}">\${MILITARY_RANKS.map(r => \`<option \${r === p.rank ? 'selected' : ''}>\${r}</option>\`).join('')}</select>
+                <div class="cs-wrap">
+                    <button type="button" class="cs-trigger" id="pe-rank-\${i}-trigger" onclick="csToggle('pe-rank-\${i}')">\${p.rank}</button>
+                    <div class="cs-menu" id="pe-rank-\${i}-menu">\${MILITARY_RANKS.map(r => \`<div class="cs-option \${r === p.rank ? 'selected' : ''}" data-val="\${r}" onclick="csPick('pe-rank-\${i}', '\${r}')">\${r}\${r === p.rank ? ' <span class="cs-check">✓</span>' : ''}</div>\`).join('')}</div>
+                </div>
+                <input type="hidden" id="pe-rank-\${i}" value="\${p.rank}">
                 <label>النقاط</label><input type="number" id="pe-points-\${i}" data-original="\${p.points}" value="\${p.points}">
                 <button class="btn sm" onclick="saveEdit('\${p.discord}', \${i})">حفظ التعديلات</button>
             </div>
