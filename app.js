@@ -3628,6 +3628,18 @@ app.get("/", (req, res) => {
     .fp-status.ok { color: #4ade80; }
     .fp-status.fail { color: #f87171; }
     nav { background: rgba(5,15,30,0.95); backdrop-filter: blur(15px); border-bottom: 1px solid rgba(59,130,246,0.3); padding: 0 1.2rem; display: flex; align-items: center; justify-content: space-between; height: 62px; position: sticky; top: 37px; z-index: 900; }
+    #fm-overlay { position: fixed; inset: 0; background: rgba(5,10,20,0.72); backdrop-filter: blur(3px); z-index: 5000; display: none; align-items: center; justify-content: center; padding: 16px; }
+    #fm-overlay.open { display: flex; }
+    #fm-box { background: linear-gradient(160deg, #0d1f3c, #0a1628); border: 1px solid var(--border); border-radius: 14px; width: 100%; max-width: 380px; padding: 20px; box-shadow: 0 15px 45px rgba(0,0,0,0.5); animation: fmPop .15s ease; }
+    @keyframes fmPop { from { transform: scale(0.94); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+    #fm-msg { font-size: 15px; line-height: 1.6; margin-bottom: 14px; white-space: pre-wrap; }
+    #fm-input { width: 100%; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px 12px; font-size: 14px; margin-bottom: 16px; font-family: inherit; }
+    #fm-input:focus { outline: none; border-color: var(--gold-soft); }
+    #fm-actions { display: flex; gap: 10px; justify-content: flex-start; }
+    #fm-actions button { border: none; border-radius: 8px; padding: 9px 18px; font-size: 14px; font-weight: bold; cursor: pointer; font-family: inherit; }
+    #fm-ok { background: linear-gradient(135deg, var(--gold), var(--green)); color: #fff; }
+    #fm-cancel { background: rgba(255,255,255,0.08); color: var(--text); }
+    #fm-ok:active, #fm-cancel:active { transform: scale(0.97); }
     .logo { font-size: 1.3rem; font-weight: 900; background: linear-gradient(90deg, #3b82f6, #60a5fa, #93c5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; letter-spacing: 2px; }
     .nav-links { display: flex; gap: 0.3rem; list-style: none; flex-wrap: wrap; }
     .nav-links button { background: transparent; border: 1px solid transparent; color: #94a3b8; padding: 0.4rem 0.8rem; border-radius: 8px; cursor: pointer; font-family: inherit; font-size: 0.85rem; transition: all 0.2s; }
@@ -3792,6 +3804,16 @@ app.get("/", (req, res) => {
 <div class="mobile-menu" id="mobile-menu"></div>
 <div class="wrap" id="app"><div class="card center">جارِ التحميل...</div></div>
 <div id="toast"></div>
+<div id="fm-overlay">
+    <div id="fm-box">
+        <div id="fm-msg"></div>
+        <input id="fm-input" type="text">
+        <div id="fm-actions">
+            <button id="fm-ok" type="button"></button>
+            <button id="fm-cancel" type="button">إلغاء</button>
+        </div>
+    </div>
+</div>
 <div id="photo-page">
     <div class="pp-bar"><button class="pp-back" onclick="closePhotoPage()">‹ رجوع</button></div>
     <div class="pp-body" onclick="if(event.target===this) closePhotoPage()">
@@ -3853,6 +3875,37 @@ function toast(msg) {
     const t = document.getElementById('toast');
     t.textContent = msg; t.style.display = 'block';
     setTimeout(() => t.style.display = 'none', 2800);
+}
+// فورم موحد يبدّل عن prompt()/confirm() الأصلية بالمتصفح — نفس تصميم الموقع
+function _fmOpen(msg, opts) {
+    return new Promise(resolve => {
+        const overlay = document.getElementById('fm-overlay');
+        const input = document.getElementById('fm-input');
+        const okBtn = document.getElementById('fm-ok');
+        const cancelBtn = document.getElementById('fm-cancel');
+        document.getElementById('fm-msg').textContent = msg;
+        input.style.display = opts.isPrompt ? 'block' : 'none';
+        input.value = opts.defaultValue != null ? opts.defaultValue : '';
+        okBtn.textContent = opts.okText || 'تأكيد';
+        overlay.classList.add('open');
+        if (opts.isPrompt) setTimeout(() => { input.focus(); input.select(); }, 30);
+        function cleanup(result) {
+            overlay.classList.remove('open');
+            okBtn.onclick = null; cancelBtn.onclick = null;
+            input.onkeydown = null; overlay.onclick = null;
+            resolve(result);
+        }
+        okBtn.onclick = () => cleanup(opts.isPrompt ? input.value : true);
+        cancelBtn.onclick = () => cleanup(opts.isPrompt ? null : false);
+        overlay.onclick = (e) => { if (e.target === overlay) cleanup(opts.isPrompt ? null : false); };
+        if (opts.isPrompt) input.onkeydown = (e) => { if (e.key === 'Enter') cleanup(input.value); if (e.key === 'Escape') cleanup(null); };
+    });
+}
+function promptModal(msg, defaultValue) {
+    return _fmOpen(msg, { isPrompt: true, defaultValue, okText: 'تأكيد' });
+}
+function confirmModal(msg) {
+    return _fmOpen(msg, { isPrompt: false, okText: 'متأكد' });
 }
 // صفحة عرض الصورة بملء الشاشة (نفس أسلوب ديسكورد) — تفتح كصفحة ثانية فوق الموقع بدل نافذة منبثقة صغيرة
 function openPhotoPage() {
@@ -4133,7 +4186,7 @@ function openWarnAllForm() {
 async function submitWarnAllForm() {
     const reason = document.getElementById('wf-reason-all').value;
     if (!reason || !reason.trim()) return toast('لازم تكتب النص');
-    if (!confirm('متأكد تبي ترسل هذا الإشعار لكل الأعضاء المسجلين بالموقع؟')) return;
+    if (!(await confirmModal('متأكد تبي ترسل هذا الإشعار لكل الأعضاء المسجلين بالموقع؟'))) return;
     try {
         const { count } = await api('/api/senior/personnel/warn-all', { method: 'POST', body: JSON.stringify({ reason }) });
         toast('✅ تم الإرسال لـ ' + count + ' عضو');
@@ -4174,7 +4227,7 @@ function showWarningOverlay(w) {
 let currentNoteReview = null;
 async function noteReviewDelete() {
     if (!currentNoteReview || !currentWarningId) return;
-    if (!confirm('متأكد تبي تحذف هذي الملاحظة نهائياً؟')) return;
+    if (!(await confirmModal('متأكد تبي تحذف هذي الملاحظة نهائياً؟'))) return;
     try {
         await api('/api/notes/' + currentNoteReview.discord + '/' + currentNoteReview.noteId, { method: 'DELETE' });
         await api('/api/warnings/' + currentWarningId + '/ack', { method: 'POST' });
@@ -4234,7 +4287,7 @@ function closePromotionAlert() {
 }
 async function promoAlertApprove() {
     if (!currentPromoAlertId) return;
-    if (!confirm('متأكد تبي تقبل هذا الطلب؟')) return;
+    if (!(await confirmModal('متأكد تبي تقبل هذا الطلب؟'))) return;
     try {
         await api('/api/high-command/promotion-requests/' + currentPromoAlertId + '/approve', { method: 'POST' });
         toast('✅ تمت الموافقة');
@@ -4243,7 +4296,7 @@ async function promoAlertApprove() {
 }
 async function promoAlertReject() {
     if (!currentPromoAlertId) return;
-    const reason = prompt('اكتب سبب الرفض:');
+    const reason = await promptModal('اكتب سبب الرفض:');
     if (reason === null) return;
     if (!reason.trim()) return toast('لازم تكتب سبب الرفض');
     try {
@@ -4965,7 +5018,7 @@ async function loadReviewedViolations() {
         </div>\`).join('');
 }
 async function deleteViolationPermanent(id) {
-    if (!confirm('حذف نهائي — بيختفي من عندك وعند العضو وعند قائده. متأكد؟')) return;
+    if (!(await confirmModal('حذف نهائي — بيختفي من عندك وعند العضو وعند قائده. متأكد؟'))) return;
     try { await api('/api/senior/violations/' + id + '/permanent', { method: 'DELETE' }); toast('تم الحذف'); loadReviewedViolations(); }
     catch (e) { toast(e.message); }
 }
@@ -5011,12 +5064,12 @@ async function approveLeave(id, senior) {
     catch (e) { toast(e.message); }
 }
 async function rejectLeave(id, senior) {
-    const reason = prompt('سبب الرفض (اختياري):') || '';
+    const reason = await promptModal('سبب الرفض (اختياري):') || '';
     try { await api('/api/leave/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) }); toast('تم الرفض'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
     catch (e) { toast(e.message); }
 }
 async function endLeave(id, senior) {
-    if (!confirm('متأكد تبي تنهي هذي الإجازة الآن؟')) return;
+    if (!(await confirmModal('متأكد تبي تنهي هذي الإجازة الآن؟'))) return;
     try { await api('/api/leave/' + id + '/end', { method: 'POST' }); toast('✅ تم إنهاء الإجازة'); senior ? loadSeniorLeavePage() : loadSectorLeavePending(); }
     catch (e) { toast(e.message); }
 }
@@ -5126,12 +5179,12 @@ async function attToggleLock() {
     catch (e) { toast(e.message); }
 }
 async function attForceCheckoutAll() {
-    if (!confirm('متأكد تبي تسجل خروج جميع الحاضرين الآن؟')) return;
+    if (!(await confirmModal('متأكد تبي تسجل خروج جميع الحاضرين الآن؟'))) return;
     try { const r = await api('/api/senior/attendance/force-checkout-all', { method: 'POST' }); toast('تم تسجيل خروج ' + r.affected + ' عضو'); }
     catch (e) { toast(e.message); }
 }
 async function attResetToday() {
-    if (!confirm('متأكد تبي تصفّر عدّاد حضور اليوم لجميع الأعضاء؟')) return;
+    if (!(await confirmModal('متأكد تبي تصفّر عدّاد حضور اليوم لجميع الأعضاء؟'))) return;
     try { await api('/api/senior/attendance/reset-today', { method: 'POST' }); toast('تم التصفير'); }
     catch (e) { toast(e.message); }
 }
@@ -5209,9 +5262,9 @@ async function approveV(id) {
     try { await api('/api/admin/violations/' + id + '/approve', { method: 'POST' }); toast('تم القبول'); loadPending(); }
     catch (e) { toast(e.message); }
 }
-function rejectV(id) {
+async function rejectV(id) {
     if (isActionLocked(id)) return toast('انتظر 5 ثواني قبل الضغط مرة أخرى');
-    const reason = prompt('اكتب سبب الرفض:');
+    const reason = await promptModal('اكتب سبب الرفض:');
     if (reason === null) return;
     if (!reason.trim()) return toast('لازم تكتب سبب');
     lockAction(id);
@@ -5353,7 +5406,7 @@ async function addHCMember(discordId) {
     catch (e) { toast(e.message); }
 }
 async function removeHCMember(discordId) {
-    if (!confirm('متأكد تبي تزيله من القيادة العليا؟')) return;
+    if (!(await confirmModal('متأكد تبي تزيله من القيادة العليا؟'))) return;
     try { await api('/api/senior/high-command/remove', { method: 'POST', body: JSON.stringify({ discordId }) }); toast('تم'); loadHighCommandList(); }
     catch (e) { toast(e.message); }
 }
@@ -5397,7 +5450,7 @@ async function assignMPRole(role, discordId) {
     catch (e) { toast(e.message); }
 }
 async function removeMPRole(role) {
-    if (!confirm('متأكد تبي تزيله من هذا المنصب؟')) return;
+    if (!(await confirmModal('متأكد تبي تزيله من هذا المنصب؟'))) return;
     try { await api('/api/senior/mp/remove', { method: 'POST', body: JSON.stringify({ role }) }); toast('تم'); loadSectors(); }
     catch (e) { toast(e.message); }
 }
@@ -5446,7 +5499,7 @@ async function assignSectorRole(sectorKey, role, discordId) {
     } catch (e) { toast(e.message); }
 }
 async function removeSectorRole(sectorKey, role) {
-    if (!confirm('متأكد تبي تزيله من هذا المنصب؟')) return;
+    if (!(await confirmModal('متأكد تبي تزيله من هذا المنصب؟'))) return;
     try {
         await api('/api/senior/sectors/' + sectorKey + '/remove', { method: 'POST', body: JSON.stringify({ role }) });
         toast('تم');
@@ -5505,9 +5558,9 @@ async function loadHCPending() {
     if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد طلبات معلّقة</div>'; return; }
     box.innerHTML = data.list.map(r => hcCard(r, true)).join('');
 }
-function hcDecide(id, action) {
+async function hcDecide(id, action) {
     if (action === 'reject') {
-        const reason = prompt('اكتب سبب الرفض:');
+        const reason = await promptModal('اكتب سبب الرفض:');
         if (reason === null) return;
         if (!reason.trim()) return toast('لازم تكتب سبب');
         api('/api/high-command/promotion-requests/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
@@ -5587,7 +5640,7 @@ function openSectorNoticeForm() {
 async function submitSectorNoticeForm() {
     const reason = document.getElementById('wf-reason-sector').value;
     if (!reason || !reason.trim()) return toast('لازم تكتب النص');
-    if (!confirm('متأكد تبي ترسل هذا الإشعار لكل أعضاء ' + ME.sectorInfo.sectorLabel + '؟')) return;
+    if (!(await confirmModal('متأكد تبي ترسل هذا الإشعار لكل أعضاء ' + ME.sectorInfo.sectorLabel + '؟'))) return;
     try {
         const { count } = await api('/api/sector/notice-all', { method: 'POST', body: JSON.stringify({ reason }) });
         toast('✅ تم الإرسال لـ ' + count + ' عضو');
@@ -5621,7 +5674,7 @@ async function assignAttendanceOfficer(discordId) {
     } catch (e) { toast(e.message); }
 }
 async function removeAttendanceOfficer() {
-    if (!confirm('متأكد تبي تزيله من مسؤول التحضير؟')) return;
+    if (!(await confirmModal('متأكد تبي تزيله من مسؤول التحضير؟'))) return;
     try {
         await api('/api/sector/attendance-officer/remove', { method: 'POST' });
         toast('تم');
@@ -5656,7 +5709,7 @@ async function assignPersonnelOfficer(discordId) {
     } catch (e) { toast(e.message); }
 }
 async function removePersonnelOfficer() {
-    if (!confirm('متأكد تبي تزيله من مسؤول الأفراد؟')) return;
+    if (!(await confirmModal('متأكد تبي تزيله من مسؤول الأفراد؟'))) return;
     try {
         await api('/api/sector/personnel-officer/remove', { method: 'POST' });
         toast('تم');
@@ -5796,7 +5849,7 @@ async function loadSectorMembers() {
         </div>\`).join('');
 }
 async function sectorPromote(discord, direction) {
-    const reason = prompt(direction === 'up' ? 'اكتب سبب الترقية:' : 'اكتب سبب التنزيل:');
+    const reason = await promptModal(direction === 'up' ? 'اكتب سبب الترقية:' : 'اكتب سبب التنزيل:');
     if (reason === null) return;
     if (!reason.trim()) return toast('لازم تكتب السبب');
     try {
@@ -5805,8 +5858,8 @@ async function sectorPromote(discord, direction) {
         loadSectorMembers();
     } catch (e) { toast(e.message); }
 }
-function sectorAssignUnit(discord) {
-    const unit = prompt('اسم اليونت الجديد:');
+async function sectorAssignUnit(discord) {
+    const unit = await promptModal('اسم اليونت الجديد:');
     if (unit === null) return;
     if (!unit.trim()) return toast('حط اسم اليونت');
     api('/api/sector/personnel/' + discord + '/unit', { method: 'POST', body: JSON.stringify({ unit }) })
@@ -5851,8 +5904,8 @@ function sectorApprove(id) {
     api('/api/sector/violations/' + id + '/approve', { method: 'POST' })
         .then(() => { toast('تم القبول'); loadSectorViolations(); }).catch(e => toast(e.message));
 }
-function sectorReject(id) {
-    const reason = prompt('اكتب سبب الرفض:');
+async function sectorReject(id) {
+    const reason = await promptModal('اكتب سبب الرفض:');
     if (reason === null) return;
     if (!reason.trim()) return toast('لازم تكتب سبب');
     api('/api/sector/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
@@ -5958,7 +6011,7 @@ async function loadPoMembers() {
 }
 // تعديل نقاط عضو — متاح لقيادة القطاع ومسؤول الأفراد (بنطاق صلاحيته) بنفس أسلوب كبار المسؤولين
 async function editMemberPoints(discord, currentPoints) {
-    const val = prompt('عدد النقاط الجديد:', currentPoints);
+    const val = await promptModal('عدد النقاط الجديد:', currentPoints);
     if (val === null) return;
     if (val === '' || isNaN(parseInt(val))) return toast('حط رقم صحيح');
     try {
@@ -5968,8 +6021,8 @@ async function editMemberPoints(discord, currentPoints) {
         if (poTab === 'members') loadPoMembers();
     } catch (e) { toast(e.message); }
 }
-function poPromotionRequest(discord, direction) {
-    const reason = prompt(direction === 'up' ? 'اكتب سبب الترقية:' : 'اكتب سبب التنزيل:');
+async function poPromotionRequest(discord, direction) {
+    const reason = await promptModal(direction === 'up' ? 'اكتب سبب الترقية:' : 'اكتب سبب التنزيل:');
     if (reason === null) return;
     if (!reason.trim()) return toast('لازم تكتب السبب');
     api('/api/personnel-officer/personnel/' + discord + '/promotion-request', { method: 'POST', body: JSON.stringify({ direction, reason }) })
@@ -6014,8 +6067,8 @@ function poApprove(id) {
     api('/api/personnel-officer/violations/' + id + '/approve', { method: 'POST' })
         .then(() => { toast('تم القبول'); loadPoViolations(); }).catch(e => toast(e.message));
 }
-function poReject(id) {
-    const reason = prompt('اكتب سبب الرفض:');
+async function poReject(id) {
+    const reason = await promptModal('اكتب سبب الرفض:');
     if (reason === null) return;
     if (!reason.trim()) return toast('لازم تكتب سبب');
     api('/api/personnel-officer/violations/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
@@ -6064,7 +6117,7 @@ function openMPNoticeForm() {
 async function submitMPNoticeForm() {
     const reason = document.getElementById('wf-reason-mp').value;
     if (!reason || !reason.trim()) return toast('لازم تكتب النص');
-    if (!confirm('متأكد تبي ترسل هذا الإشعار لكل أفراد الشرطة العسكرية؟')) return;
+    if (!(await confirmModal('متأكد تبي ترسل هذا الإشعار لكل أفراد الشرطة العسكرية؟'))) return;
     try {
         const { count } = await api('/api/mp/notice-all', { method: 'POST', body: JSON.stringify({ reason }) });
         toast('✅ تم الإرسال لـ ' + count + ' عضو');
@@ -6274,14 +6327,14 @@ async function loadMPReports() {
     if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تقارير بعد</div>'; return; }
     box.innerHTML = data.list.map(r => renderMPReportCard(r, 'mpReportDecide', true)).join('');
 }
-function mpDeleteReport(id) {
-    if (!confirm('متأكد تبي تحذف هذا التقرير نهائياً؟ ما يرجع بعدها.')) return;
+async function mpDeleteReport(id) {
+    if (!(await confirmModal('متأكد تبي تحذف هذا التقرير نهائياً؟ ما يرجع بعدها.'))) return;
     api('/api/mp/reports/' + id, { method: 'DELETE' })
         .then(() => { toast('🗑️ تم الحذف نهائياً'); loadMPReports(); }).catch(e => toast(e.message));
 }
-function mpReportDecide(id, action) {
+async function mpReportDecide(id, action) {
     if (action === 'reject') {
-        const reason = prompt('اكتب سبب الرفض:');
+        const reason = await promptModal('اكتب سبب الرفض:');
         if (reason === null) return;
         if (!reason.trim()) return toast('لازم تكتب سبب');
         api('/api/mp/reports/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
@@ -6370,8 +6423,8 @@ function mpAssignPO(discordId) {
     api('/api/mp/personnel-officer/assign', { method: 'POST', body: JSON.stringify({ discordId }) })
         .then(() => { toast('تم التعيين'); loadMPPOBox(); }).catch(e => toast(e.message));
 }
-function mpRemovePO() {
-    if (!confirm('متأكد تبي تزيله من منصب مسؤول الأفراد؟')) return;
+async function mpRemovePO() {
+    if (!(await confirmModal('متأكد تبي تزيله من منصب مسؤول الأفراد؟'))) return;
     api('/api/mp/personnel-officer/remove', { method: 'POST' })
         .then(() => { toast('تم'); loadMPPOBox(); }).catch(e => toast(e.message));
 }
@@ -6427,9 +6480,9 @@ async function loadMPPOReports() {
     if (data.list.length === 0) { box.innerHTML = '<div class="card center" style="color:var(--muted);">لا توجد تقارير معلّقة</div>'; return; }
     box.innerHTML = data.list.map(r => renderMPReportCard(r, 'mpPoReportDecide')).join('');
 }
-function mpPoReportDecide(id, action) {
+async function mpPoReportDecide(id, action) {
     if (action === 'reject') {
-        const reason = prompt('اكتب سبب الرفض:');
+        const reason = await promptModal('اكتب سبب الرفض:');
         if (reason === null) return;
         if (!reason.trim()) return toast('لازم تكتب سبب');
         api('/api/mp/po/reports/' + id + '/reject', { method: 'POST', body: JSON.stringify({ reason }) })
@@ -6676,7 +6729,7 @@ async function saveEdit(discordId, i) {
     } catch (e) { toast(e.message); }
 }
 async function deletePersonnel(discordId, displayName) {
-    if (!confirm('متأكد تبي تحذف حساب "' + (displayName || discordId) + '" نهائياً؟ ما يمكن التراجع عن هذا الإجراء.')) return;
+    if (!(await confirmModal('متأكد تبي تحذف حساب "' + (displayName || discordId) + '" نهائياً؟ ما يمكن التراجع عن هذا الإجراء.'))) return;
     try {
         await api('/api/senior/personnel/' + discordId, { method: 'DELETE' });
         toast('🗑️ تم حذف الحساب نهائياً');
@@ -6925,7 +6978,7 @@ function openSectorNotesDelete(sector) {
     document.getElementById('wf-overlay').classList.add('open');
 }
 async function sectorNotesDeleteAll(sector) {
-    if (!confirm('متأكد؟ بتحذف كل ملاحظات هذا القطاع نهائياً بدون استثناء.')) return;
+    if (!(await confirmModal('متأكد؟ بتحذف كل ملاحظات هذا القطاع نهائياً بدون استثناء.'))) return;
     try {
         const { count } = await api('/api/senior/notes/by-sector/' + sector + '/delete-all', { method: 'POST' });
         toast('🗑️ تم حذف ملاحظات ' + count + ' عسكري');
@@ -6968,7 +7021,7 @@ function toggleKeepNote(noteId, checked) {
 }
 async function submitSectorNotesDeleteExcept() {
     if (!sectorNotesDeleteCtx) return;
-    if (!confirm('متأكد؟ كل الملاحظات اللي ما علّمتها بتنحذف نهائياً.')) return;
+    if (!(await confirmModal('متأكد؟ كل الملاحظات اللي ما علّمتها بتنحذف نهائياً.'))) return;
     try {
         const { count } = await api('/api/senior/notes/by-sector/' + sectorNotesDeleteCtx.sector + '/delete-except', {
             method: 'POST', body: JSON.stringify({ keepNoteIds: Array.from(sectorNotesDeleteCtx.keepIds) }),
@@ -6980,7 +7033,7 @@ async function submitSectorNotesDeleteExcept() {
     } catch (e) { toast(e.message); }
 }
 async function deleteNote(discord, noteId) {
-    if (!confirm('متأكد تبي تحذف هذي الملاحظة؟')) return;
+    if (!(await confirmModal('متأكد تبي تحذف هذي الملاحظة؟'))) return;
     try { await api('/api/senior/personnel/' + discord + '/note/' + noteId, { method: 'DELETE' }); toast('تم الحذف'); loadNotesPage(); }
     catch (e) { toast(e.message); }
 }
@@ -7102,7 +7155,7 @@ async function savePenalty() {
     } catch (e) { toast(e.message); }
 }
 async function deletePenalty(id) {
-    if (!confirm('متأكد تبي تحذف هذي العقوبة؟')) return;
+    if (!(await confirmModal('متأكد تبي تحذف هذي العقوبة؟'))) return;
     try {
         const { list } = await api('/api/senior/penalties/' + id, { method: 'DELETE' });
         toast('تم الحذف');
