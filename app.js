@@ -3847,10 +3847,11 @@ let pollTimer = null;
 let blockedPollTimer = null;
 let attHeartbeatTimer = null;
 
-// يمسك آخر زر ضُغط فعليًا (يشتغل حتى على سفاري آيفون اللي ما يعطي focus للأزرار تلقائيًا عند اللمس)
+// يمسك آخر عنصر تم الضغط عليه فعليًا (زر أو تبويب أو أي عنصر onclick) — يشتغل حتى على سفاري آيفون اللي ما يعطي focus تلقائيًا عند اللمس.
+// لازم يشمل عناصر التبويبات (.tab) مو بس <button>، لأن قبل كذا أي ضغط على تبويب كان يفضل ياخذ حالة "busy" من آخر زر حقيقي انضغط (حتى لو خلص طلبه أو ما له علاقة)، فكان يطلع خطأ "طلبك السابق لسا قيد التنفيذ" غلط من أول ضغطة.
 let __lastClickedBtn = null;
 document.addEventListener('click', function (e) {
-    const b = e.target.closest('button');
+    const b = e.target.closest('button, .tab, [onclick]');
     if (b) __lastClickedBtn = b;
 }, true);
 
