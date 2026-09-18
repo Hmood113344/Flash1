@@ -4845,7 +4845,7 @@ async function renderReportForm(category) {
             <h3 style="margin-top:16px;">تفاصيل العملية الميدانية</h3>
             <label>سبب الاستيقاف</label>
             <input id="rp-stop-reason" placeholder="سبب الاستيقاف">
-            <div class="row" style="margin-top:16px;"><h3>المخالفات على هذا المتهم (بحد أقصى 5)</h3><button type="button" class="btn sm gray" onclick="addReportItem('\${category}')">+ إضافة مخالفة</button></div>
+            <div class="row" style="margin-top:16px;"><h3>\${isDrugs ? 'المخالفات' : 'المضبوطات'} على هذا المتهم (بحد أقصى 5)</h3><button type="button" class="btn sm gray" onclick="addReportItem('\${category}')">\${isDrugs ? '+ إضافة مخالفة' : '+ إضافة مضبوط'}</button></div>
             <div id="rp-items-box"></div>
             <label style="margin-top:12px;">الإجراءات الأمنية المتخذة</label>
             <div id="rp-actions-box">
@@ -4868,16 +4868,17 @@ async function renderReportForm(category) {
 }
 function addReportItem(category) {
     const box = document.getElementById('rp-items-box');
-    if (box.querySelectorAll('.rp-item-block').length >= 5) return toast('الحد الأقصى 5 مخالفات بنفس التقرير');
+    const isDrugs = category === 'مخدرات';
+    box.dataset.category = category;
+    if (box.querySelectorAll('.rp-item-block').length >= 5) return toast(isDrugs ? 'الحد الأقصى 5 مخالفات بنفس التقرير' : 'الحد الأقصى 5 مضبوطات بنفس التقرير');
     reportItemCount++;
     const i = reportItemCount;
-    const isDrugs = category === 'مخدرات';
     const div = document.createElement('div');
     div.className = 'card rp-item-block';
     div.id = 'rp-item-' + i;
     div.style.cssText = 'margin-top:8px;padding:12px;';
     div.innerHTML = \`
-        <div class="row"><b>مخالفة #<span class="rp-item-num">\${box.children.length + 1}</span></b><button type="button" class="btn danger sm" onclick="removeReportItem(\${i})">حذف</button></div>
+        <div class="row"><b>\${isDrugs ? 'مخالفة' : 'مضبوط'} #<span class="rp-item-num">\${box.children.length + 1}</span></b><button type="button" class="btn danger sm" onclick="removeReportItem(\${i})">حذف</button></div>
         \${isDrugs ? \`
         <label>نوع المخدر المضبوط</label>
         <input class="rp-item-drug-type" placeholder="مثال: حشيش، شبو، حبوب مخدرة">
@@ -4886,15 +4887,16 @@ function addReportItem(category) {
         <label>طريقة إخفاء المخدر</label>
         <input class="rp-item-conceal" placeholder="مثال: مخبأ داخل صندوق السيارة">
         \` : \`
-        <label>المضبوطات</label>
-        <textarea class="rp-item-seized" placeholder="المضبوطات" rows="2"></textarea>
+        <label>مضبوط</label>
+        <textarea class="rp-item-seized" placeholder="مضبوط" rows="2"></textarea>
         \`}\`;
     box.appendChild(div);
     renumberReportItems();
 }
 function removeReportItem(i) {
     const box = document.getElementById('rp-items-box');
-    if (box.querySelectorAll('.rp-item-block').length <= 1) return toast('لازم تبقى مخالفة واحدة على الأقل');
+    const isDrugs = box.dataset.category === 'مخدرات';
+    if (box.querySelectorAll('.rp-item-block').length <= 1) return toast(isDrugs ? 'لازم تبقى مخالفة واحدة على الأقل' : 'لازم يبقى مضبوط واحد على الأقل');
     document.getElementById('rp-item-' + i).remove();
     renumberReportItems();
 }
@@ -4949,7 +4951,7 @@ async function submitReport(category) {
     if (!reportVehiclePhoto) return toast('لازم ترفق صورة المركبة');
 
     const blocks = Array.from(document.querySelectorAll('#rp-items-box .rp-item-block'));
-    if (!blocks.length) return toast('أضف مخالفة واحدة على الأقل');
+    if (!blocks.length) return toast(isDrugs ? 'أضف مخالفة واحدة على الأقل' : 'أضف مضبوط واحد على الأقل');
     const items = [];
     for (const b of blocks) {
         if (isDrugs) {
@@ -4960,7 +4962,7 @@ async function submitReport(category) {
             items.push({ drugType, drugQuantity, concealMethod });
         } else {
             const seizedItems = b.querySelector('.rp-item-seized').value.trim();
-            if (!seizedItems) return toast('اكتب المضبوطات لكل مخالفة');
+            if (!seizedItems) return toast('اكتب المضبوطات لكل مضبوط');
             items.push({ seizedItems });
         }
     }
