@@ -56,7 +56,7 @@ const CONFIG = {
     CITIZEN_ROLE_ID: process.env.CITIZEN_ROLE_ID || "",
 
     // عنوان موقع البنك — يُستخدم للتحقق من الرصيد وسداد المخالفات عبر البطاقة
-    BANK_API: process.env.BANK_API || "https://bank2-w89b.onrender.com",
+    BANK_API: process.env.BANK_API || "https://bank2-9gvz.onrender.com",
     // مفتاح داخلي مشترك بين فلاش والبنك للتحقق من أن الطلب جاي من موقع فلاش فعلاً (لازم يكون نفس القيمة بملف البنك)
     INTERNAL_API_KEY: process.env.INTERNAL_API_KEY || "flash_bank_internal_2026",
 
@@ -391,6 +391,25 @@ const CitizenViolationSchema = new mongoose.Schema({
 });
 CitizenViolationSchema.index({ citizenDiscord: 1, createdAt: -1 });
 const CitizenViolation = mongoose.model("CitizenViolation", CitizenViolationSchema);
+
+// طلبات التسجيل الواردة من البوت (/لوحة-التسجيل) — تنتظر مراجعة الإدارة
+const RegistrationRequestSchema = new mongoose.Schema({
+    discord: { type: String, required: true },
+    discordTag: String,
+    avatar: { type: String, default: null }, // رابط صورة حساب ديسكورد
+    fullName: { type: String, default: null },
+    gameUsername: { type: String, default: null }, // يوزر حسابه
+    status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
+    assignedType: { type: String, enum: ["citizen", "military", null], default: null }, // اللي حددته الإدارة وقت القبول
+    assignedRoleId: { type: String, default: null },
+    reviewedBy: { type: String, default: null },
+    reviewedByTag: { type: String, default: null },
+    reviewedAt: { type: Date, default: null },
+    rejectReason: { type: String, default: null },
+    createdAt: { type: Date, default: Date.now },
+});
+RegistrationRequestSchema.index({ status: 1, createdAt: 1 });
+const RegistrationRequest = mongoose.model("RegistrationRequest", RegistrationRequestSchema);
 
 const LogSchema = new mongoose.Schema({
     discordId: { type: String, default: null },     // آيدي الشخص المتأثر بالحدث (العسكري مثلاً)
@@ -3821,7 +3840,8 @@ app.post("/api/citizen/violations/:id/pay", ensureCitizen, async (req, res) => {
 
 // ── ملاحظة: تسجيل مخالفات المواطنين من طرف العسكري، وتسجيل بيانات المواطن (الهوية/الرخصة/المركبة) من طرف الإدارة،
 // هذي أجزاء قسم "العسكري" و"الإدارة" وتُضاف في المرحلة التالية. مؤقتاً — أداة يدوية لكبار المسؤولين لتجربة القسم:
-app.post("/api/senior/citizens/:discord/update", ensureSeniorAdmin, async (req, res) => {
+// تسجيل/تعديل بيانات مواطن — الزر الأول بقسم الإدارة (متاح لأي إداري، مو بس كبار المسؤولين)
+app.post("/api/admin/citizens/:discord/register", ensureAnyAdmin, async (req, res) => {
     try {
         const { shortId, longId, registeredName, licenseNumber, vehicleType, vehiclePlate, vehiclePhoto, isWanted, hasRecord } = req.body;
         let c = await Citizen.findOne({ discord: req.params.discord });
@@ -3851,6 +3871,133 @@ app.post("/api/senior/citizen-violations/create", ensureSeniorAdmin, async (req,
             officerDiscord: req.user.id, officerTag: req.user.username, officerName: "كبير مسؤولين (تجريبي)",
         });
         res.json({ success: true, violation: v });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// APIs قسم الإدارة (6 صفحات: الحسابات المعلقة، تسجيل مواطن، تسجيل عسكري، تسجيل إداري، سجل العسكر، مخالفات معلقة)
+// ══════════════════════════════════════════════════════════════════════════
+
+// تسجيل/تعديل بيانات عسكري — الزر الثاني بقسم الإدارة
+app.post("/api/admin/personnel/:discord/register", ensureAnyAdmin, async (req, res) => {
+    try {
+        const { registeredName, unit, rank } = req.body;
+        let p = await Personnel.findOne({ discord: req.params.discord });
+        if (!p) p = new Personnel({ discord: req.params.discord });
+        if (registeredName !== undefined) p.registeredName = registeredName;
+        if (unit !== undefined) p.unit = unit;
+        if (rank !== undefined && CONFIG.MILITARY_RANKS.includes(rank)) p.rank = rank;
+        await p.save();
+        await logEvent({ action: "تسجيل/تعديل عسكري (إدارة)", discordId: p.discord, actorId: req.user.id, actorTag: req.user.username, details: `${registeredName || ""} — ${unit || ""} — ${rank || ""}` });
+        res.json({ success: true, personnel: p });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// تسجيل إداري جديد — الزر الثالث بقسم الإدارة (إضافة فقط، الفصل يبقى لكبار المسؤولين حصراً)
+app.post("/api/admin/hire-admin", ensureAnyAdmin, async (req, res) => {
+    try {
+        const { discordId, name } = req.body;
+        if (!discordId || !discordId.trim()) return res.status(400).json({ error: "حط آيدي الإداري" });
+        const settings = await getSettings();
+        if (!settings.adminList.includes(discordId.trim())) settings.adminList.push(discordId.trim());
+        await settings.save();
+        await logEvent({ action: "توظيف إداري (قسم الإدارة)", discordId: discordId.trim(), actorId: req.user.id, actorTag: req.user.username, details: name || "" });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// سجل العسكر — عرض فقط (متاح لأي إداري)
+app.get("/api/admin/personnel-list", ensureAnyAdmin, async (req, res) => {
+    try {
+        const q = (req.query.q || "").trim();
+        const filter = q ? { $or: [{ registeredName: new RegExp(q, "i") }, { unit: new RegExp(q, "i") }, { discordTag: new RegExp(q, "i") }] } : {};
+        const list = await Personnel.find(filter, { "notes.image": 0 }).sort({ createdAt: -1 }).limit(100);
+        res.json(list);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── الحسابات المعلقة (طلبات التسجيل الواردة من البوت) ──
+app.get("/api/admin/registration-requests", ensureAnyAdmin, async (req, res) => {
+    try {
+        const status = ["pending", "approved", "rejected"].includes(req.query.status) ? req.query.status : "pending";
+        const list = await RegistrationRequest.find({ status }).sort({ createdAt: 1 });
+        res.json(list);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/admin/registration-requests/:id/approve", ensureAnyAdmin, async (req, res) => {
+    try {
+        const { assignedType, roleId } = req.body; // assignedType: "citizen" | "military"
+        if (!["citizen", "military"].includes(assignedType) || !roleId) return res.status(400).json({ error: "حدد نوع العضو والرتبة/الرول" });
+        const r = await RegistrationRequest.findById(req.params.id);
+        if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
+
+        if (botReady) {
+            try {
+                const guild = await client.guilds.fetch(CONFIG.GUILD_ID);
+                const member = await guild.members.fetch(r.discord);
+                await member.roles.add(roleId);
+            } catch (e) { console.error("❌ فشل إعطاء الرول عند قبول التسجيل:", e.message); }
+        }
+
+        r.status = "approved"; r.assignedType = assignedType; r.assignedRoleId = roleId;
+        r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+        await r.save();
+
+        // ننشئ سجل مبدئي بالنوع المناسب حتى يظهر بقسمه فوراً
+        if (assignedType === "citizen") {
+            const exists = await Citizen.findOne({ discord: r.discord });
+            if (!exists) await Citizen.create({ discord: r.discord, discordTag: r.discordTag, registeredName: r.fullName, createdBy: req.user.id, createdByTag: req.user.username });
+        } else {
+            const exists = await Personnel.findOne({ discord: r.discord });
+            if (!exists) await Personnel.create({ discord: r.discord, discordTag: r.discordTag, registeredName: r.fullName });
+        }
+
+        if (botReady) {
+            try {
+                const user = await client.users.fetch(r.discord);
+                await user.send(`✅ تم قبول طلب تسجيلك في ${CONFIG.SITE_NAME}. تفضّل بزيارة الموقع: ${CONFIG.SITE_URL}`);
+            } catch (e) { /* تجاهل لو مقفّل الخاص */ }
+        }
+
+        await logEvent({ action: "قبول طلب تسجيل", discordId: r.discord, discordTag: r.discordTag, actorId: req.user.id, actorTag: req.user.username, details: assignedType });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/admin/registration-requests/:id/reject", ensureAnyAdmin, async (req, res) => {
+    try {
+        const { reason } = req.body;
+        const r = await RegistrationRequest.findById(req.params.id);
+        if (!r || r.status !== "pending") return res.status(404).json({ error: "غير موجود" });
+        r.status = "rejected"; r.rejectReason = reason || null;
+        r.reviewedBy = req.user.id; r.reviewedByTag = req.user.username; r.reviewedAt = new Date();
+        await r.save();
+        if (botReady) {
+            try {
+                const user = await client.users.fetch(r.discord);
+                await user.send(`❌ تم رفض طلب تسجيلك في ${CONFIG.SITE_NAME}${reason ? ` — السبب: ${reason}` : ""}.`);
+            } catch (e) { /* تجاهل */ }
+        }
+        await logEvent({ action: "رفض طلب تسجيل", discordId: r.discord, discordTag: r.discordTag, actorId: req.user.id, actorTag: req.user.username, details: reason || "" });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// أداة تجريبية مؤقتة لكبار المسؤولين لإنشاء طلب تسجيل وهمي — لتجربة صفحة "الحسابات المعلقة" لين يجهز قسم البوت فعلياً
+app.post("/api/senior/registration-requests/create-test", ensureSeniorAdmin, async (req, res) => {
+    try {
+        const { discord, fullName, gameUsername } = req.body;
+        if (!discord) return res.status(400).json({ error: "حط آيدي ديسكورد" });
+        let avatar = null;
+        if (botReady) {
+            try {
+                const user = await client.users.fetch(discord);
+                avatar = user.displayAvatarURL({ extension: "png", size: 128 });
+            } catch (e) { /* تجاهل */ }
+        }
+        const r = await RegistrationRequest.create({ discord, discordTag: null, avatar, fullName, gameUsername });
+        res.json({ success: true, request: r });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -4770,6 +4917,7 @@ function buildNav() {
         { label: '🪪 بطاقتي', fn: 'renderCard()' },
     );
     if (ME.isAdmin) items.push({ label: '🛠️ لوحة الإدارة', fn: 'renderAdmin()' });
+    if (ME.isAdmin) items.push({ label: '📋 التسجيل والحسابات', fn: "renderAccountsAdminPanel('pending')" });
     if (ME.isHighCommand) items.push({ label: '⭐ القيادة العليا', fn: 'renderHighCommandPanel()' });
     if (ME.mpInfo) items.push({ label: '🚔 لوحة الشرطة العسكرية', fn: 'renderMPPanel()' });
     else if (ME.mpPersonnelOfficer) items.push({ label: '🚔 مسؤول أفراد الشرطة العسكرية', fn: 'renderMPPOPanel()' });
@@ -5079,6 +5227,270 @@ async function viewMilCitizenViolationPhoto(id, side) {
         if (!photo) return setPhotoPageError('لا توجد صورة');
         setPhotoPageImage(photo);
     } catch (e) { setPhotoPageError(e.message); }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// قسم الإدارة — لوحة "التسجيل والحسابات" (6 صفحات)
+// ══════════════════════════════════════════════════════════════════════════
+const AAP_TABS = [
+    { id: 'pending', label: '📥 الحسابات المعلقة' },
+    { id: 'reg-citizen', label: '🪪 تسجيل مواطن' },
+    { id: 'reg-military', label: '🎖️ تسجيل عسكري' },
+    { id: 'reg-admin', label: '🛡️ تسجيل إداري' },
+    { id: 'personnel', label: '📚 سجل العسكر' },
+    { id: 'violations', label: '🚦 المخالفات المعلقة' },
+];
+function renderAccountsAdminPanel(tab) {
+    tab = tab || 'pending';
+    document.getElementById('app').innerHTML = \`
+        <div class="card row"><h2>📋 التسجيل والحسابات</h2><button class="btn gray sm" onclick="renderDashboard()">رجوع</button></div>
+        <div class="tabs">\${AAP_TABS.map(t => \`<div class="tab \${t.id === tab ? 'active' : ''}" onclick="renderAccountsAdminPanel('\${t.id}')">\${t.label}</div>\`).join('')}</div>
+        <div id="aap-content"><div class="card">جارِ التحميل...</div></div>
+    \`;
+    const loaders = {
+        pending: loadAAPending, 'reg-citizen': renderAAPRegCitizen, 'reg-military': renderAAPRegMilitary,
+        'reg-admin': renderAAPRegAdmin, personnel: renderAAPPersonnel, violations: loadAAPViolations,
+    };
+    (loaders[tab] || loadAAPending)();
+}
+
+// ── 1) الحسابات المعلقة ──
+async function loadAAPending() {
+    const box = document.getElementById('aap-content');
+    try {
+        const list = await api('/api/admin/registration-requests?status=pending');
+        if (!list.length) { box.innerHTML = '<div class="card">لا توجد حسابات معلقة 🎉</div>'; return; }
+        box.innerHTML = list.map(r => \`
+            <div class="card">
+                <div class="row">
+                    <div class="row" style="gap:10px;">
+                        \${r.avatar ? \`<img class="avatar" style="width:50px;height:50px;" src="\${r.avatar}">\` : ''}
+                        <div>
+                            <b>\${r.fullName || '(بدون اسم)'}</b>
+                            <div style="color:var(--muted);font-size:12px;">يوزر: \${r.gameUsername || '-'} — ديسكورد: \${r.discord}</div>
+                        </div>
+                    </div>
+                    <div class="row" style="gap:6px;">
+                        <button class="btn sm" onclick="toggleAAPApprove('\${r._id}')">قبول</button>
+                        <button class="btn danger sm" onclick="aapReject('\${r._id}')">رفض</button>
+                    </div>
+                </div>
+                <div id="aap-approve-form-\${r._id}" class="hidden" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                    <label>نوع العضو</label>
+                    <select id="aap-type-\${r._id}">
+                        <option value="citizen">مواطن</option>
+                        <option value="military">عسكري</option>
+                    </select>
+                    <label>آيدي الرتبة/الرول بديسكورد</label>
+                    <input id="aap-role-\${r._id}" placeholder="آيدي الرول">
+                    <button class="btn sm" onclick="aapApprove('\${r._id}')">تأكيد القبول وإعطاء الرول</button>
+                </div>
+            </div>
+        \`).join('');
+    } catch (e) { box.innerHTML = \`<div class="card">\${e.message}</div>\`; }
+}
+function toggleAAPApprove(id) { document.getElementById('aap-approve-form-' + id).classList.toggle('hidden'); }
+async function aapApprove(id) {
+    const assignedType = document.getElementById('aap-type-' + id).value;
+    const roleId = document.getElementById('aap-role-' + id).value.trim();
+    if (!roleId) return toast('حط آيدي الرول');
+    try {
+        await api(\`/api/admin/registration-requests/\${id}/approve\`, { method: 'POST', body: JSON.stringify({ assignedType, roleId }) });
+        toast('✅ تم القبول وإعطاء الرول');
+        loadAAPending();
+    } catch (e) { toast(e.message); }
+}
+async function aapReject(id) {
+    const reason = await promptModal('سبب الرفض (اختياري):', '');
+    if (reason === null) return;
+    try {
+        await api(\`/api/admin/registration-requests/\${id}/reject\`, { method: 'POST', body: JSON.stringify({ reason: reason || '' }) });
+        toast('❌ تم الرفض');
+        loadAAPending();
+    } catch (e) { toast(e.message); }
+}
+
+// ── 2) تسجيل مواطن ──
+let aapCitizenPhoto = null;
+function renderAAPRegCitizen() {
+    aapCitizenPhoto = null;
+    document.getElementById('aap-content').innerHTML = \`
+        <div class="card">
+            <label>آيدي ديسكورد للمواطن</label>
+            <input id="aapc-discord" placeholder="آيدي ديسكورد">
+            <label>الهوية المختصرة (4 أرقام)</label>
+            <input id="aapc-short" maxlength="4" placeholder="1234">
+            <label>الهوية الطويلة (11 رقم)</label>
+            <input id="aapc-long" maxlength="11" placeholder="12345678901">
+            <label>الاسم المسجل</label>
+            <input id="aapc-name" placeholder="الاسم الكامل">
+            <label>رقم الرخصة (اختياري)</label>
+            <input id="aapc-license" placeholder="رقم الرخصة">
+            <label>نوع المركبة (اختياري)</label>
+            <input id="aapc-vtype" placeholder="مثال: سيدان">
+            <label>لوحة المركبة (اختياري)</label>
+            <input id="aapc-plate" placeholder="رقم اللوحة">
+            <label>صورة المركبة (اختياري)</label>
+            <input type="file" accept="image/*" id="aapc-photo" onchange="previewAAPCPhoto()">
+            <img id="aapc-photo-preview" style="display:none;max-width:160px;border-radius:8px;margin-bottom:10px;">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;"><input type="checkbox" id="aapc-wanted" style="width:auto;margin:0;"> مطلوب أمنياً</label>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:8px;"><input type="checkbox" id="aapc-record" style="width:auto;margin:0;"> عليه سجل</label>
+            <button class="btn" style="margin-top:14px;" onclick="submitAAPRegCitizen()">حفظ بيانات المواطن</button>
+        </div>
+    \`;
+}
+function previewAAPCPhoto() {
+    const f = document.getElementById('aapc-photo').files[0];
+    if (!f) return;
+    if (f.size > ${CONFIG.MAX_PHOTO_MB} * 1024 * 1024) { toast('الصورة أكبر من ${CONFIG.MAX_PHOTO_MB}MB'); return; }
+    const reader = new FileReader();
+    reader.onload = e => {
+        aapCitizenPhoto = e.target.result;
+        const img = document.getElementById('aapc-photo-preview');
+        img.src = e.target.result; img.style.display = 'block';
+    };
+    reader.readAsDataURL(f);
+}
+async function submitAAPRegCitizen() {
+    const discord = document.getElementById('aapc-discord').value.trim();
+    if (!discord) return toast('حط آيدي ديسكورد المواطن');
+    const body = {
+        shortId: document.getElementById('aapc-short').value.trim() || null,
+        longId: document.getElementById('aapc-long').value.trim() || null,
+        registeredName: document.getElementById('aapc-name').value.trim() || null,
+        licenseNumber: document.getElementById('aapc-license').value.trim() || null,
+        vehicleType: document.getElementById('aapc-vtype').value.trim() || null,
+        vehiclePlate: document.getElementById('aapc-plate').value.trim() || null,
+        isWanted: document.getElementById('aapc-wanted').checked,
+        hasRecord: document.getElementById('aapc-record').checked,
+    };
+    if (aapCitizenPhoto) body.vehiclePhoto = aapCitizenPhoto;
+    try {
+        await api(\`/api/admin/citizens/\${discord}/register\`, { method: 'POST', body: JSON.stringify(body) });
+        toast('✅ تم حفظ بيانات المواطن');
+        renderAAPRegCitizen();
+    } catch (e) { toast(e.message); }
+}
+
+// ── 3) تسجيل عسكري ──
+function renderAAPRegMilitary() {
+    document.getElementById('aap-content').innerHTML = \`
+        <div class="card">
+            <label>آيدي ديسكورد للعسكري</label>
+            <input id="aapm-discord" placeholder="آيدي ديسكورد">
+            <label>الاسم المسجل</label>
+            <input id="aapm-name" placeholder="الاسم الكامل">
+            <label>الوحدة/القطاع</label>
+            <input id="aapm-unit" placeholder="مثال: الدوريات">
+            <label>الرتبة</label>
+            <select id="aapm-rank">\${CONFIG.MILITARY_RANKS.map(r => \`<option value="\${r}">\${r}</option>\`).join('')}</select>
+            <button class="btn" style="margin-top:14px;" onclick="submitAAPRegMilitary()">حفظ بيانات العسكري</button>
+        </div>
+    \`;
+}
+async function submitAAPRegMilitary() {
+    const discord = document.getElementById('aapm-discord').value.trim();
+    if (!discord) return toast('حط آيدي ديسكورد العسكري');
+    try {
+        await api(\`/api/admin/personnel/\${discord}/register\`, {
+            method: 'POST',
+            body: JSON.stringify({
+                registeredName: document.getElementById('aapm-name').value.trim() || null,
+                unit: document.getElementById('aapm-unit').value.trim() || null,
+                rank: document.getElementById('aapm-rank').value,
+            }),
+        });
+        toast('✅ تم حفظ بيانات العسكري');
+        renderAAPRegMilitary();
+    } catch (e) { toast(e.message); }
+}
+
+// ── 4) تسجيل إداري ──
+function renderAAPRegAdmin() {
+    document.getElementById('aap-content').innerHTML = \`
+        <div class="card">
+            <p style="color:var(--muted);margin-bottom:10px;">إضافة إداري جديد فقط — الفصل يتم من قبل كبار المسؤولين حصراً.</p>
+            <label>آيدي ديسكورد</label>
+            <input id="aapa-discord" placeholder="آيدي ديسكورد">
+            <label>الاسم (اختياري)</label>
+            <input id="aapa-name" placeholder="الاسم">
+            <button class="btn" style="margin-top:14px;" onclick="submitAAPRegAdmin()">تسجيل كإداري</button>
+        </div>
+    \`;
+}
+async function submitAAPRegAdmin() {
+    const discordId = document.getElementById('aapa-discord').value.trim();
+    if (!discordId) return toast('حط آيدي ديسكورد');
+    try {
+        await api('/api/admin/hire-admin', { method: 'POST', body: JSON.stringify({ discordId, name: document.getElementById('aapa-name').value.trim() }) });
+        toast('✅ تم تسجيله كإداري');
+        document.getElementById('aapa-discord').value = ''; document.getElementById('aapa-name').value = '';
+    } catch (e) { toast(e.message); }
+}
+
+// ── 5) سجل العسكر ──
+function renderAAPPersonnel() {
+    document.getElementById('aap-content').innerHTML = \`
+        <div class="card">
+            <div class="row" style="gap:8px;">
+                <input id="aapp-q" placeholder="ابحث بالاسم / الوحدة / يوزر ديسكورد" style="flex:1;" onkeydown="if(event.key==='Enter') loadAAPPersonnel()">
+                <button class="btn sm" style="width:auto;" onclick="loadAAPPersonnel()">بحث</button>
+            </div>
+        </div>
+        <div id="aapp-list"></div>
+    \`;
+    loadAAPPersonnel();
+}
+async function loadAAPPersonnel() {
+    const box = document.getElementById('aapp-list');
+    box.innerHTML = '<div class="card">جارِ التحميل...</div>';
+    try {
+        const q = document.getElementById('aapp-q').value.trim();
+        const list = await api('/api/admin/personnel-list' + (q ? '?q=' + encodeURIComponent(q) : ''));
+        if (!list.length) { box.innerHTML = '<div class="card">لا توجد نتائج</div>'; return; }
+        box.innerHTML = list.map(p => \`
+            <div class="log-item">
+                <div>
+                    <b>\${p.registeredName || p.discordTag || '(بدون اسم)'}</b>
+                    <div style="color:var(--muted);font-size:12px;">الوحدة: \${p.unit || '-'} — الرتبة: \${p.rank} — النقاط: \${p.points}</div>
+                </div>
+                \${p.isBlocked ? '<span class="badge rejected">موقوف</span>' : ''}
+            </div>
+        \`).join('');
+    } catch (e) { box.innerHTML = \`<div class="card">\${e.message}</div>\`; }
+}
+
+// ── 6) المخالفات المعلقة ──
+async function loadAAPViolations() {
+    const box = document.getElementById('aap-content');
+    try {
+        const { list } = await api('/api/admin/pending');
+        if (!list.length) { box.innerHTML = '<div class="card">لا توجد مخالفات معلقة 🎉</div>'; return; }
+        box.innerHTML = list.map(v => \`
+            <div class="card row">
+                <div>
+                    <b>\${v.violationType}</b>
+                    <div style="color:var(--muted);font-size:12px;">\${v.reporterName || v.reporterTag || ''} — لوحة: \${v.plateNumber || '-'} — \${new Date(v.createdAt).toLocaleString('ar')}</div>
+                </div>
+                <div class="row" style="gap:6px;">
+                    \${v.hasPhoto ? \`<button class="btn gray sm" onclick="viewViolationPhoto('\${v._id}')">صورة</button>\` : ''}
+                    <button class="btn sm" onclick="aapApproveViolation('\${v._id}')">قبول</button>
+                    <button class="btn danger sm" onclick="aapRejectViolation('\${v._id}')">رفض</button>
+                </div>
+            </div>
+        \`).join('');
+    } catch (e) { box.innerHTML = \`<div class="card">\${e.message}</div>\`; }
+}
+async function aapApproveViolation(id) {
+    try { await api(\`/api/admin/violations/\${id}/approve\`, { method: 'POST' }); toast('✅ تم القبول'); loadAAPViolations(); }
+    catch (e) { toast(e.message); }
+}
+async function aapRejectViolation(id) {
+    const reason = await promptModal('سبب الرفض:', '');
+    if (reason === null) return;
+    if (!reason.trim()) return toast('لازم تكتب سبب الرفض');
+    try { await api(\`/api/admin/violations/\${id}/reject\`, { method: 'POST', body: JSON.stringify({ reason }) }); toast('❌ تم الرفض'); loadAAPViolations(); }
+    catch (e) { toast(e.message); }
 }
 function renderMinePage() {
     document.getElementById('app').innerHTML = \`<div class="card"><h2>📋 مخالفاتي</h2><div id="mine-list">جارِ التحميل...</div></div>\`;
