@@ -399,6 +399,7 @@ const RegistrationRequestSchema = new mongoose.Schema({
     avatar: { type: String, default: null }, // رابط صورة حساب ديسكورد
     fullName: { type: String, default: null },
     gameUsername: { type: String, default: null }, // يوزر حسابه
+    submittedPhoto: { type: String, default: null }, // صورة حسابه اللي أرسلها بالخاص
     status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
     assignedType: { type: String, enum: ["citizen", "military", null], default: null }, // اللي حددته الإدارة وقت القبول
     assignedRoleId: { type: String, default: null },
@@ -1066,6 +1067,11 @@ async function rejectViolation(v, actorId, actorTag, reason) {
 
 const commands = [
     new SlashCommandBuilder()
+        .setName("لوحة-التسجيل")
+        .setDescription("ينشر لوحة تسجيل الحسابات (للإدمن ستريتور فقط)")
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+    new SlashCommandBuilder()
         .setName("حظر")
         .setDescription("حظر عسكري من الموقع (كبار المسؤولين فقط)")
         .addUserOption(o => o.setName("اللاعب").setDescription("العسكري المطلوب حظره").setRequired(true))
@@ -1092,6 +1098,24 @@ client.on("interactionCreate", async interaction => {
         // ── أوامر السلاش ─────────────────────────────────────────────
         if (interaction.isChatInputCommand()) {
             const { commandName } = interaction;
+
+            if (commandName === "لوحة-التسجيل") {
+                const embed = new EmbedBuilder()
+                    .setColor(0x22c55e)
+                    .setTitle("🪖 لوحة تسجيل الحسابات — " + CONFIG.SITE_NAME)
+                    .setDescription(
+                        "هلا وغلا فيك 👋\n\n" +
+                        "هذي اللوحة تخليك تربط حسابك بموقع " + CONFIG.SITE_NAME + " سواء كنت عسكري أو مواطن.\n\n" +
+                        "بس تضغط على الزر تحت، بنسألك سؤالين بسيطين (اسمك الكامل، ويوزر حسابك)، وبعدها بنطلب منك بالخاص صورة حسابك عشان نتأكد منك.\n\n" +
+                        "بعد كذا، طلبك يروح للإدارة عشان تراجعه وتقبله، وبمجرد ما يقبلونه بتقدر تدخل الموقع على طول. 🌟\n\n" +
+                        "⚠️ خلك متأكد إن خاصك (DM) مفتوح قبل لا تضغط الزر، عشان نقدر نكمل معك الإجراءات."
+                    )
+                    .setFooter({ text: "بالتوفيق للجميع 🌹" });
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId("start_registration").setLabel("ربط الحساب 📝").setStyle(ButtonStyle.Success)
+                );
+                return interaction.reply({ embeds: [embed], components: [row] });
+            }
 
             if (commandName === "حظر") {
                 if (!isSeniorAdmin(interaction.user.id)) {
@@ -1129,6 +1153,27 @@ client.on("interactionCreate", async interaction => {
         if (interaction.isButton()) {
             const id = interaction.customId;
 
+            if (id === "start_registration") {
+                const already = (await isMilitary(interaction.user.id)).ok || await isCitizen(interaction.user.id);
+                if (already) {
+                    return interaction.reply({ content: "🚫 عندك تسجيل مسبق بالموقع، ما تحتاج تسجّل مرة ثانية.", ephemeral: true });
+                }
+                const existingPending = await RegistrationRequest.findOne({ discord: interaction.user.id, status: "pending" });
+                if (existingPending) {
+                    return interaction.reply({ content: "⏳ عندك طلب تسجيل قيد المراجعة حالياً، انتظر رد الإدارة.", ephemeral: true });
+                }
+                const modal = new ModalBuilder().setCustomId("regmodal").setTitle("ربط الحساب");
+                const nameInput = new TextInputBuilder()
+                    .setCustomId("fullName").setLabel("ضع اسمك كامل").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60);
+                const userInput = new TextInputBuilder()
+                    .setCustomId("gameUsername").setLabel("ضع يوزر حسابك").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60);
+                modal.addComponents(
+                    new ActionRowBuilder().addComponents(nameInput),
+                    new ActionRowBuilder().addComponents(userInput),
+                );
+                return interaction.showModal(modal);
+            }
+
             if (id.startsWith("approve_") || id.startsWith("reject_")) {
                 const [action, vid] = id.split("_");
                 const allowed = await isAnyAdmin(interaction.user.id);
@@ -1160,6 +1205,45 @@ client.on("interactionCreate", async interaction => {
 
         // ── نماذج (Modals) ───────────────────────────────────────────
         if (interaction.isModalSubmit()) {
+            if (interaction.customId === "regmodal") {
+                const fullName = interaction.fields.getTextInputValue("fullName").trim();
+                const gameUsername = interaction.fields.getTextInputValue("gameUsername").trim();
+                let avatar = null;
+                try { avatar = interaction.user.displayAvatarURL({ extension: "png", size: 128 }); } catch (e) { /* تجاهل */ }
+
+                await RegistrationRequest.create({
+                    discord: interaction.user.id, discordTag: interaction.user.username, avatar, fullName, gameUsername,
+                });
+
+                await interaction.reply({ content: "📩 توجه للخاص عندك عشان تكمل الإجراءات.", ephemeral: true });
+
+                if (activeRegistrationSessions.has(interaction.user.id)) return;
+                activeRegistrationSessions.add(interaction.user.id);
+                try {
+                    const dm = await interaction.user.createDM();
+                    await dm.send("📸 ضع صورة حسابك عشان نكمل مراجعة طلبك (أرفق صورة بنفس الرسالة).");
+                    const filter = m => m.author.id === interaction.user.id;
+                    const collected = await dm.awaitMessages({ filter, max: 1, time: 5 * 60 * 1000, errors: ["time"] });
+                    const msg = collected.first();
+                    const photoUrl = msg.attachments.first()?.url || null;
+                    if (!photoUrl) {
+                        await dm.send("❌ لازم ترفق صورة فعلية. اضغط على زر (ربط الحساب) مرة ثانية وحاول من جديد.");
+                        await RegistrationRequest.deleteOne({ discord: interaction.user.id, status: "pending", submittedPhoto: null });
+                    } else {
+                        await RegistrationRequest.findOneAndUpdate({ discord: interaction.user.id, status: "pending" }, { submittedPhoto: photoUrl });
+                        await dm.send("✅ تم استلام طلبك، سيتم مراجعته من قبل الإدارة قريباً. 🌹");
+                    }
+                } catch (e) {
+                    try {
+                        const dm = await interaction.user.createDM();
+                        await dm.send("⏱️ انتهى الوقت، اضغط على زر (ربط الحساب) مرة ثانية وحاول من جديد.");
+                    } catch (e2) { /* الخاص مقفّل — تجاهل */ }
+                    await RegistrationRequest.deleteOne({ discord: interaction.user.id, status: "pending", submittedPhoto: null });
+                } finally {
+                    activeRegistrationSessions.delete(interaction.user.id);
+                }
+                return;
+            }
             if (interaction.customId.startsWith("rejectmodal_")) {
                 const vid = interaction.customId.split("_")[1];
                 const reason = interaction.fields.getTextInputValue("reason");
@@ -1176,6 +1260,7 @@ client.on("interactionCreate", async interaction => {
     }
 });
 
+const activeRegistrationSessions = new Set();
 const activeVehicleSessions = new Set();
 client.on("messageCreate", async message => {
     if (message.author.bot) return;
@@ -5271,6 +5356,7 @@ async function loadAAPending() {
                         </div>
                     </div>
                     <div class="row" style="gap:6px;">
+                        \${r.submittedPhoto ? \`<a href="\${r.submittedPhoto}" target="_blank" class="btn gray sm" style="text-decoration:none;">📷 صورة الحساب</a>\` : ''}
                         <button class="btn sm" onclick="toggleAAPApprove('\${r._id}')">قبول</button>
                         <button class="btn danger sm" onclick="aapReject('\${r._id}')">رفض</button>
                     </div>
